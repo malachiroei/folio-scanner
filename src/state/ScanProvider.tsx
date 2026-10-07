@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { detectDocumentCorners } from '../lib/detect'
 import { cornersValid, defaultCorners } from '../lib/geometry'
+import { isOpenCvReady, loadOpenCv } from '../lib/opencv'
 import {
   canvasToJpegBlob,
   downloadUrl,
@@ -9,7 +10,6 @@ import {
   nextFrame,
   normalizeImage,
 } from '../lib/image'
-import { loadOpenCv } from '../lib/opencv'
 import { renderDocument } from '../lib/process'
 import type { Corners, Draft, EngineStatus, FilterMode, PreviewImage, ScanPage, Screen } from '../types'
 import { ScanContext } from './scan-context'
@@ -55,15 +55,20 @@ export function ScanProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     let live = true
+    const unblock = window.setTimeout(() => {
+      if (!live) return
+      setEngine((status) => (status === 'loading' ? 'fallback' : status))
+    }, 8000)
     loadOpenCv()
       .then(() => {
         if (live) setEngine('ready')
       })
       .catch(() => {
-        if (live) setEngine('error')
+        if (live) setEngine((status) => (status === 'ready' ? status : 'fallback'))
       })
     return () => {
       live = false
+      window.clearTimeout(unblock)
     }
   }, [])
 
@@ -86,9 +91,18 @@ export function ScanProvider({ children }: { children: ReactNode }) {
 
   function retryEngine() {
     setEngine('loading')
+    const unblock = window.setTimeout(() => {
+      setEngine((status) => (status === 'loading' ? 'fallback' : status))
+    }, 8000)
     loadOpenCv()
-      .then(() => setEngine('ready'))
-      .catch(() => setEngine('error'))
+      .then(() => {
+        window.clearTimeout(unblock)
+        setEngine('ready')
+      })
+      .catch(() => {
+        window.clearTimeout(unblock)
+        setEngine((status) => (status === 'ready' ? status : 'fallback'))
+      })
   }
 
   function dismissToast() {
@@ -97,27 +111,18 @@ export function ScanProvider({ children }: { children: ReactNode }) {
 
   async function ingestBlob(blob: Blob) {
     setScreen('prepare')
-    setToast(null)
-    setBusy('Loading vision engine…')
-    await nextFrame()
-    try {
-      await loadOpenCv()
-      setEngine('ready')
-    } catch (error) {
-      setEngine('error')
-      setToast(errorMessage(error))
-      setScreen('home')
-      setBusy(null)
-      return
-    }
-
-    setBusy('Finding the page…')
+    const visionReady = isOpenCvReady()
+    setBusy(visionReady ? 'Finding the page…' : 'Preparing photo…')
+    if (visionReady) setToast(null)
+    else setToast('Vision engine isn’t ready. You can still crop and adjust this photo.')
     await nextFrame()
     let normalized: { url: string; width: number; height: number } | null = null
     try {
       normalized = await normalizeImage(blob)
       const image = await loadImage(normalized.url)
-      const found = detectDocumentCorners(image, normalized.width, normalized.height)
+      const found = visionReady
+        ? detectDocumentCorners(image, normalized.width, normalized.height)
+        : { corners: defaultCorners(normalized.width, normalized.height, 0.07), detected: false }
       setDraft({
         sourceUrl: normalized.url,
         width: normalized.width,
@@ -152,6 +157,19 @@ export function ScanProvider({ children }: { children: ReactNode }) {
   async function resetDetection() {
     const current = draftRef.current
     if (!current) return
+    if (!isOpenCvReady()) {
+      setDraft((draftNow) =>
+        draftNow
+          ? {
+              ...draftNow,
+              corners: defaultCorners(draftNow.width, draftNow.height, 0.07),
+              detected: false,
+            }
+          : draftNow,
+      )
+      setToast('Edge detection needs the vision engine. Drag the pins, or retry from the home screen.')
+      return
+    }
     setBusy('Finding the page…')
     try {
       await nextFrame()

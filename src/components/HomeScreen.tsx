@@ -72,23 +72,33 @@ export function HomeScreen() {
         )}
 
         <div className="mt-auto pt-8">
-          <div className="flex items-center gap-2 text-sm text-mist dark:text-paper/60" aria-live="polite">
+          <div aria-live="polite">
             {engine === 'loading' && (
-              <>
+              <div className="flex items-center gap-2 text-sm text-mist dark:text-paper/60">
                 <Spinner className="size-4" />
-                Loading vision engine…
-              </>
+                <span>Loading vision engine… You can scan now.</span>
+              </div>
             )}
             {engine === 'ready' && (
-              <>
+              <div className="flex items-center gap-2 text-sm text-mist dark:text-paper/60">
                 <span className="size-2 rounded-full bg-moss-bright" />
                 Ready to scan
-              </>
+              </div>
             )}
-            {engine === 'error' && (
-              <button type="button" className="underline" onClick={() => void retryEngine()}>
-                Vision engine failed to load. Tap to retry.
-              </button>
+            {engine === 'fallback' && (
+              <div className="rounded-2xl bg-paper px-4 py-3 text-sm ring-1 ring-copper/40 dark:bg-night-2">
+                <p className="font-semibold text-ink dark:text-paper">Vision engine didn’t load</p>
+                <p className="mt-1 leading-5 text-mist dark:text-paper/70">
+                  You can still capture and upload. Cropping, straightening, and contrast work without it.
+                </p>
+                <button
+                  type="button"
+                  className="mt-3 rounded-xl bg-moss px-3 py-2 text-sm font-semibold text-paper"
+                  onClick={retryEngine}
+                >
+                  Retry vision engine
+                </button>
+              </div>
             )}
           </div>
           <p className="mt-2 text-xs text-mist/80 dark:text-paper/40">

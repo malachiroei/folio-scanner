@@ -1,7 +1,8 @@
 import Jscanify from 'jscanify/client'
 import type { Corners, FilterMode } from '../types'
 import { outputSize } from './geometry'
-import { getCv, loadOpenCv, MatBin, type Cv, type CvMat } from './opencv'
+import { renderCanvasDocument } from './canvas-scan'
+import { getCv, isOpenCvReady, MatBin, type Cv, type CvMat } from './opencv'
 
 function toJscanCorners(corners: Corners) {
   return {
@@ -191,31 +192,33 @@ function applyBlackAndWhite(cv: Cv, source: HTMLCanvasElement): HTMLCanvasElemen
   }
 }
 
+async function renderWithCanvas(
+  image: CanvasImageSource,
+  corners: Corners,
+  filter: FilterMode,
+): Promise<{ canvas: HTMLCanvasElement; width: number; height: number }> {
+  const canvas = await renderCanvasDocument(image, corners, filter)
+  return { canvas, width: canvas.width, height: canvas.height }
+}
+
 export async function renderDocument(
   image: CanvasImageSource,
   corners: Corners,
   filter: FilterMode,
 ): Promise<{ canvas: HTMLCanvasElement; width: number; height: number }> {
-  await loadOpenCv()
-  const cv = getCv()
-  const size = outputSize(corners)
-  let warped: HTMLCanvasElement
-  try {
-    warped = warp(cv, image, corners, size.width, size.height)
-  } catch (error) {
-    console.error(error)
-    throw new Error('Could not straighten this page. Move the pins onto the corners and try again.')
+  if (isOpenCvReady()) {
+    try {
+      const cv = getCv()
+      const size = outputSize(corners)
+      const warped = warp(cv, image, corners, size.width, size.height)
+      if (filter === 'original') {
+        return { canvas: warped, width: warped.width, height: warped.height }
+      }
+      const canvas = filter === 'bw' ? applyBlackAndWhite(cv, warped) : applyMagicColor(cv, warped)
+      return { canvas, width: canvas.width, height: canvas.height }
+    } catch (error) {
+      console.error(error)
+    }
   }
-
-  if (filter === 'original') {
-    return { canvas: warped, width: warped.width, height: warped.height }
-  }
-
-  try {
-    const canvas = filter === 'bw' ? applyBlackAndWhite(cv, warped) : applyMagicColor(cv, warped)
-    return { canvas, width: canvas.width, height: canvas.height }
-  } catch (error) {
-    console.error(error)
-    throw new Error('Could not clean this page. Try Original, or adjust the corners.')
-  }
+  return renderWithCanvas(image, corners, filter)
 }

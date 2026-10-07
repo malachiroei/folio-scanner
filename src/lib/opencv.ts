@@ -120,14 +120,20 @@ declare global {
 }
 
 const OPENCV_SOURCES = [
-  'https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.12.0-release.1/dist/opencv.js',
-  'https://docs.opencv.org/4.12.0/opencv.js',
+  'https://docs.opencv.org/4.8.0/opencv.js',
+  'https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.8.0-release.1/dist/opencv.js',
 ]
+
+const LOAD_TIMEOUT_MS = 10_000
 
 let loading: Promise<Cv> | null = null
 
 function isReady(cv: BootCv | undefined): cv is Cv {
   return Boolean(cv && typeof cv.Mat === 'function' && typeof cv.warpPerspective === 'function')
+}
+
+export function isOpenCvReady(): boolean {
+  return isReady(globalThis.cv)
 }
 
 export function getCv(): Cv {
@@ -148,75 +154,75 @@ export function loadOpenCv(): Promise<Cv> {
 }
 
 function startLoading(): Promise<Cv> {
+  const started = Date.now()
   return new Promise((resolve, reject) => {
+    const failAll = () => {
+      reject(new Error('The vision engine did not load. Basic adjustments are still available.'))
+    }
+
     const attempt = (index: number) => {
-      if (index >= OPENCV_SOURCES.length) {
-        reject(new Error('Could not load the vision engine. Check your connection and try again.'))
+      const remaining = LOAD_TIMEOUT_MS - (Date.now() - started)
+      if (index >= OPENCV_SOURCES.length || remaining <= 0) {
+        failAll()
         return
       }
-
-      const script = document.createElement('script')
-      script.src = OPENCV_SOURCES[index]
-      script.async = true
-      let settled = false
-      let poll = 0
-      let timer = 0
-
-      const succeed = (cv: Cv) => {
-        if (settled) return
-        settled = true
-        window.clearTimeout(timer)
-        window.clearInterval(poll)
-        globalThis.cv = cv
-        resolve(cv)
+      const source = OPENCV_SOURCES[index]
+      if (!source) {
+        failAll()
+        return
       }
-
-      const fail = () => {
-        if (settled) return
-        settled = true
-        window.clearTimeout(timer)
-        window.clearInterval(poll)
-        script.remove()
-        attempt(index + 1)
-      }
-
-      timer = window.setTimeout(fail, 50000)
-      poll = window.setInterval(() => {
-        const ready = globalThis.cv
-        if (isReady(ready)) succeed(ready)
-      }, 250)
-
-      script.onload = () => {
-        const current = globalThis.cv
-        if (isReady(current)) {
-          succeed(current)
-          return
-        }
-        if (current && typeof current.then === 'function') {
-          current.then((ready) => succeed(ready)).catch(() => fail())
-          return
-        }
-        if (current) {
-          const previous = current.onRuntimeInitialized
-          current.onRuntimeInitialized = () => {
-            previous?.()
-            const ready = globalThis.cv
-            if (isReady(ready)) succeed(ready)
-            else fail()
-          }
-        }
-        window.setTimeout(() => {
-          const ready = globalThis.cv
-          if (!settled && isReady(ready)) succeed(ready)
-          else if (!settled && !current) fail()
-        }, 400)
-      }
-
-      script.onerror = () => fail()
-      document.head.appendChild(script)
+      void loadSource(source, remaining).then(
+        (cv) => resolve(cv),
+        () => attempt(index + 1),
+      )
     }
 
     attempt(0)
+  })
+}
+
+function loadSource(src: string, budgetMs: number): Promise<Cv> {
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const script = document.createElement('script')
+    script.src = src
+    script.async = true
+    script.dataset.opencvSrc = src
+
+    const finish = (error: Error | null) => {
+      if (settled) return
+      settled = true
+      window.clearTimeout(timer)
+      window.clearInterval(poll)
+      script.onload = null
+      script.onerror = null
+      if (!error && isReady(globalThis.cv)) {
+        resolve(globalThis.cv)
+        return
+      }
+      script.remove()
+      reject(error ?? new Error('OpenCV.js did not initialize'))
+    }
+
+    const timer = window.setTimeout(() => finish(new Error('OpenCV.js timed out')), budgetMs)
+    const poll = window.setInterval(() => {
+      if (isReady(globalThis.cv)) finish(null)
+    }, 100)
+
+    const previous = globalThis.cv
+    const runtime = previous && typeof previous === 'object' ? previous : {}
+    const earlier = runtime.onRuntimeInitialized
+    runtime.onRuntimeInitialized = () => {
+      earlier?.()
+      if (isReady(globalThis.cv)) finish(null)
+    }
+    globalThis.cv = runtime
+
+    script.onload = () => {
+      if (isReady(globalThis.cv)) finish(null)
+    }
+    script.onerror = () => finish(new Error('OpenCV.js failed to download'))
+    document.head.appendChild(script)
   })
 }
 

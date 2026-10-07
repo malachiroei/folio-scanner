@@ -8,7 +8,7 @@ export type Corners = Record<CornerKey, Point>
 
 export type Screen = 'home' | 'camera' | 'prepare' | 'corners' | 'preview' | 'pages'
 
-export type EngineStatus = 'loading' | 'ready' | 'error'
+export type EngineStatus = 'loading' | 'ready' | 'fallback'
 
 export type Draft = {
   sourceUrl: string
