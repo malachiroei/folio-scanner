@@ -1,0 +1,70 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-sans: "Outfit", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Fraunces", Georgia, serif;
+  --color-ink: #14221c;
+  --color-moss: #1c6b56;
+  --color-moss-bright: #2f9d80;
+  --color-sand: #efe7da;
+  --color-paper: #fbf7f0;
+  --color-copper: #c56a3d;
+  --color-copper-bright: #e7a06a;
+  --color-night: #0e1614;
+  --color-night-2: #182320;
+  --color-mist: #5e6f68;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  background: var(--color-sand);
+  color: var(--color-ink);
+}
+
+button,
+a {
+  -webkit-tap-highlight-color: transparent;
+}
+
+::selection {
+  background: #e7a06a;
+  color: #14221c;
+}
+
+.app-bg {
+  background:
+    radial-gradient(900px 420px at 0% -10%, rgba(47, 157, 128, 0.18), transparent 60%),
+    radial-gradient(700px 380px at 100% 0%, rgba(212, 120, 74, 0.16), transparent 55%),
+    var(--color-sand);
+}
+
+.dark .app-bg {
+  background:
+    radial-gradient(900px 420px at 0% -10%, rgba(47, 157, 128, 0.22), transparent 60%),
+    radial-gradient(700px 380px at 100% 0%, rgba(231, 160, 106, 0.12), transparent 55%),
+    var(--color-night);
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.rise {
+  animation: rise 0.35s ease both;
+}
