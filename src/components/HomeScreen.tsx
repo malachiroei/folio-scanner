@@ -1,7 +1,6 @@
 import { Camera, Moon, Sun } from 'lucide-react'
 import { useScan } from '../state/scan-context'
 import { Button } from './Button'
-import { Spinner } from './Spinner'
 import { UploadDropzone } from './UploadDropzone'
 
 export function HomeScreen() {
@@ -72,38 +71,17 @@ export function HomeScreen() {
         )}
 
         <div className="mt-auto pt-8">
-          <div aria-live="polite">
-            {engine === 'loading' && (
-              <div className="flex items-center gap-2 text-sm text-mist dark:text-paper/60">
-                <Spinner className="size-4" />
-                <span>Loading vision engine… You can scan now.</span>
-              </div>
-            )}
-            {engine === 'ready' && (
-              <div className="flex items-center gap-2 text-sm text-mist dark:text-paper/60">
-                <span className="size-2 rounded-full bg-moss-bright" />
-                Ready to scan
-              </div>
-            )}
-            {engine === 'fallback' && (
-              <div className="rounded-2xl bg-paper px-4 py-3 text-sm ring-1 ring-copper/40 dark:bg-night-2">
-                <p className="font-semibold text-ink dark:text-paper">Vision engine didn’t load</p>
-                <p className="mt-1 leading-5 text-mist dark:text-paper/70">
-                  You can still capture and upload. Cropping, straightening, and contrast work without it.
-                </p>
-                <button
-                  type="button"
-                  className="mt-3 rounded-xl bg-moss px-3 py-2 text-sm font-semibold text-paper"
-                  onClick={retryEngine}
-                >
-                  Retry vision engine
-                </button>
-              </div>
-            )}
-          </div>
-          <p className="mt-2 text-xs text-mist/80 dark:text-paper/40">
-            Pages stay in this tab until you export them.
-          </p>
+          {engine === 'fallback' && (
+            <div className="mb-3 rounded-2xl bg-paper px-4 py-3 text-sm ring-1 ring-black/10 dark:bg-night-2 dark:ring-white/10">
+              <p className="leading-5 text-mist dark:text-paper/70">
+                Edge detection is unavailable. Cropping and filters still work.
+              </p>
+              <button type="button" className="mt-2 font-semibold text-moss dark:text-moss-bright" onClick={retryEngine}>
+                Retry
+              </button>
+            </div>
+          )}
+          <p className="text-xs text-mist/80 dark:text-paper/40">Pages stay in this tab until you export them.</p>
         </div>
       </div>
     </div>

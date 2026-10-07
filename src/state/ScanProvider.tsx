@@ -26,7 +26,7 @@ function pageFileName(index: number) {
 
 export function ScanProvider({ children }: { children: ReactNode }) {
   const [theme, setTheme] = useState<'light' | 'dark'>(readTheme)
-  const [engine, setEngine] = useState<EngineStatus>('loading')
+  const [engine, setEngine] = useState<EngineStatus>('idle')
   const [screen, setScreen] = useState<Screen>('home')
   const [busy, setBusy] = useState<string | null>(null)
   const [toast, setToast] = useState<string | null>(null)
@@ -54,25 +54,6 @@ export function ScanProvider({ children }: { children: ReactNode }) {
   }, [theme])
 
   useEffect(() => {
-    let live = true
-    const unblock = window.setTimeout(() => {
-      if (!live) return
-      setEngine((status) => (status === 'loading' ? 'fallback' : status))
-    }, 8000)
-    loadOpenCv()
-      .then(() => {
-        if (live) setEngine('ready')
-      })
-      .catch(() => {
-        if (live) setEngine((status) => (status === 'ready' ? status : 'fallback'))
-      })
-    return () => {
-      live = false
-      window.clearTimeout(unblock)
-    }
-  }, [])
-
-  useEffect(() => {
     if (!toast) return
     const id = window.setTimeout(() => setToast(null), 4200)
     return () => window.clearTimeout(id)
@@ -89,20 +70,19 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     setTheme((current) => (current === 'dark' ? 'light' : 'dark'))
   }
 
+  function beginVisionLoad() {
+    if (isOpenCvReady()) {
+      setEngine('ready')
+      return
+    }
+    void loadOpenCv()
+      .then(() => setEngine('ready'))
+      .catch(() => setEngine((status) => (status === 'ready' ? status : 'fallback')))
+  }
+
   function retryEngine() {
-    setEngine('loading')
-    const unblock = window.setTimeout(() => {
-      setEngine((status) => (status === 'loading' ? 'fallback' : status))
-    }, 8000)
-    loadOpenCv()
-      .then(() => {
-        window.clearTimeout(unblock)
-        setEngine('ready')
-      })
-      .catch(() => {
-        window.clearTimeout(unblock)
-        setEngine((status) => (status === 'ready' ? status : 'fallback'))
-      })
+    setToast('Retrying the vision engine in the background.')
+    beginVisionLoad()
   }
 
   function dismissToast() {
@@ -113,8 +93,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     setScreen('prepare')
     const visionReady = isOpenCvReady()
     setBusy(visionReady ? 'Finding the page…' : 'Preparing photo…')
-    if (visionReady) setToast(null)
-    else setToast('Vision engine isn’t ready. You can still crop and adjust this photo.')
+    if (!visionReady) setToast('Preparing this photo. Edge detection will catch up in the background.')
     await nextFrame()
     let normalized: { url: string; width: number; height: number } | null = null
     try {
@@ -133,6 +112,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
         editingId: null,
       })
       setScreen('corners')
+      window.setTimeout(() => beginVisionLoad(), 0)
     } catch (error) {
       if (normalized) URL.revokeObjectURL(normalized.url)
       setToast(errorMessage(error))
