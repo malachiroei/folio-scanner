@@ -199,14 +199,6 @@ export function ScanProvider({ children }: { children: ReactNode }) {
       return
     }
     try {
-      if (!isOpenCvReady()) {
-        await loadOpenCv()
-        setEngine('ready')
-      }
-      if (cancelled()) {
-        stopDetecting()
-        return
-      }
       await nextFrame()
       if (cancelled()) {
         stopDetecting()
@@ -226,7 +218,6 @@ export function ScanProvider({ children }: { children: ReactNode }) {
       applyAutoCorners(found.corners, true)
     } catch (error) {
       console.error(error)
-      if (!isOpenCvReady()) setEngine((status) => (status === 'ready' ? status : 'fallback'))
       if (cancelled()) return
       stopDetecting()
       setToast(errorMessage(error))
@@ -234,7 +225,6 @@ export function ScanProvider({ children }: { children: ReactNode }) {
   }
 
   async function ingestBlob(blob: Blob) {
-    beginVisionLoad()
     setScreen('prepare')
     setBusy('מכין את התמונה…')
     await nextFrame()
@@ -972,10 +962,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     draft,
     preview,
     selectedId,
-    openCamera: () => {
-      setScreen('camera')
-      window.setTimeout(() => beginVisionLoad(), 400)
-    },
+    openCamera: () => setScreen('camera'),
     closeCamera: () => setScreen('home'),
     ingestFile,
     ingestBlob,

@@ -24,6 +24,7 @@ export function CameraCapture() {
   const { closeCamera, ingestBlob, ingestFile } = useScan()
   const videoRef = useRef<HTMLVideoElement>(null)
   const fileRef = useRef<HTMLInputElement>(null)
+  const nativeRef = useRef<HTMLInputElement>(null)
   const [facing, setFacing] = useState<'environment' | 'user'>('environment')
   const [error, setError] = useState<string | null>(null)
   const [ready, setReady] = useState(false)
@@ -43,22 +44,35 @@ export function CameraCapture() {
         return
       }
       try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          audio: false,
-          video: {
-            facingMode: { ideal: facing },
-            width: { ideal: 1280 },
-            height: { ideal: 1280 },
-          },
-        })
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({
+            audio: false,
+            video: {
+              facingMode: { ideal: facing },
+              width: { ideal: 1920 },
+              height: { ideal: 1080 },
+            },
+          })
+        } catch (first) {
+          if (first instanceof DOMException && (first.name === 'NotAllowedError' || first.name === 'SecurityError')) {
+            throw first
+          }
+          stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false })
+        }
         if (cancelled) {
           stream.getTracks().forEach((track) => track.stop())
           return
         }
         view.srcObject = stream
-        await view.play()
+        try {
+          await view.play()
+        } catch (playError) {
+          // A interrupted play() (e.g. fast unmount) is harmless; the stream is still attached.
+          console.warn(playError)
+        }
         if (!cancelled) setReady(true)
       } catch (err) {
+        console.error(err)
         if (!cancelled) setError(cameraMessage(err))
       }
     }
@@ -127,10 +141,29 @@ export function CameraCapture() {
       </div>
 
       {error && (
-        <div className="absolute inset-x-5 top-24 rounded-2xl bg-black/70 px-4 py-3 text-sm leading-5">
-          {error}
+        <div className="absolute inset-x-5 top-24 z-10 rounded-2xl bg-black/70 px-4 py-3 text-sm leading-5">
+          <p>{error}</p>
+          <button
+            type="button"
+            className="mt-3 min-h-11 w-full rounded-xl bg-white px-4 py-2 font-semibold text-black"
+            onClick={() => nativeRef.current?.click()}
+          >
+            צלם או בחר תמונה
+          </button>
         </div>
       )}
+      <input
+        ref={nativeRef}
+        type="file"
+        accept="image/*"
+        capture="environment"
+        className="sr-only"
+        onChange={(event) => {
+          const file = event.target.files?.[0]
+          event.target.value = ''
+          if (file) ingestFile(file)
+        }}
+      />
 
       <div className="absolute inset-x-0 bottom-0 flex items-center justify-between px-8 pb-[max(1.25rem,env(safe-area-inset-bottom))]">
         <button
