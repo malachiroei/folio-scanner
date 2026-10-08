@@ -109,12 +109,22 @@ function sample(data: Uint8ClampedArray, width: number, height: number, x: numbe
   return [mix(0), mix(1), mix(2), mix(3)]
 }
 
+function paintScaled(source: HTMLCanvasElement, width: number, height: number): HTMLCanvasElement {
+  const canvas = document.createElement('canvas')
+  canvas.width = width
+  canvas.height = height
+  canvas.getContext('2d')?.drawImage(source, 0, 0, width, height)
+  return canvas
+}
+
 async function warpCanvas(
   source: HTMLCanvasElement,
   corners: Corners,
   width: number,
   height: number,
+  deadlineAt = Number.POSITIVE_INFINITY,
 ): Promise<HTMLCanvasElement> {
+  if (performance.now() > deadlineAt) return paintScaled(source, width, height)
   const context = source.getContext('2d', { willReadFrequently: true })
   if (!context) throw new Error('לא ניתן לקרוא את התמונה.')
   const pixels = context.getImageData(0, 0, source.width, source.height)
@@ -136,10 +146,15 @@ async function warpCanvas(
     return canvas
   }
 
+  if (performance.now() > deadlineAt) return paintScaled(source, width, height)
+
   const dest = output.createImageData(width, height)
   const data = dest.data
   for (let y = 0; y < height; y += 1) {
-    if (y % 120 === 0) await nextFrame()
+    if (y % 8 === 0) {
+      await nextFrame()
+      if (performance.now() > deadlineAt) return paintScaled(source, width, height)
+    }
     for (let x = 0; x < width; x += 1) {
       const point = project(map, x, y)
       const [r, g, b, a] = sample(pixels.data, source.width, source.height, point.x, point.y)
@@ -214,7 +229,7 @@ export function desaturateCanvas(canvas: HTMLCanvasElement): HTMLCanvasElement {
   return canvas
 }
 
-function filterPixels(image: ImageData, filter: 'magic' | 'bw') {
+async function filterPixels(image: ImageData, filter: 'magic' | 'bw') {
   const { data, width, height } = image
   const gray = new Float32Array(width * height)
   for (let i = 0; i < gray.length; i += 1) gray[i] = luminance(data, i * 4)
@@ -222,6 +237,7 @@ function filterPixels(image: ImageData, filter: 'magic' | 'bw') {
   const radius = Math.max(8, Math.round(Math.min(width, height) / (filter === 'bw' ? 28 : 14)))
 
   for (let y = 0; y < height; y += 1) {
+    if (y % 16 === 0) await nextFrame()
     const y0 = Math.max(0, y - radius)
     const y1 = Math.min(height, y + radius + 1)
     for (let x = 0; x < width; x += 1) {
@@ -251,15 +267,16 @@ function filterPixels(image: ImageData, filter: 'magic' | 'bw') {
 export async function straightenCanvas(
   image: CanvasImageSource,
   corners: Corners,
+  deadlineAt = Number.POSITIVE_INFINITY,
 ): Promise<HTMLCanvasElement> {
   const fitted = outputSize(corners)
   const scale = Math.min(1, MAX_EDGE / Math.max(fitted.width, fitted.height, 1))
   const width = Math.max(32, Math.round(fitted.width * scale))
   const height = Math.max(32, Math.round(fitted.height * scale))
-  return warpCanvas(drawSource(image), corners, width, height)
+  return warpCanvas(drawSource(image), corners, width, height, deadlineAt)
 }
 
-export function applyCanvasMagic(source: HTMLCanvasElement): HTMLCanvasElement {
+export async function applyCanvasMagic(source: HTMLCanvasElement): Promise<HTMLCanvasElement> {
   const canvas = document.createElement('canvas')
   canvas.width = source.width
   canvas.height = source.height
@@ -267,7 +284,7 @@ export function applyCanvasMagic(source: HTMLCanvasElement): HTMLCanvasElement {
   if (!context) return source
   context.drawImage(source, 0, 0)
   const pixels = context.getImageData(0, 0, canvas.width, canvas.height)
-  filterPixels(pixels, 'magic')
+  await filterPixels(pixels, 'magic')
   context.putImageData(pixels, 0, 0)
   return canvas
 }
@@ -284,7 +301,7 @@ export async function renderCanvasDocument(
   const context = copyCanvas(warped).getContext('2d', { willReadFrequently: true })
   if (!context) return warped
   const pixels = context.getImageData(0, 0, context.canvas.width, context.canvas.height)
-  filterPixels(pixels, 'bw')
+  await filterPixels(pixels, 'bw')
   context.putImageData(pixels, 0, 0)
   return context.canvas
 }

@@ -1,14 +1,17 @@
 import { Mail, Share2, Trash2, X } from 'lucide-react'
 import { useState } from 'react'
+import { createPortal } from 'react-dom'
 import { readFavoriteEmails, writeFavoriteEmails, type FavoriteEmail } from '../lib/favorite-emails'
 import { Button } from './Button'
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 
 export function ShareDrawer({
+  open,
   onClose,
   onShare,
 }: {
+  open: boolean
   onClose: () => void
   onShare: (email?: string) => Promise<void>
 }) {
@@ -57,8 +60,14 @@ export function ShareDrawer({
     }
   }
 
-  return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center bg-night/45" role="presentation" onClick={onClose}>
+  if (!open) return null
+
+  return createPortal(
+    <div
+      className="pointer-events-auto fixed inset-0 z-[80] flex items-end justify-center bg-night/45"
+      role="presentation"
+      onClick={onClose}
+    >
       <div
         role="dialog"
         aria-modal="true"
@@ -158,6 +167,7 @@ export function ShareDrawer({
           </Button>
         </form>
       </div>
-    </div>
+    </div>,
+    document.body,
   )
 }

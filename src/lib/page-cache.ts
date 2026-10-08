@@ -37,22 +37,26 @@ export function storeMagic(key: string, canvas: HTMLCanvasElement) {
   magics.set(key, canvas)
 }
 
-export function loadMagic(key: string, produce: () => HTMLCanvasElement): Promise<HTMLCanvasElement> {
+export function loadMagic(
+  key: string,
+  produce: () => HTMLCanvasElement | Promise<HTMLCanvasElement>,
+): Promise<HTMLCanvasElement> {
   const ready = magics.get(key)
   if (ready) return Promise.resolve(ready)
   const pending = magicJobs.get(key)
   if (pending) return pending
   const job = new Promise<HTMLCanvasElement>((resolve, reject) => {
     window.setTimeout(() => {
-      try {
-        const canvas = produce()
-        magics.set(key, canvas)
-        resolve(canvas)
-      } catch (error) {
-        reject(error)
-      } finally {
-        magicJobs.delete(key)
-      }
+      void Promise.resolve()
+        .then(produce)
+        .then((canvas) => {
+          magics.set(key, canvas)
+          resolve(canvas)
+        })
+        .catch(reject)
+        .finally(() => {
+          magicJobs.delete(key)
+        })
     }, 0)
   })
   magicJobs.set(key, job)

@@ -46,6 +46,9 @@ export function ScanProvider({ children }: { children: ReactNode }) {
   const pagesRef = useRef(pages)
   const previewRef = useRef(preview)
   const requestRef = useRef(0)
+  const processingRef = useRef(false)
+  const processingOwner = useRef(0)
+  const processedKeyRef = useRef<string | null>(null)
   const userAdjustedRef = useRef(false)
   const detectGen = useRef(0)
   const busyToken = useRef(0)
@@ -251,6 +254,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
         editingId: null,
       }
       draftRef.current = next
+      processedKeyRef.current = null
       setDraft(next)
       setBusy(null)
       setScreen('corners')
@@ -378,7 +382,13 @@ export function ScanProvider({ children }: { children: ReactNode }) {
   }
 
   async function renderPreview(source: Draft) {
+    const key = pageKey(source.sourceUrl, source.corners)
+    if (processingRef.current) return
+    if (processedKeyRef.current === key && previewRef.current) return
     const token = ++requestRef.current
+    processingRef.current = true
+    processingOwner.current = token
+    processedKeyRef.current = key
     const endBusy = beginBusy('מיישר את העמוד…')
     let released = false
     const release = () => {
@@ -388,20 +398,46 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     }
     try {
       await nextFrame()
-      const { key, canvas } = await warpCanvasFor(source.sourceUrl, source.corners)
       if (token !== requestRef.current) return
-      const warpBlob = await canvasToJpegBlob(canvas, 0.92)
+      const warped = await warpCanvasFor(source.sourceUrl, source.corners)
+      if (token !== requestRef.current) return
+      const warpBlob = await canvasToJpegBlob(warped.canvas, 0.92)
       if (token !== requestRef.current) return
       const warpUrl = URL.createObjectURL(warpBlob)
       replacePreview({
         url: warpUrl,
         warpUrl,
         magicUrl: null,
-        width: canvas.width,
-        height: canvas.height,
+        width: warped.canvas.width,
+        height: warped.canvas.height,
       })
+    } catch (error) {
+      console.error(error)
+      if (token === requestRef.current) {
+        processedKeyRef.current = null
+        setToast(errorMessage(error))
+      }
+    } finally {
+      if (processingOwner.current === token) processingRef.current = false
       release()
-      const magic = cachedMagic(key) ?? (await loadMagic(key, () => renderMagic(canvas)))
+    }
+  }
+
+  async function fillMagic(source: Draft) {
+    const shot = previewRef.current
+    if (!shot || shot.magicUrl || processingRef.current) return
+    const token = ++requestRef.current
+    processingRef.current = true
+    processingOwner.current = token
+    const endBusy = beginBusy('מנקה את העמוד…')
+    try {
+      await nextFrame()
+      if (token !== requestRef.current) return
+      const key = pageKey(source.sourceUrl, source.corners)
+      const warp = cachedWarp(key) ?? (await raster(shot.warpUrl))
+      storeWarp(key, warp)
+      if (token !== requestRef.current) return
+      const magic = cachedMagic(key) ?? (await loadMagic(key, () => renderMagic(warp)))
       if (token !== requestRef.current) return
       const magicBlob = await canvasToJpegBlob(magic, 0.93)
       if (token !== requestRef.current) return
@@ -409,16 +445,17 @@ export function ScanProvider({ children }: { children: ReactNode }) {
       const current = previewRef.current
       replacePreview({
         url: magicUrl,
-        warpUrl: current?.warpUrl ?? warpUrl,
+        warpUrl: current?.warpUrl ?? shot.warpUrl,
         magicUrl,
-        width: canvas.width,
-        height: canvas.height,
+        width: shot.width,
+        height: shot.height,
       })
     } catch (error) {
       console.error(error)
       if (token === requestRef.current) setToast(errorMessage(error))
     } finally {
-      release()
+      if (processingOwner.current === token) processingRef.current = false
+      endBusy()
     }
   }
 
@@ -434,7 +471,6 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     }
     try {
       setScreen('preview')
-      window.setTimeout(() => beginVisionLoad(), 50)
       void renderPreview(current)
     } catch (error) {
       console.error(error)
@@ -446,6 +482,8 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     const current = draftRef.current
     detectGen.current += 1
     requestRef.current += 1
+    processingRef.current = false
+    processedKeyRef.current = null
     replacePreview(null)
     setBusy(null)
     if (current?.editingId) {
@@ -460,21 +498,27 @@ export function ScanProvider({ children }: { children: ReactNode }) {
 
   function backToCorners() {
     requestRef.current += 1
+    processingRef.current = false
+    processedKeyRef.current = null
     setBusy(null)
     setScreen('corners')
   }
 
   function setFilter(filter: FilterMode) {
     const current = draftRef.current
-    if (!current || current.filter === filter) return
-    const next = { ...current, filter }
-    draftRef.current = next
-    setDraft(next)
+    if (!current) return
+    if (current.filter !== filter) {
+      const next = { ...current, filter }
+      draftRef.current = next
+      setDraft(next)
+    }
+    if (filter === 'magic' && !previewRef.current?.magicUrl) void fillMagic(current)
   }
 
   function retryPreview() {
     const current = draftRef.current
-    if (!current) return
+    if (!current || processingRef.current) return
+    processedKeyRef.current = null
     void renderPreview(current)
   }
 
@@ -490,6 +534,8 @@ export function ScanProvider({ children }: { children: ReactNode }) {
       : 'לצאת בלי לשמור את העמוד?'
     if (!window.confirm(question)) return
     requestRef.current += 1
+    processingRef.current = false
+    processedKeyRef.current = null
     replacePreview(null)
     if (!pagesRef.current.some((page) => page.sourceUrl === current.sourceUrl)) {
       URL.revokeObjectURL(current.sourceUrl)
@@ -567,6 +613,8 @@ export function ScanProvider({ children }: { children: ReactNode }) {
       }
       rememberPage(page)
       requestRef.current += 1
+      processingRef.current = false
+      processedKeyRef.current = null
       replacePreview(null)
       draftRef.current = null
       setDraft(null)
@@ -695,6 +743,8 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     detectGen.current += 1
     userAdjustedRef.current = true
     requestRef.current += 1
+    processingRef.current = false
+    processedKeyRef.current = null
     replacePreview(null)
     setBusy(null)
     setDraft({
