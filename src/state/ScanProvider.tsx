@@ -804,7 +804,11 @@ export function ScanProvider({ children }: { children: ReactNode }) {
       }
       let shared = false
       try {
-        if (typeof navigator.canShare === 'function' && navigator.canShare(payload)) {
+        if (
+          typeof navigator.share === 'function' &&
+          typeof navigator.canShare === 'function' &&
+          navigator.canShare(payload)
+        ) {
           await navigator.share(payload)
           shared = true
         }

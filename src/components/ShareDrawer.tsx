@@ -78,7 +78,7 @@ export function ShareDrawer({
           <button
             type="button"
             onClick={onClose}
-            className="grid size-11 shrink-0 place-items-center rounded-full hover:bg-black/5 dark:hover:bg-white/8"
+            className="pointer-events-auto grid size-11 shrink-0 touch-manipulation place-items-center rounded-full hover:bg-black/5 dark:hover:bg-white/8"
             aria-label="סגור"
           >
             <X className="size-5" />
@@ -102,7 +102,7 @@ export function ShareDrawer({
                 type="button"
                 disabled={sending !== null}
                 onClick={() => void send(item.email)}
-                className="flex min-h-12 min-w-0 flex-1 items-center gap-2 rounded-2xl bg-paper px-3 text-start active:scale-[0.98] disabled:opacity-40 dark:bg-night-2"
+                className="pointer-events-auto flex min-h-12 min-w-0 flex-1 touch-manipulation items-center gap-2 rounded-2xl bg-paper px-3 text-start active:scale-[0.98] disabled:opacity-40 dark:bg-night-2"
               >
                 <Mail className="size-4 shrink-0 text-moss" />
                 <span className="min-w-0">
@@ -112,7 +112,7 @@ export function ShareDrawer({
               </button>
               <button
                 type="button"
-                className="grid size-11 shrink-0 place-items-center rounded-2xl bg-paper text-copper active:scale-[0.98] dark:bg-night-2"
+                className="pointer-events-auto grid size-11 shrink-0 touch-manipulation place-items-center rounded-2xl bg-paper text-copper active:scale-[0.98] dark:bg-night-2"
                 aria-label={`מחק את ${item.name}`}
                 onClick={() => persist(favorites.filter((entry) => entry.id !== item.id))}
               >

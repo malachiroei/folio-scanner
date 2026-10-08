@@ -33,7 +33,7 @@ export function FilterControls({
               aria-checked={selected}
               disabled={disabled}
               onClick={() => onChange(filter.id)}
-              className={`flex min-h-16 flex-col items-center justify-center gap-1 rounded-2xl px-1 text-[11px] leading-tight font-semibold transition active:scale-[0.98] disabled:opacity-40 ${
+              className={`pointer-events-auto flex min-h-16 touch-manipulation flex-col items-center justify-center gap-1 rounded-2xl px-1 text-[11px] leading-tight font-semibold transition active:scale-[0.98] disabled:opacity-40 ${
                 selected
                   ? 'bg-moss text-paper shadow-[0_8px_18px_rgba(28,107,86,0.2)]'
                   : 'bg-sand/70 text-ink dark:bg-white/6 dark:text-paper'
