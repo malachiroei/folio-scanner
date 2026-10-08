@@ -91,11 +91,21 @@ export function ScanProvider({ children }: { children: ReactNode }) {
 
   function beginBusy(label: string) {
     const token = ++busyToken.current
+    let closed = false
+    const finish = () => {
+      if (closed || token !== busyToken.current) return
+      closed = true
+      busyToken.current += 1
+      setBusy(null)
+    }
     const timer = window.setTimeout(() => {
-      if (token === busyToken.current) setBusy(label)
+      if (!closed && token === busyToken.current) setBusy(label)
     }, 100)
+    const failsafe = window.setTimeout(finish, 500)
     return () => {
+      closed = true
       window.clearTimeout(timer)
+      window.clearTimeout(failsafe)
       if (token !== busyToken.current) return
       busyToken.current += 1
       setBusy(null)
@@ -370,6 +380,12 @@ export function ScanProvider({ children }: { children: ReactNode }) {
   async function renderPreview(source: Draft) {
     const token = ++requestRef.current
     const endBusy = beginBusy('מיישר את העמוד…')
+    let released = false
+    const release = () => {
+      if (released) return
+      released = true
+      endBusy()
+    }
     try {
       await nextFrame()
       const { key, canvas } = await warpCanvasFor(source.sourceUrl, source.corners)
@@ -384,6 +400,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
         width: canvas.width,
         height: canvas.height,
       })
+      release()
       const magic = cachedMagic(key) ?? (await loadMagic(key, () => renderMagic(canvas)))
       if (token !== requestRef.current) return
       const magicBlob = await canvasToJpegBlob(magic, 0.93)
@@ -401,7 +418,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
       console.error(error)
       if (token === requestRef.current) setToast(errorMessage(error))
     } finally {
-      endBusy()
+      release()
     }
   }
 
@@ -728,37 +745,91 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     }
   }
 
-  async function exportPdf() {
-    const endBusy = beginBusy('מכין PDF…')
+  async function assemblePdfPages() {
     const temps: string[] = []
+    if (draftRef.current && previewRef.current) {
+      const page = await bakedPage()
+      if (page) rememberPage(page)
+    }
+    const list = pagesRef.current
+    if (list.length === 0) throw new Error('הוסף עמוד לפני הייצוא.')
+    const ready: ScanPage[] = []
+    for (const page of list) {
+      if (page.filter === 'original') {
+        ready.push({ ...page, resultUrl: page.warpUrl })
+        continue
+      }
+      if (page.filter === 'magic' && (page.magicUrl || page.resultUrl)) {
+        ready.push({ ...page, resultUrl: page.magicUrl ?? page.resultUrl })
+        continue
+      }
+      const blob = await blobFor(page.sourceUrl, page.corners, page.filter, page)
+      const url = URL.createObjectURL(blob)
+      temps.push(url)
+      ready.push({ ...page, resultUrl: url })
+    }
+    return {
+      ready,
+      release() {
+        for (const url of temps) URL.revokeObjectURL(url)
+      },
+    }
+  }
+
+  async function createPdfFile() {
+    const assembled = await assemblePdfPages()
+    try {
+      const { buildPagesPdf, pdfFileName } = await import('../lib/pdf')
+      const blob = await buildPagesPdf(assembled.ready)
+      return new File([blob], pdfFileName(), { type: 'application/pdf' })
+    } finally {
+      assembled.release()
+    }
+  }
+
+  function openMailto(email: string) {
+    const href = `mailto:${email}?subject=${encodeURIComponent('סריקת מסמך - Folio')}&body=${encodeURIComponent('מצורף מסמך סרוק.')}`
+    window.location.href = href
+  }
+
+  async function sharePdf(email?: string) {
+    const endBusy = beginBusy('מכין PDF…')
     try {
       await nextFrame()
-      if (draftRef.current && previewRef.current) {
-        const page = await bakedPage()
-        if (page) rememberPage(page)
+      const file = await createPdfFile()
+      const payload = {
+        files: [file],
+        title: 'סריקת מסמך - Folio',
+        text: email ? `אל: ${email}\nמצורף מסמך סרוק.` : 'מצורף מסמך סרוק.',
       }
-      const list = pagesRef.current
-      if (list.length === 0) {
-        setToast('הוסף עמוד לפני הייצוא.')
-        return
-      }
-      const ready: ScanPage[] = []
-      for (const page of list) {
-        if (page.filter === 'original') {
-          ready.push({ ...page, resultUrl: page.warpUrl })
-          continue
+      let shared = false
+      try {
+        if (typeof navigator.canShare === 'function' && navigator.canShare(payload)) {
+          await navigator.share(payload)
+          shared = true
         }
-        if (page.filter === 'magic' && (page.magicUrl || page.resultUrl)) {
-          ready.push({ ...page, resultUrl: page.magicUrl ?? page.resultUrl })
-          continue
-        }
-        const blob = await blobFor(page.sourceUrl, page.corners, page.filter, page)
-        const url = URL.createObjectURL(blob)
-        temps.push(url)
-        ready.push({ ...page, resultUrl: url })
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') return
+        console.error(error)
       }
-      const { exportPagesPdf } = await import('../lib/pdf')
-      await exportPagesPdf(ready)
+      if (shared) return
+      downloadBlob(file, file.name)
+      if (email) openMailto(email)
+      else setToast('ה-PDF ירד למכשיר. אפשר לצרף אותו למייל.')
+    } catch (error) {
+      console.error(error)
+      setToast(errorMessage(error))
+    } finally {
+      endBusy()
+    }
+  }
+
+  async function exportPdf() {
+    const endBusy = beginBusy('מכין PDF…')
+    try {
+      await nextFrame()
+      const file = await createPdfFile()
+      downloadBlob(file, file.name)
       try {
         const { default: confetti } = await import('canvas-confetti')
         void confetti({
@@ -776,7 +847,6 @@ export function ScanProvider({ children }: { children: ReactNode }) {
       console.error(error)
       setToast(errorMessage(error))
     } finally {
-      for (const url of temps) URL.revokeObjectURL(url)
       endBusy()
     }
   }
@@ -811,6 +881,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     commitPage,
     addPage,
     downloadDraft,
+    sharePdf,
     openPages,
     closePages: () => setScreen('home'),
     selectPage,

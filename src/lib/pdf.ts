@@ -29,7 +29,11 @@ function pageFormat(width: number, height: number) {
   return { pw, ph, orientation } as const
 }
 
-export async function exportPagesPdf(pages: ScanPage[]) {
+export function pdfFileName() {
+  return `folio-${pageStamp()}.pdf`
+}
+
+export async function buildPagesPdf(pages: ScanPage[]): Promise<Blob> {
   if (pages.length === 0) throw new Error('הוסף עמוד לפני הייצוא.')
 
   let doc: jsPDF | null = null
@@ -53,5 +57,9 @@ export async function exportPagesPdf(pages: ScanPage[]) {
 
   if (!doc) throw new Error('הוסף עמוד לפני הייצוא.')
   doc.setProperties({ title: 'Folio — סורק מסמכים', creator: 'Folio' })
-  downloadBlob(doc.output('blob'), `folio-${pageStamp()}.pdf`)
+  return doc.output('blob')
+}
+
+export async function exportPagesPdf(pages: ScanPage[]) {
+  downloadBlob(await buildPagesPdf(pages), pdfFileName())
 }

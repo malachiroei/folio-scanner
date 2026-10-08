@@ -1,20 +1,39 @@
-import { ChevronLeft, Crop, Download, FileDown, Plus } from 'lucide-react'
+import { ChevronLeft, Crop, Download, FileDown, Plus, Share2 } from 'lucide-react'
+import { useEffect, useState } from 'react'
 import { filteredSource, filterCss } from '../lib/view-filter'
 import { useScan } from '../state/scan-context'
 import { Button } from './Button'
 import { FilterControls } from './FilterControls'
+import { ShareDrawer } from './ShareDrawer'
 import { Spinner } from './Spinner'
 
 export function PreviewScreen() {
-  const { draft, preview, busy, setFilter, addPage, downloadDraft, exportPdf, backToCorners, leavePreview, retryPreview } =
-    useScan()
-  if (!draft) return null
+  const {
+    draft,
+    preview,
+    busy,
+    setFilter,
+    addPage,
+    downloadDraft,
+    exportPdf,
+    sharePdf,
+    backToCorners,
+    leavePreview,
+    retryPreview,
+  } = useScan()
+  const [sharing, setSharing] = useState(false)
   const view = preview
     ? {
-        src: filteredSource(draft.filter, preview.warpUrl, preview.magicUrl ?? (preview.url === preview.warpUrl ? null : preview.url)),
-        css: filterCss(draft.filter),
+        src: filteredSource(
+          draft?.filter ?? 'original',
+          preview.warpUrl,
+          preview.magicUrl ?? (preview.url === preview.warpUrl ? null : preview.url),
+        ),
+        css: draft ? filterCss(draft.filter) : undefined,
       }
     : null
+
+  if (!draft) return null
 
   return (
     <div className="app-bg flex h-dvh flex-col overflow-hidden text-ink dark:text-paper">
@@ -31,7 +50,7 @@ export function PreviewScreen() {
       </header>
 
       <div className="flex min-h-0 flex-1 items-center justify-center p-4">
-        <div className="relative max-h-full max-w-full" aria-busy={Boolean(busy)}>
+        <div className="relative max-h-full max-w-full" aria-busy={!view && busy !== null}>
           {view ? (
             <img
               src={view.src}
@@ -40,16 +59,7 @@ export function PreviewScreen() {
               className="max-h-full max-w-full rounded-2xl bg-white object-contain shadow-[0_18px_50px_rgba(20,34,28,0.18)]"
             />
           ) : (
-            <div className="grid h-64 w-56 place-items-center rounded-2xl bg-paper text-moss shadow-lg dark:bg-night-2">
-              <Spinner className="size-8" />
-            </div>
-          )}
-          {busy && view && (
-            <div className="pointer-events-none absolute inset-0 grid place-items-center">
-              <span className="grid size-12 place-items-center rounded-full bg-night/55 text-paper shadow-lg">
-                <Spinner className="size-5" />
-              </span>
-            </div>
+            <WaitingPage />
           )}
         </div>
       </div>
@@ -85,11 +95,30 @@ export function PreviewScreen() {
             ערוך חיתוך
           </Button>
         </div>
+        <Button variant="secondary" className="w-full" disabled={!preview} onClick={() => setSharing(true)}>
+          <Share2 className="size-4" />
+          שלח במייל / שתף
+        </Button>
         <Button className="w-full" disabled={!preview} onClick={() => void exportPdf()}>
           <FileDown className="size-4" />
           ייצוא ל-PDF
         </Button>
       </footer>
+      {sharing && <ShareDrawer onClose={() => setSharing(false)} onShare={sharePdf} />}
+    </div>
+  )
+}
+
+function WaitingPage() {
+  const [visible, setVisible] = useState(true)
+  useEffect(() => {
+    const failsafe = window.setTimeout(() => setVisible(false), 500)
+    return () => window.clearTimeout(failsafe)
+  }, [])
+  if (!visible) return null
+  return (
+    <div className="grid h-64 w-56 place-items-center rounded-2xl bg-paper text-moss shadow-lg dark:bg-night-2">
+      <Spinner className="size-8" />
     </div>
   )
 }
