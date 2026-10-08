@@ -12,7 +12,17 @@ const LABELS: Record<CornerKey, string> = {
   bl: 'Bottom left corner',
 }
 
-type Loupe = { x: number; y: number; point: Point }
+const LOUPE = 184
+
+type Loupe = { x: number; y: number; point: Point; key: CornerKey }
+
+function buzz(duration: number) {
+  try {
+    navigator.vibrate?.(duration)
+  } catch {
+    // Vibration is optional and some browsers block it.
+  }
+}
 
 export function CornerEditor() {
   const { draft, updateCorners, resetDetection, useFullFrame, confirmCorners, backFromCorners } = useScan()
@@ -114,12 +124,12 @@ export function CornerEditor() {
     const image = imageRef.current
     if (!canvas || !image) return
     const dpr = window.devicePixelRatio || 1
-    const size = 148
+    const size = LOUPE
     canvas.width = Math.round(size * dpr)
     canvas.height = Math.round(size * dpr)
     const context = canvas.getContext('2d')
     if (!context) return
-    const imageWindow = Math.max(24, size / 2.4 / Math.max(displayScale, 0.0001))
+    const imageWindow = Math.max(18, size / 3.8 / Math.max(displayScale, 0.0001))
     context.clearRect(0, 0, canvas.width, canvas.height)
     context.save()
     context.beginPath()
@@ -137,13 +147,32 @@ export function CornerEditor() {
       canvas.height,
     )
     context.restore()
-    context.strokeStyle = '#e7a06a'
-    context.lineWidth = 1.5 * dpr
+    const cx = canvas.width / 2
+    const cy = canvas.height / 2
+    const gap = 14 * dpr
+    const arm = 18 * dpr
+    context.lineCap = 'round'
+    context.strokeStyle = 'rgba(255,255,255,0.95)'
+    context.lineWidth = 4 * dpr
     context.beginPath()
-    context.moveTo(canvas.width / 2, 14 * dpr)
-    context.lineTo(canvas.width / 2, canvas.height - 14 * dpr)
-    context.moveTo(14 * dpr, canvas.height / 2)
-    context.lineTo(canvas.width - 14 * dpr, canvas.height / 2)
+    context.moveTo(cx, cy - gap - arm)
+    context.lineTo(cx, cy - gap)
+    context.moveTo(cx, cy + gap)
+    context.lineTo(cx, cy + gap + arm)
+    context.moveTo(cx - gap - arm, cy)
+    context.lineTo(cx - gap, cy)
+    context.moveTo(cx + gap, cy)
+    context.lineTo(cx + gap + arm, cy)
+    context.stroke()
+    context.strokeStyle = '#c56a3d'
+    context.lineWidth = 2 * dpr
+    context.stroke()
+    context.fillStyle = '#ffffff'
+    context.beginPath()
+    context.arc(cx, cy, 3.2 * dpr, 0, Math.PI * 2)
+    context.fill()
+    context.strokeStyle = '#c56a3d'
+    context.lineWidth = 1.5 * dpr
     context.stroke()
   }, [displayScale, loupe])
 
@@ -173,13 +202,13 @@ export function CornerEditor() {
     const stageEl = stageRef.current
     if (!stageEl) return
     const rect = stageEl.getBoundingClientRect()
-    const size = 148
+    const size = LOUPE
     let x = clientX - rect.left - size / 2
     let y = clientY - rect.top - size - 36
     if (y < 8) y = clientY - rect.top + 28
     x = Math.max(8, Math.min(x, rect.width - size - 8))
     y = Math.max(8, Math.min(y, rect.height - size - 8))
-    setLoupe({ x, y, point })
+    setLoupe({ x, y, point, key: dragKey.current ?? 'tl' })
   }
 
   function movePin(event: PointerEvent<HTMLButtonElement>, key: CornerKey) {
@@ -282,13 +311,53 @@ export function CornerEditor() {
                   strokeWidth={2.5}
                   vectorEffect="non-scaling-stroke"
                 />
+                {active && (
+                  <g pointerEvents="none">
+                    <line
+                      x1={pins[active].x}
+                      y1={0}
+                      x2={pins[active].x}
+                      y2={draft.height}
+                      stroke="rgba(255,255,255,0.9)"
+                      strokeWidth={3}
+                      vectorEffect="non-scaling-stroke"
+                    />
+                    <line
+                      x1={0}
+                      y1={pins[active].y}
+                      x2={draft.width}
+                      y2={pins[active].y}
+                      stroke="rgba(255,255,255,0.9)"
+                      strokeWidth={3}
+                      vectorEffect="non-scaling-stroke"
+                    />
+                    <line
+                      x1={pins[active].x}
+                      y1={0}
+                      x2={pins[active].x}
+                      y2={draft.height}
+                      stroke="#c56a3d"
+                      strokeWidth={1.5}
+                      vectorEffect="non-scaling-stroke"
+                    />
+                    <line
+                      x1={0}
+                      y1={pins[active].y}
+                      x2={draft.width}
+                      y2={pins[active].y}
+                      stroke="#c56a3d"
+                      strokeWidth={1.5}
+                      vectorEffect="non-scaling-stroke"
+                    />
+                  </g>
+                )}
               </svg>
               {CORNER_KEYS.map((key) => (
                 <button
                   key={key}
                   type="button"
                   aria-label={LABELS[key]}
-                  className="absolute z-20 size-11 -translate-x-1/2 -translate-y-1/2"
+                  className={`absolute size-14 -translate-x-1/2 -translate-y-1/2 ${active === key ? 'z-30' : 'z-20'}`}
                   style={{
                     left: `${(pins[key].x / draft.width) * 100}%`,
                     top: `${(pins[key].y / draft.height) * 100}%`,
@@ -306,11 +375,13 @@ export function CornerEditor() {
                     cornersRef.current = current
                     dragKey.current = key
                     setActive(key)
+                    buzz(12)
                     event.currentTarget.setPointerCapture(event.pointerId)
                     placeLoupe(event.clientX, event.clientY, current[key])
                   }}
                   onPointerMove={(event) => movePin(event, key)}
                   onPointerUp={() => {
+                    if (dragged.current) buzz(8)
                     dragKey.current = null
                     if (!dragged.current) {
                       visualRef.current = page.corners
@@ -345,10 +416,14 @@ export function CornerEditor() {
                   }}
                 >
                   <span
-                    className={`pointer-events-none absolute top-1/2 left-1/2 size-5 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white bg-copper shadow-md ${
-                      active === key ? 'scale-125' : ''
+                    className={`pointer-events-none absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full border-white bg-copper ${
+                      active === key
+                        ? 'size-9 border-[3px] shadow-[0_0_0_7px_rgba(197,106,61,0.35)]'
+                        : 'size-5 border-2 shadow-md'
                     }`}
-                  />
+                  >
+                    <span className="absolute top-1/2 left-1/2 size-1.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-white" />
+                  </span>
                 </button>
               ))}
             </div>
@@ -356,24 +431,31 @@ export function CornerEditor() {
         </div>
         {loupe && (
           <div
-            className="pointer-events-none absolute z-30 size-36 overflow-hidden rounded-full border-4 border-white shadow-2xl"
-            style={{ left: loupe.x, top: loupe.y }}
+            className="pointer-events-none absolute z-30"
+            style={{ left: loupe.x, top: loupe.y, width: LOUPE }}
             aria-hidden="true"
           >
-            <canvas ref={loupeCanvasRef} className="h-full w-full" />
+            <div className="h-[184px] w-[184px] overflow-hidden rounded-full border-4 border-white shadow-[0_12px_40px_rgba(20,34,28,0.35)] ring-2 ring-copper">
+              <canvas ref={loupeCanvasRef} className="h-full w-full" />
+            </div>
+            <p className="mt-1 rounded-full bg-ink/85 px-2 py-1 text-center text-[11px] font-semibold text-white">
+              {LABELS[loupe.key]}
+            </p>
           </div>
         )}
       </div>
 
       <footer className="space-y-3 px-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
         <p className="text-center text-sm text-mist dark:text-paper/60">
-          {page.detecting
-            ? 'Looking for the page. Drag a pin whenever you want.'
-            : !page.detected
-              ? 'No clear page edge yet. The pins sit inside the frame — drag them to the corners.'
-              : valid
-                ? 'A magnifier follows your finger while you drag.'
-                : 'Those edges cross. Separate the pins so they frame the page.'}
+          {active
+            ? `${LABELS[active]}. The crosshair is the exact corner.`
+            : page.detecting
+              ? 'Looking for the page. Drag a pin whenever you want.'
+              : !page.detected
+                ? 'No clear page edge yet. The pins sit inside the frame — drag them to the corners.'
+                : valid
+                  ? 'Drag a pin. A magnifier and crosshair show the exact corner.'
+                  : 'Those edges cross. Separate the pins so they frame the page.'}
         </p>
         <Button className="w-full" disabled={!valid} onClick={confirmCorners}>
           Next / Process

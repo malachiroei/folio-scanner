@@ -37,6 +37,13 @@ export type Cv = {
     sigmaY?: number,
     borderType?: number,
   ) => void
+  bilateralFilter: (
+    src: CvMat,
+    dst: CvMat,
+    d: number,
+    sigmaColor: number,
+    sigmaSpace: number,
+  ) => void
   Canny: (src: CvMat, dst: CvMat, threshold1: number, threshold2: number) => void
   threshold: (src: CvMat, dst: CvMat, thresh: number, maxval: number, type: number) => number
   dilate: (src: CvMat, dst: CvMat, kernel: CvMat) => void
@@ -52,7 +59,11 @@ export type Cv = {
   arcLength: (contour: CvMat, closed: boolean) => number
   approxPolyDP: (curve: CvMat, approx: CvMat, epsilon: number, closed: boolean) => void
   isContourConvex: (contour: CvMat) => boolean
-  minAreaRect: (points: CvMat) => { center: { x: number; y: number } }
+  minAreaRect: (points: CvMat) => {
+    center: { x: number; y: number }
+    size: { width: number; height: number }
+    angle: number
+  }
   RotatedRect: { points: (rect: unknown) => { x: number; y: number }[] }
   matFromArray: (rows: number, cols: number, type: number, array: number[]) => CvMat
   getPerspectiveTransform: (src: CvMat, dst: CvMat) => CvMat
@@ -97,6 +108,7 @@ export type Cv = {
   INTER_AREA: number
   INTER_LINEAR: number
   THRESH_BINARY: number
+  THRESH_BINARY_INV: number
   THRESH_OTSU: number
   RETR_LIST: number
   CHAIN_APPROX_SIMPLE: number

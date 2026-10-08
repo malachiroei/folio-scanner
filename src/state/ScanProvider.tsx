@@ -131,8 +131,13 @@ export function ScanProvider({ children }: { children: ReactNode }) {
       const image = await loadImage(sourceUrl)
       if (gen !== detectGen.current || userAdjustedRef.current) return
       const found = detectDocumentCorners(image, width, height)
-      if (found.detected && performance.now() <= deadline) finish(found.corners, true)
-      else finish(inset(), false)
+      if (gen !== detectGen.current || userAdjustedRef.current) return
+      if (found.detected) {
+        settled = false
+        finish(found.corners, true)
+        return
+      }
+      if (performance.now() <= deadline && !settled) finish(inset(), false)
     }
 
     if (!isOpenCvReady()) {
