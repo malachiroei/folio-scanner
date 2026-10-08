@@ -1,6 +1,7 @@
 export type CvMat = {
   rows: number
   cols: number
+  type: () => number
   data: Uint8Array
   data32S: Int32Array
   data32F: Float32Array
@@ -55,6 +56,7 @@ export type Cv = {
     mode: number,
     method: number,
   ) => void
+  inRange: (src: CvMat, lower: CvMat, upper: CvMat, dst: CvMat) => void
   contourArea: (contour: CvMat) => number
   arcLength: (contour: CvMat, closed: boolean) => number
   approxPolyDP: (curve: CvMat, approx: CvMat, epsilon: number, closed: boolean) => void
@@ -102,6 +104,7 @@ export type Cv = {
   ) => void
   COLOR_RGBA2GRAY: number
   COLOR_RGBA2RGB: number
+  COLOR_RGB2HSV: number
   COLOR_RGB2Lab: number
   COLOR_Lab2RGB: number
   COLOR_GRAY2RGB: number
@@ -110,6 +113,7 @@ export type Cv = {
   THRESH_BINARY: number
   THRESH_BINARY_INV: number
   THRESH_OTSU: number
+  RETR_EXTERNAL: number
   RETR_LIST: number
   CHAIN_APPROX_SIMPLE: number
   MORPH_RECT: number
@@ -118,6 +122,7 @@ export type Cv = {
   MORPH_OPEN: number
   CV_8U: number
   CV_8UC1: number
+  CV_8UC3: number
   CV_32F: number
   CV_32FC2: number
   ADAPTIVE_THRESH_GAUSSIAN_C: number

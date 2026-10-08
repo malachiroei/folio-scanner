@@ -183,58 +183,58 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     const gen = ++detectGen.current
 
     window.setTimeout(() => {
-      const started = performance.now()
-      const expired = () => performance.now() - started > 1000 || gen !== detectGen.current
-      const idle = window.requestIdleCallback
       const start = () => {
-        void locatePage(sourceUrl, width, height, gen, expired)
+        void locatePage(sourceUrl, width, height, gen)
       }
-      if (typeof idle === 'function') idle(start, { timeout: 50 })
+      const idle = window.requestIdleCallback
+      if (typeof idle === 'function') idle(start, { timeout: 80 })
       else start()
     }, 50)
   }
 
-  async function locatePage(
-    sourceUrl: string,
-    width: number,
-    height: number,
-    gen: number,
-    expired: () => boolean,
-  ) {
-    if (expired() || userAdjustedRef.current) {
-      stopDetecting()
-      return
-    }
-    if (!isOpenCvReady()) {
+  async function locatePage(sourceUrl: string, width: number, height: number, gen: number) {
+    const cancelled = () => gen !== detectGen.current || userAdjustedRef.current
+    if (cancelled()) {
       stopDetecting()
       return
     }
     try {
+      if (!isOpenCvReady()) {
+        await loadOpenCv()
+        setEngine('ready')
+      }
+      if (cancelled()) {
+        stopDetecting()
+        return
+      }
       await nextFrame()
-      if (expired() || userAdjustedRef.current) {
+      if (cancelled()) {
         stopDetecting()
         return
       }
       const image = await loadImage(sourceUrl)
       await new Promise((resolve) => window.setTimeout(resolve, 0))
-      if (expired() || userAdjustedRef.current || gen !== detectGen.current) {
+      if (cancelled()) {
         stopDetecting()
         return
       }
       const found = detectDocumentCorners(image, width, height)
-      if (expired() || userAdjustedRef.current || gen !== detectGen.current || !found.detected) {
+      if (cancelled() || !found.detected) {
         stopDetecting()
         return
       }
       applyAutoCorners(found.corners, true)
     } catch (error) {
       console.error(error)
+      if (!isOpenCvReady()) setEngine((status) => (status === 'ready' ? status : 'fallback'))
+      if (cancelled()) return
       stopDetecting()
       setToast(errorMessage(error))
     }
   }
 
   async function ingestBlob(blob: Blob) {
+    beginVisionLoad()
     setScreen('prepare')
     setBusy('מכין את התמונה…')
     await nextFrame()
@@ -972,7 +972,10 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     draft,
     preview,
     selectedId,
-    openCamera: () => setScreen('camera'),
+    openCamera: () => {
+      setScreen('camera')
+      window.setTimeout(() => beginVisionLoad(), 400)
+    },
     closeCamera: () => setScreen('home'),
     ingestFile,
     ingestBlob,
