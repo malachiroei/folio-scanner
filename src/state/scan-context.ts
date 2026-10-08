@@ -20,6 +20,7 @@ export type ScanContextValue = {
   ingestBlob: (blob: Blob) => void
   updateCorners: (corners: Corners) => void
   resetDetection: () => Promise<void>
+  resetPins: () => void
   useFullFrame: () => void
   confirmCorners: () => void
   backFromCorners: () => void

@@ -47,8 +47,8 @@ export function CameraCapture() {
           audio: false,
           video: {
             facingMode: { ideal: facing },
-            width: { ideal: 2560 },
-            height: { ideal: 1920 },
+            width: { ideal: 1280 },
+            height: { ideal: 1280 },
           },
         })
         if (cancelled) {
@@ -82,16 +82,19 @@ export function CameraCapture() {
   function capture() {
     const video = videoRef.current
     if (!video || !video.videoWidth) return
+    const scale = Math.min(1, 1280 / Math.max(video.videoWidth, video.videoHeight))
+    const width = Math.max(1, Math.round(video.videoWidth * scale))
+    const height = Math.max(1, Math.round(video.videoHeight * scale))
     const canvas = document.createElement('canvas')
-    canvas.width = video.videoWidth
-    canvas.height = video.videoHeight
+    canvas.width = width
+    canvas.height = height
     const context = canvas.getContext('2d')
     if (!context) return
     if (facing === 'user') {
-      context.translate(canvas.width, 0)
+      context.translate(width, 0)
       context.scale(-1, 1)
     }
-    context.drawImage(video, 0, 0)
+    context.drawImage(video, 0, 0, width, height)
     canvas.toBlob(
       (blob) => {
         if (blob) ingestBlob(blob)

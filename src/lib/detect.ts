@@ -2,8 +2,8 @@ import type { Corners, Point } from '../types'
 import { clampPoint, cornersValid, defaultCorners, orderCorners, polygonArea } from './geometry'
 import { getCv, MatBin, type Cv, type CvMat } from './opencv'
 
-const DETECT_MAX = 1024
-const DETECT_BUDGET_MS = 1400
+const DETECT_MAX = 640
+const DETECT_BUDGET_MS = 700
 
 type Scan = {
   quad: Point[] | null
@@ -62,12 +62,7 @@ function smoothGray(cv: Cv, bin: MatBin, src: CvMat): CvMat {
   const gray = bin.keep(new cv.Mat())
   cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY)
   const blurred = bin.keep(new cv.Mat())
-  try {
-    // Small radius: keeps a faint page edge, drops paper grain and text.
-    cv.bilateralFilter(gray, blurred, 5, 50, 50)
-  } catch {
-    cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0)
-  }
+  cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0)
   return blurred
 }
 

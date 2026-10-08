@@ -31,7 +31,12 @@ class AppErrorBoundary extends Component<{ children: ReactNode }, BoundaryState>
   state: BoundaryState = { message: null }
 
   static getDerivedStateFromError(error: unknown): BoundaryState {
+    console.error(error)
     return { message: error instanceof Error ? error.message : 'משהו השתבש.' }
+  }
+
+  componentDidCatch(error: unknown) {
+    console.error(error)
   }
 
   render() {

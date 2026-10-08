@@ -24,8 +24,18 @@ function buzz(duration: number) {
   }
 }
 
+function stopGesture(event: { preventDefault: () => void; stopPropagation?: () => void }) {
+  try {
+    event.preventDefault()
+    event.stopPropagation?.()
+  } catch (error) {
+    console.error(error)
+  }
+}
+
 export function CornerEditor() {
-  const { draft, updateCorners, resetDetection, useFullFrame, confirmCorners, backFromCorners } = useScan()
+  const { draft, updateCorners, resetDetection, resetPins, useFullFrame, confirmCorners, backFromCorners } =
+    useScan()
   const stageRef = useRef<HTMLDivElement>(null)
   const frameRef = useRef<HTMLDivElement>(null)
   const imageRef = useRef<HTMLImageElement>(null)
@@ -35,10 +45,10 @@ export function CornerEditor() {
   const dragKey = useRef<CornerKey | null>(null)
   const dragged = useRef(false)
   const seenSnap = useRef(0)
+  const pageRef = useRef(draft)
   const animRef = useRef(0)
   const animSettled = useRef(false)
   const [visual, setVisual] = useState<Corners | null>(null)
-  const [shownToken, setShownToken] = useState(0)
   const [stage, setStage] = useState({ w: 0, h: 0 })
   const [active, setActive] = useState<CornerKey | null>(null)
   const [loupe, setLoupe] = useState<Loupe | null>(null)
@@ -48,19 +58,23 @@ export function CornerEditor() {
   const corners = draft?.corners
 
   useLayoutEffect(() => {
+    pageRef.current = draft
     if (!draft?.corners || draft.snapToken !== seenSnap.current || dragKey.current) return
+    cancelAnimationFrame(animRef.current)
+    animRef.current = 0
+    animSettled.current = true
     visualRef.current = draft.corners
     cornersRef.current = draft.corners
     setVisual(draft.corners)
-  }, [draft?.corners, draft?.snapToken])
+  }, [draft])
 
   useEffect(() => {
-    if (!draft || draft.snapToken === 0 || draft.snapToken === seenSnap.current) return
-    const token = draft.snapToken
-    const to = draft.corners
+    const page = pageRef.current
+    if (!page || page.snapToken === 0 || page.snapToken === seenSnap.current) return
+    const token = page.snapToken
+    const to = page.corners
     const previous = seenSnap.current
     seenSnap.current = token
-    setShownToken(token)
     if (dragKey.current) {
       visualRef.current = to
       cornersRef.current = to
@@ -68,7 +82,7 @@ export function CornerEditor() {
       return
     }
     animSettled.current = false
-    const from = defaultCorners(draft.width, draft.height, 0)
+    const from = visualRef.current ?? defaultCorners(page.width, page.height, 0.1)
     visualRef.current = from
     cornersRef.current = from
     setVisual(from)
@@ -94,12 +108,9 @@ export function CornerEditor() {
     return () => {
       cancelAnimationFrame(animRef.current)
       animRef.current = 0
-      if (!animSettled.current) {
-        seenSnap.current = previous
-        setShownToken(previous)
-      }
+      if (!animSettled.current) seenSnap.current = previous
     }
-  }, [draft])
+  }, [draft?.snapToken])
 
   useLayoutEffect(() => {
     const stageEl = stageRef.current
@@ -192,10 +203,7 @@ export function CornerEditor() {
 
   if (!draft || !corners) return null
   const page = draft
-  const pins =
-    page.snapToken !== 0 && page.snapToken !== shownToken
-      ? defaultCorners(page.width, page.height, 0)
-      : (visual ?? corners)
+  const pins = visual ?? corners
 
   const valid = cornersValid(page.corners, page.width, page.height)
   const polygon = CORNER_KEYS.map((key) => `${pins[key].x},${pins[key].y}`).join(' ')
@@ -228,7 +236,7 @@ export function CornerEditor() {
   function movePin(event: PointerEvent<HTMLDivElement>, key: CornerKey) {
     if (dragKey.current !== key || !cornersRef.current) return
     if (event.pointerType === 'mouse' && event.buttons === 0) return
-    event.preventDefault()
+    stopGesture(event)
     const point = clientToImage(event.clientX, event.clientY)
     const next = { ...cornersRef.current, [key]: point }
     dragged.current = true
@@ -416,13 +424,11 @@ export function CornerEditor() {
                     WebkitUserSelect: 'none',
                   }}
                   onPointerDown={(event) => {
-                    event.preventDefault()
-                    event.stopPropagation()
+                    stopGesture(event)
                     cancelAnimationFrame(animRef.current)
                     animRef.current = 0
                     animSettled.current = true
                     seenSnap.current = page.snapToken
-                    setShownToken(page.snapToken)
                     dragged.current = false
                     const current = visualRef.current ?? page.corners
                     cornersRef.current = current
@@ -439,9 +445,6 @@ export function CornerEditor() {
                   onPointerMove={(event) => movePin(event, key)}
                   onPointerUp={finishDrag}
                   onPointerCancel={finishDrag}
-                  onTouchStart={(event) => event.preventDefault()}
-                  onTouchMove={(event) => event.preventDefault()}
-                  onTouchEnd={(event) => event.preventDefault()}
                   onKeyDown={(event) => {
                     const step = event.shiftKey ? 12 : 2
                     const delta: Record<string, [number, number] | undefined> = {
@@ -498,6 +501,13 @@ export function CornerEditor() {
                   ? 'גרור פינה. הזכוכית המגדלת והצלב מסמנים את הנקודה המדויקת.'
                   : 'הקווים נחתכים. הרחק את הפינות כך שיקיפו את העמוד.'}
         </p>
+        <button
+          type="button"
+          onClick={resetPins}
+          className="mx-auto block min-h-11 rounded-2xl bg-paper px-4 py-2 text-sm font-semibold text-ink shadow-[0_8px_20px_rgba(20,34,28,0.08)] ring-1 ring-black/10 active:scale-[0.98] dark:bg-night-2 dark:text-paper dark:ring-white/10"
+        >
+          אפס פינות
+        </button>
         <Button className="relative z-40 w-full" onClick={processPage}>
           המשך לעיבוד
           <ChevronRight className="dir-icon size-5" />

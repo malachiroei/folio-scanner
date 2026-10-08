@@ -69,6 +69,24 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     return () => window.clearTimeout(id)
   }, [toast])
 
+  useEffect(() => {
+    const report = (error: unknown) => {
+      console.error(error)
+      setToast(errorMessage(error))
+    }
+    const onError = (event: ErrorEvent) => {
+      if (event.target !== window) return
+      report(event.error ?? event.message)
+    }
+    const onRejection = (event: PromiseRejectionEvent) => report(event.reason)
+    window.addEventListener('error', onError)
+    window.addEventListener('unhandledrejection', onRejection)
+    return () => {
+      window.removeEventListener('error', onError)
+      window.removeEventListener('unhandledrejection', onRejection)
+    }
+  }, [])
+
   function replacePreview(next: PreviewImage | null) {
     const previous = previewRef.current
     if (previous && previous.url !== next?.url) URL.revokeObjectURL(previous.url)
@@ -114,69 +132,62 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     )
   }
 
-  async function locatePage(sourceUrl: string, width: number, height: number) {
+  function stopDetecting() {
+    setDraft((current) => (current ? { ...current, detecting: false } : current))
+  }
+
+  function scheduleLocate(sourceUrl: string, width: number, height: number) {
     const gen = ++detectGen.current
-    const started = performance.now()
-    let settled = false
-    const inset = () => defaultCorners(width, height, 0.1)
 
-    const timer = window.setTimeout(() => {
-      if (settled || gen !== detectGen.current || userAdjustedRef.current) return
-      settled = true
-      applyAutoCorners(inset(), false)
-    }, 1500)
-
-    const finish = (corners: Corners, detected: boolean) => {
-      if (settled || gen !== detectGen.current || userAdjustedRef.current) return
-      settled = true
-      window.clearTimeout(timer)
-      applyAutoCorners(corners, detected)
-    }
-
-    const readPage = async (deadline: number) => {
-      await nextFrame()
-      if (gen !== detectGen.current || userAdjustedRef.current) return
-      const image = await loadImage(sourceUrl)
-      if (gen !== detectGen.current || userAdjustedRef.current) return
-      const found = detectDocumentCorners(image, width, height)
-      if (gen !== detectGen.current || userAdjustedRef.current) return
-      if (found.detected) {
-        settled = false
-        finish(found.corners, true)
-        return
+    window.setTimeout(() => {
+      const started = performance.now()
+      const expired = () => performance.now() - started > 1000 || gen !== detectGen.current
+      const idle = window.requestIdleCallback
+      const start = () => {
+        void locatePage(sourceUrl, width, height, gen, expired)
       }
-      if (performance.now() <= deadline && !settled) finish(inset(), false)
-    }
+      if (typeof idle === 'function') idle(start, { timeout: 50 })
+      else start()
+    }, 50)
+  }
 
-    if (!isOpenCvReady()) {
-      finish(inset(), false)
-      void loadOpenCv()
-        .then(async () => {
-          if (userAdjustedRef.current || gen !== detectGen.current) return
-          const current = draftRef.current
-          if (!current || current.sourceUrl !== sourceUrl || current.detected) return
-          await nextFrame()
-          if (userAdjustedRef.current || gen !== detectGen.current) return
-          const image = await loadImage(sourceUrl)
-          if (userAdjustedRef.current || gen !== detectGen.current) return
-          const found = detectDocumentCorners(image, width, height)
-          if (!found.detected || userAdjustedRef.current || gen !== detectGen.current) return
-          settled = false
-          finish(found.corners, true)
-        })
-        .catch(() => {
-          // The corner screen already has the inset pins.
-        })
+  async function locatePage(
+    sourceUrl: string,
+    width: number,
+    height: number,
+    gen: number,
+    expired: () => boolean,
+  ) {
+    if (expired() || userAdjustedRef.current) {
+      stopDetecting()
       return
     }
-
+    if (!isOpenCvReady()) {
+      stopDetecting()
+      return
+    }
     try {
-      await readPage(started + 1500)
+      await nextFrame()
+      if (expired() || userAdjustedRef.current) {
+        stopDetecting()
+        return
+      }
+      const image = await loadImage(sourceUrl)
+      await new Promise((resolve) => window.setTimeout(resolve, 0))
+      if (expired() || userAdjustedRef.current || gen !== detectGen.current) {
+        stopDetecting()
+        return
+      }
+      const found = detectDocumentCorners(image, width, height)
+      if (expired() || userAdjustedRef.current || gen !== detectGen.current || !found.detected) {
+        stopDetecting()
+        return
+      }
+      applyAutoCorners(found.corners, true)
     } catch (error) {
-      finish(inset(), false)
+      console.error(error)
+      stopDetecting()
       setToast(errorMessage(error))
-    } finally {
-      window.clearTimeout(timer)
     }
   }
 
@@ -188,21 +199,22 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     try {
       normalized = await normalizeImage(blob)
       userAdjustedRef.current = false
-      setDraft({
+      const next = {
         sourceUrl: normalized.url,
         width: normalized.width,
         height: normalized.height,
-        corners: defaultCorners(normalized.width, normalized.height, 0),
-        filter: 'magic',
+        corners: defaultCorners(normalized.width, normalized.height, 0.1),
+        filter: 'magic' as const,
         detected: false,
         detecting: true,
         snapToken: 0,
         editingId: null,
-      })
+      }
+      draftRef.current = next
+      setDraft(next)
       setBusy(null)
       setScreen('corners')
-      void locatePage(normalized.url, normalized.width, normalized.height)
-      window.setTimeout(() => beginVisionLoad(), 0)
+      scheduleLocate(normalized.url, normalized.width, normalized.height)
     } catch (error) {
       if (normalized) URL.revokeObjectURL(normalized.url)
       setToast(errorMessage(error))
@@ -233,27 +245,45 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     const current = draftRef.current
     if (!current) return
     userAdjustedRef.current = false
-    setDraft({
+    const next = {
       ...current,
-      corners: defaultCorners(current.width, current.height, 0),
+      corners: defaultCorners(current.width, current.height, 0.1),
       detected: false,
       detecting: true,
-    })
-    void locatePage(current.sourceUrl, current.width, current.height)
+    }
+    draftRef.current = next
+    setDraft(next)
+    scheduleLocate(current.sourceUrl, current.width, current.height)
+  }
+
+  function resetPins() {
+    const current = draftRef.current
+    if (!current) return
+    detectGen.current += 1
+    userAdjustedRef.current = true
+    const next = {
+      ...current,
+      corners: defaultCorners(current.width, current.height, 0.1),
+      detected: false,
+      detecting: false,
+    }
+    draftRef.current = next
+    setDraft(next)
   }
 
   function useFullFrame() {
+    const current = draftRef.current
+    if (!current) return
+    detectGen.current += 1
     userAdjustedRef.current = true
-    setDraft((current) =>
-      current
-        ? {
-            ...current,
-            corners: defaultCorners(current.width, current.height, 0.015),
-            detected: true,
-            detecting: false,
-          }
-        : current,
-    )
+    const next = {
+      ...current,
+      corners: defaultCorners(current.width, current.height, 0.015),
+      detected: true,
+      detecting: false,
+    }
+    draftRef.current = next
+    setDraft(next)
   }
 
   async function renderPreview(source: Draft, filter: FilterMode) {
@@ -291,6 +321,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     }
     try {
       setScreen('preview')
+      window.setTimeout(() => beginVisionLoad(), 50)
       void renderPreview(current, current.filter)
     } catch (error) {
       console.error(error)
@@ -533,6 +564,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     ingestBlob,
     updateCorners,
     resetDetection,
+    resetPins,
     useFullFrame,
     confirmCorners,
     backFromCorners,
