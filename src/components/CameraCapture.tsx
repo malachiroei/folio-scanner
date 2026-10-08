@@ -49,8 +49,8 @@ export function CameraCapture() {
             audio: false,
             video: {
               facingMode: { ideal: facing },
-              width: { ideal: 1920 },
-              height: { ideal: 1080 },
+              width: { ideal: 3840 },
+              height: { ideal: 2160 },
             },
           })
         } catch (first) {
@@ -96,7 +96,7 @@ export function CameraCapture() {
   function capture() {
     const video = videoRef.current
     if (!video || !video.videoWidth) return
-    const scale = Math.min(1, 1280 / Math.max(video.videoWidth, video.videoHeight))
+    const scale = Math.min(1, 3000 / Math.max(video.videoWidth, video.videoHeight))
     const width = Math.max(1, Math.round(video.videoWidth * scale))
     const height = Math.max(1, Math.round(video.videoHeight * scale))
     const canvas = document.createElement('canvas')

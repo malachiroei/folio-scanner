@@ -1,8 +1,9 @@
-import type { Corners, FilterMode, Point } from '../types'
+﻿import type { Corners, FilterMode, Point } from '../types'
 import { outputSize } from './geometry'
 import { nextFrame } from './image'
 
-const MAX_EDGE = 1400
+/** Long edge of the straightened page. Text in a dense table needs this much to stay sharp. */
+const MAX_EDGE = 2400
 
 function sourceSize(image: CanvasImageSource): { width: number; height: number } {
   if (image instanceof HTMLImageElement) {
@@ -23,7 +24,7 @@ function drawSource(image: CanvasImageSource): HTMLCanvasElement {
   canvas.width = Math.max(1, width)
   canvas.height = Math.max(1, height)
   const context = canvas.getContext('2d', { willReadFrequently: true })
-  if (!context) throw new Error('לא ניתן להכין את התמונה.')
+  if (!context) throw new Error('׳׳ ׳ ׳™׳×׳ ׳׳”׳›׳™׳ ׳׳× ׳”׳×׳׳•׳ ׳”.')
   context.drawImage(image, 0, 0, canvas.width, canvas.height)
   return canvas
 }
@@ -76,44 +77,31 @@ function homography(from: Point[], to: Point[]): number[] | null {
   return [...solved, 1]
 }
 
-function project(h: number[], x: number, y: number): Point {
-  const w = (h[6] ?? 0) * x + (h[7] ?? 0) * y + (h[8] ?? 1)
-  const safe = Math.abs(w) < 1e-6 ? (w < 0 ? -1e-6 : 1e-6) : w
-  return {
-    x: ((h[0] ?? 0) * x + (h[1] ?? 0) * y + (h[2] ?? 0)) / safe,
-    y: ((h[3] ?? 0) * x + (h[4] ?? 0) * y + (h[5] ?? 0)) / safe,
-  }
-}
-
-function sample(data: Uint8ClampedArray, width: number, height: number, x: number, y: number) {
-  const maxX = width - 1
-  const maxY = height - 1
-  const cx = Math.min(maxX, Math.max(0, x))
-  const cy = Math.min(maxY, Math.max(0, y))
-  const x0 = Math.floor(cx)
-  const y0 = Math.floor(cy)
-  const x1 = Math.min(maxX, x0 + 1)
-  const y1 = Math.min(maxY, y0 + 1)
-  const dx = cx - x0
-  const dy = cy - y0
-  const at = (px: number, py: number) => (py * width + px) * 4
-  const i00 = at(x0, y0)
-  const i10 = at(x1, y0)
-  const i01 = at(x0, y1)
-  const i11 = at(x1, y1)
-  const mix = (channel: number) => {
-    const top = (data[i00 + channel] ?? 0) * (1 - dx) + (data[i10 + channel] ?? 0) * dx
-    const bottom = (data[i01 + channel] ?? 0) * (1 - dx) + (data[i11 + channel] ?? 0) * dx
-    return top * (1 - dy) + bottom * dy
-  }
-  return [mix(0), mix(1), mix(2), mix(3)]
-}
-
-function paintScaled(source: HTMLCanvasElement, width: number, height: number): HTMLCanvasElement {
+/** Fast fallback when the time budget runs out: the corners' bounding box, scaled to the page size. */
+function paintScaled(
+  source: HTMLCanvasElement,
+  width: number,
+  height: number,
+  corners?: Corners,
+): HTMLCanvasElement {
   const canvas = document.createElement('canvas')
   canvas.width = width
   canvas.height = height
-  canvas.getContext('2d')?.drawImage(source, 0, 0, width, height)
+  const context = canvas.getContext('2d')
+  if (!context) return canvas
+  if (corners) {
+    const xs = [corners.tl.x, corners.tr.x, corners.br.x, corners.bl.x]
+    const ys = [corners.tl.y, corners.tr.y, corners.br.y, corners.bl.y]
+    const left = Math.max(0, Math.min(...xs))
+    const top = Math.max(0, Math.min(...ys))
+    const right = Math.min(source.width, Math.max(...xs))
+    const bottom = Math.min(source.height, Math.max(...ys))
+    if (right - left > 8 && bottom - top > 8) {
+      context.drawImage(source, left, top, right - left, bottom - top, 0, 0, width, height)
+      return canvas
+    }
+  }
+  context.drawImage(source, 0, 0, width, height)
   return canvas
 }
 
@@ -124,9 +112,9 @@ async function warpCanvas(
   height: number,
   deadlineAt = Number.POSITIVE_INFINITY,
 ): Promise<HTMLCanvasElement> {
-  if (performance.now() > deadlineAt) return paintScaled(source, width, height)
+  if (performance.now() > deadlineAt) return paintScaled(source, width, height, corners)
   const context = source.getContext('2d', { willReadFrequently: true })
-  if (!context) throw new Error('לא ניתן לקרוא את התמונה.')
+  if (!context) throw new Error('׳׳ ׳ ׳™׳×׳ ׳׳§׳¨׳•׳ ׳׳× ׳”׳×׳׳•׳ ׳”.')
   const pixels = context.getImageData(0, 0, source.width, source.height)
   const from = [
     { x: 0, y: 0 },
@@ -140,29 +128,58 @@ async function warpCanvas(
   canvas.width = width
   canvas.height = height
   const output = canvas.getContext('2d', { willReadFrequently: true })
-  if (!output) throw new Error('לא ניתן ליישר את העמוד.')
+  if (!output) throw new Error('׳׳ ׳ ׳™׳×׳ ׳׳™׳™׳©׳¨ ׳׳× ׳”׳¢׳׳•׳“.')
   if (!map) {
     output.drawImage(source, 0, 0, width, height)
     return canvas
   }
 
-  if (performance.now() > deadlineAt) return paintScaled(source, width, height)
+  if (performance.now() > deadlineAt) return paintScaled(source, width, height, corners)
 
   const dest = output.createImageData(width, height)
   const data = dest.data
+  const src = pixels.data
+  const sw = source.width
+  const sh = source.height
+  const [h0 = 1, h1 = 0, h2 = 0, h3 = 0, h4 = 1, h5 = 0, h6 = 0, h7 = 0, h8 = 1] = map
+  const maxX = sw - 1
+  const maxY = sh - 1
   for (let y = 0; y < height; y += 1) {
-    if (y % 8 === 0) {
+    if (y % 32 === 0) {
       await nextFrame()
-      if (performance.now() > deadlineAt) return paintScaled(source, width, height)
+      if (performance.now() > deadlineAt) return paintScaled(source, width, height, corners)
     }
+    let out = y * width * 4
     for (let x = 0; x < width; x += 1) {
-      const point = project(map, x, y)
-      const [r, g, b, a] = sample(pixels.data, source.width, source.height, point.x, point.y)
-      const index = (y * width + x) * 4
-      data[index] = r ?? 0
-      data[index + 1] = g ?? 0
-      data[index + 2] = b ?? 0
-      data[index + 3] = a ?? 255
+      const w = h6 * x + h7 * y + h8
+      const safe = Math.abs(w) < 1e-6 ? 1e-6 : w
+      let px = (h0 * x + h1 * y + h2) / safe
+      let py = (h3 * x + h4 * y + h5) / safe
+      if (px < 0) px = 0
+      else if (px > maxX) px = maxX
+      if (py < 0) py = 0
+      else if (py > maxY) py = maxY
+      const x0 = px | 0
+      const y0 = py | 0
+      const x1 = x0 < maxX ? x0 + 1 : x0
+      const y1 = y0 < maxY ? y0 + 1 : y0
+      const dx = px - x0
+      const dy = py - y0
+      const i00 = (y0 * sw + x0) * 4
+      const i10 = (y0 * sw + x1) * 4
+      const i01 = (y1 * sw + x0) * 4
+      const i11 = (y1 * sw + x1) * 4
+      const w00 = (1 - dx) * (1 - dy)
+      const w10 = dx * (1 - dy)
+      const w01 = (1 - dx) * dy
+      const w11 = dx * dy
+      data[out] = (src[i00] ?? 0) * w00 + (src[i10] ?? 0) * w10 + (src[i01] ?? 0) * w01 + (src[i11] ?? 0) * w11
+      data[out + 1] =
+        (src[i00 + 1] ?? 0) * w00 + (src[i10 + 1] ?? 0) * w10 + (src[i01 + 1] ?? 0) * w01 + (src[i11 + 1] ?? 0) * w11
+      data[out + 2] =
+        (src[i00 + 2] ?? 0) * w00 + (src[i10 + 2] ?? 0) * w10 + (src[i01 + 2] ?? 0) * w01 + (src[i11 + 2] ?? 0) * w11
+      data[out + 3] = 255
+      out += 4
     }
   }
   output.putImageData(dest, 0, 0)
@@ -273,7 +290,14 @@ export async function straightenCanvas(
   const scale = Math.min(1, MAX_EDGE / Math.max(fitted.width, fitted.height, 1))
   const width = Math.max(32, Math.round(fitted.width * scale))
   const height = Math.max(32, Math.round(fitted.height * scale))
-  return warpCanvas(drawSource(image), corners, width, height, deadlineAt)
+  const copy = drawSource(image)
+  try {
+    return await warpCanvas(copy, corners, width, height, deadlineAt)
+  } finally {
+    // Release the full-size working copy right away so phones do not hold ~30MB until GC.
+    copy.width = 0
+    copy.height = 0
+  }
 }
 
 export async function applyCanvasMagic(source: HTMLCanvasElement): Promise<HTMLCanvasElement> {

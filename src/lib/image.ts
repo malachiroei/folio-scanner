@@ -1,4 +1,4 @@
-const MAX_SOURCE_EDGE = 1280
+const MAX_SOURCE_EDGE = 3000
 
 export function nextFrame(): Promise<void> {
   return new Promise((resolve) => {

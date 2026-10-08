@@ -391,7 +391,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
       if (token !== requestRef.current) return
       const warped = await warpCanvasFor(source.sourceUrl, source.corners)
       if (token !== requestRef.current) return
-      const warpBlob = await canvasToJpegBlob(warped.canvas, 0.92)
+      const warpBlob = await canvasToJpegBlob(warped.canvas, 0.95)
       if (token !== requestRef.current) return
       const warpUrl = URL.createObjectURL(warpBlob)
       replacePreview({
