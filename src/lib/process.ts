@@ -1,7 +1,7 @@
 import Jscanify from 'jscanify/client'
 import type { Corners, FilterMode } from '../types'
 import { outputSize } from './geometry'
-import { desaturateCanvas, renderCanvasDocument } from './canvas-scan'
+import { applyCanvasMagic, renderCanvasDocument, straightenCanvas } from './canvas-scan'
 import { getCv, isOpenCvReady, MatBin, type Cv, type CvMat } from './opencv'
 
 function toJscanCorners(corners: Corners) {
@@ -165,33 +165,6 @@ function applyMagicColor(cv: Cv, source: HTMLCanvasElement): HTMLCanvasElement {
   }
 }
 
-function applyBlackAndWhite(cv: Cv, source: HTMLCanvasElement): HTMLCanvasElement {
-  const src = cv.imread(source)
-  const gray = new cv.Mat()
-  const blur = new cv.Mat()
-  const bw = new cv.Mat()
-  try {
-    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY)
-    cv.GaussianBlur(gray, blur, new cv.Size(3, 3), 0)
-    const limit = Math.max(3, Math.min(gray.cols, gray.rows))
-    let block = Math.round(limit / 28)
-    if (block % 2 === 0) block += 1
-    block = Math.max(15, Math.min(75, block))
-    if (block >= limit) block = limit % 2 === 0 ? limit - 1 : limit
-    if (block % 2 === 0) block -= 1
-    block = Math.max(3, block)
-    cv.adaptiveThreshold(blur, bw, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY, block, 12)
-    const canvas = document.createElement('canvas')
-    cv.imshow(canvas, bw)
-    return canvas
-  } finally {
-    src.delete()
-    gray.delete()
-    blur.delete()
-    bw.delete()
-  }
-}
-
 async function renderWithCanvas(
   image: CanvasImageSource,
   corners: Corners,
@@ -201,28 +174,61 @@ async function renderWithCanvas(
   return { canvas, width: canvas.width, height: canvas.height }
 }
 
+export async function straightenDocument(
+  image: CanvasImageSource,
+  corners: Corners,
+): Promise<HTMLCanvasElement> {
+  if (isOpenCvReady()) {
+    try {
+      const cv = getCv()
+      const size = outputSize(corners)
+      return warp(cv, image, corners, size.width, size.height)
+    } catch (error) {
+      console.error(error)
+    }
+  }
+  return straightenCanvas(image, corners)
+}
+
+export function paintFastFilter(source: HTMLCanvasElement, filter: 'gray' | 'bw'): HTMLCanvasElement {
+  const canvas = document.createElement('canvas')
+  canvas.width = source.width
+  canvas.height = source.height
+  const context = canvas.getContext('2d')
+  if (!context) return source
+  context.filter = filter === 'gray' ? 'grayscale(1)' : 'grayscale(1) contrast(2.25) brightness(1.06)'
+  context.drawImage(source, 0, 0)
+  context.filter = 'none'
+  return canvas
+}
+
+export function renderMagic(source: HTMLCanvasElement): HTMLCanvasElement {
+  if (isOpenCvReady()) {
+    try {
+      return applyMagicColor(getCv(), source)
+    } catch (error) {
+      console.error(error)
+    }
+  }
+  return applyCanvasMagic(source)
+}
+
 export async function renderDocument(
   image: CanvasImageSource,
   corners: Corners,
   filter: FilterMode,
 ): Promise<{ canvas: HTMLCanvasElement; width: number; height: number }> {
-  if (isOpenCvReady()) {
-    try {
-      const cv = getCv()
-      const size = outputSize(corners)
-      const warped = warp(cv, image, corners, size.width, size.height)
-      if (filter === 'original') {
-        return { canvas: warped, width: warped.width, height: warped.height }
-      }
-      if (filter === 'gray') {
-        desaturateCanvas(warped)
-        return { canvas: warped, width: warped.width, height: warped.height }
-      }
-      const canvas = filter === 'bw' ? applyBlackAndWhite(cv, warped) : applyMagicColor(cv, warped)
+  try {
+    const warped = await straightenDocument(image, corners)
+    if (filter === 'original') return { canvas: warped, width: warped.width, height: warped.height }
+    if (filter === 'gray' || filter === 'bw') {
+      const canvas = paintFastFilter(warped, filter)
       return { canvas, width: canvas.width, height: canvas.height }
-    } catch (error) {
-      console.error(error)
     }
+    const canvas = renderMagic(warped)
+    return { canvas, width: canvas.width, height: canvas.height }
+  } catch (error) {
+    console.error(error)
   }
   return renderWithCanvas(image, corners, filter)
 }

@@ -30,12 +30,16 @@ export type ScanPage = {
   corners: Corners
   filter: FilterMode
   resultUrl: string
+  warpUrl: string
+  magicUrl: string | null
   resultWidth: number
   resultHeight: number
 }
 
 export type PreviewImage = {
   url: string
+  warpUrl: string
+  magicUrl: string | null
   width: number
   height: number
 }

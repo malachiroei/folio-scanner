@@ -248,22 +248,51 @@ function filterPixels(image: ImageData, filter: 'magic' | 'bw') {
   }
 }
 
+export async function straightenCanvas(
+  image: CanvasImageSource,
+  corners: Corners,
+): Promise<HTMLCanvasElement> {
+  const fitted = outputSize(corners)
+  const scale = Math.min(1, MAX_EDGE / Math.max(fitted.width, fitted.height, 1))
+  const width = Math.max(32, Math.round(fitted.width * scale))
+  const height = Math.max(32, Math.round(fitted.height * scale))
+  return warpCanvas(drawSource(image), corners, width, height)
+}
+
+export function applyCanvasMagic(source: HTMLCanvasElement): HTMLCanvasElement {
+  const canvas = document.createElement('canvas')
+  canvas.width = source.width
+  canvas.height = source.height
+  const context = canvas.getContext('2d', { willReadFrequently: true })
+  if (!context) return source
+  context.drawImage(source, 0, 0)
+  const pixels = context.getImageData(0, 0, canvas.width, canvas.height)
+  filterPixels(pixels, 'magic')
+  context.putImageData(pixels, 0, 0)
+  return canvas
+}
+
 export async function renderCanvasDocument(
   image: CanvasImageSource,
   corners: Corners,
   filter: FilterMode,
 ): Promise<HTMLCanvasElement> {
-  const fitted = outputSize(corners)
-  const scale = Math.min(1, MAX_EDGE / Math.max(fitted.width, fitted.height))
-  const width = Math.max(32, Math.round(fitted.width * scale))
-  const height = Math.max(32, Math.round(fitted.height * scale))
-  const warped = await warpCanvas(drawSource(image), corners, width, height)
+  const warped = await straightenCanvas(image, corners)
   if (filter === 'original') return warped
-  if (filter === 'gray') return desaturateCanvas(warped)
-  const context = warped.getContext('2d', { willReadFrequently: true })
+  if (filter === 'gray') return desaturateCanvas(copyCanvas(warped))
+  if (filter === 'magic') return applyCanvasMagic(warped)
+  const context = copyCanvas(warped).getContext('2d', { willReadFrequently: true })
   if (!context) return warped
-  const pixels = context.getImageData(0, 0, warped.width, warped.height)
-  filterPixels(pixels, filter)
+  const pixels = context.getImageData(0, 0, context.canvas.width, context.canvas.height)
+  filterPixels(pixels, 'bw')
   context.putImageData(pixels, 0, 0)
-  return warped
+  return context.canvas
+}
+
+function copyCanvas(source: HTMLCanvasElement): HTMLCanvasElement {
+  const canvas = document.createElement('canvas')
+  canvas.width = source.width
+  canvas.height = source.height
+  canvas.getContext('2d')?.drawImage(source, 0, 0)
+  return canvas
 }

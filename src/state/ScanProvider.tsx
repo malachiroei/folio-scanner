@@ -4,13 +4,14 @@ import { cornersValid, defaultCorners } from '../lib/geometry'
 import { isOpenCvReady, loadOpenCv } from '../lib/opencv'
 import {
   canvasToJpegBlob,
-  downloadUrl,
+  downloadBlob,
   errorMessage,
   loadImage,
   nextFrame,
   normalizeImage,
 } from '../lib/image'
-import { renderDocument } from '../lib/process'
+import { cachedMagic, cachedWarp, loadMagic, pageKey, storeWarp } from '../lib/page-cache'
+import { paintFastFilter, renderMagic, straightenDocument } from '../lib/process'
 import type { Corners, Draft, EngineStatus, FilterMode, PreviewImage, ScanPage, Screen } from '../types'
 import { ScanContext } from './scan-context'
 
@@ -47,6 +48,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
   const requestRef = useRef(0)
   const userAdjustedRef = useRef(false)
   const detectGen = useRef(0)
+  const busyToken = useRef(0)
 
   useEffect(() => {
     draftRef.current = draft
@@ -87,9 +89,37 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
+  function beginBusy(label: string) {
+    const token = ++busyToken.current
+    const timer = window.setTimeout(() => {
+      if (token === busyToken.current) setBusy(label)
+    }, 100)
+    return () => {
+      window.clearTimeout(timer)
+      if (token !== busyToken.current) return
+      busyToken.current += 1
+      setBusy(null)
+    }
+  }
+
   function replacePreview(next: PreviewImage | null) {
     const previous = previewRef.current
-    if (previous && previous.url !== next?.url) URL.revokeObjectURL(previous.url)
+    const keep = new Set<string>()
+    if (next?.url) keep.add(next.url)
+    if (next?.warpUrl) keep.add(next.warpUrl)
+    if (next?.magicUrl) keep.add(next.magicUrl)
+    for (const page of pagesRef.current) {
+      keep.add(page.resultUrl)
+      keep.add(page.warpUrl)
+      if (page.magicUrl) keep.add(page.magicUrl)
+      keep.add(page.sourceUrl)
+    }
+    if (previous) {
+      const urls = [previous.url, previous.warpUrl, previous.magicUrl]
+      for (const url of urls) {
+        if (url && !keep.has(url)) URL.revokeObjectURL(url)
+      }
+    }
     previewRef.current = next
     setPreview(next)
   }
@@ -286,26 +316,92 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     setDraft(next)
   }
 
-  async function renderPreview(source: Draft, filter: FilterMode) {
+  async function raster(url: string): Promise<HTMLCanvasElement> {
+    const image = await loadImage(url)
+    const canvas = document.createElement('canvas')
+    canvas.width = image.naturalWidth || image.width
+    canvas.height = image.naturalHeight || image.height
+    const context = canvas.getContext('2d')
+    if (!context) throw new Error('לא ניתן להכין את התמונה.')
+    context.drawImage(image, 0, 0)
+    return canvas
+  }
+
+  async function warpCanvasFor(sourceUrl: string, corners: Corners) {
+    const key = pageKey(sourceUrl, corners)
+    const cached = cachedWarp(key)
+    if (cached) return { key, canvas: cached }
+    const image = await loadImage(sourceUrl)
+    await new Promise((resolve) => window.setTimeout(resolve, 0))
+    const canvas = await straightenDocument(image, corners)
+    storeWarp(key, canvas)
+    return { key, canvas }
+  }
+
+  async function blobFor(
+    sourceUrl: string,
+    corners: Corners,
+    filter: FilterMode,
+    known: { warpUrl: string; magicUrl: string | null },
+  ) {
+    if (filter === 'original') {
+      const response = await fetch(known.warpUrl)
+      if (!response.ok) throw new Error('לא ניתן לקרוא את התמונה.')
+      return response.blob()
+    }
+    if (filter === 'magic' && known.magicUrl) {
+      const response = await fetch(known.magicUrl)
+      if (!response.ok) throw new Error('לא ניתן לקרוא את התמונה.')
+      return response.blob()
+    }
+    const key = pageKey(sourceUrl, corners)
+    let canvas = cachedWarp(key)
+    if (!canvas) {
+      canvas = known.warpUrl ? await raster(known.warpUrl) : (await warpCanvasFor(sourceUrl, corners)).canvas
+      storeWarp(key, canvas)
+    }
+    if (filter === 'magic') {
+      const magic = cachedMagic(key) ?? (await loadMagic(key, () => renderMagic(canvas)))
+      return canvasToJpegBlob(magic, 0.93)
+    }
+    return canvasToJpegBlob(paintFastFilter(canvas, filter), 0.93)
+  }
+
+  async function renderPreview(source: Draft) {
     const token = ++requestRef.current
-    setBusy(filterLabel(filter))
+    const endBusy = beginBusy('מיישר את העמוד…')
     try {
       await nextFrame()
-      const image = await loadImage(source.sourceUrl)
-      const rendered = await renderDocument(image, source.corners, filter)
+      const { key, canvas } = await warpCanvasFor(source.sourceUrl, source.corners)
       if (token !== requestRef.current) return
-      const blob = await canvasToJpegBlob(rendered.canvas, 0.93)
+      const warpBlob = await canvasToJpegBlob(canvas, 0.92)
       if (token !== requestRef.current) return
+      const warpUrl = URL.createObjectURL(warpBlob)
       replacePreview({
-        url: URL.createObjectURL(blob),
-        width: rendered.width,
-        height: rendered.height,
+        url: warpUrl,
+        warpUrl,
+        magicUrl: null,
+        width: canvas.width,
+        height: canvas.height,
+      })
+      const magic = cachedMagic(key) ?? (await loadMagic(key, () => renderMagic(canvas)))
+      if (token !== requestRef.current) return
+      const magicBlob = await canvasToJpegBlob(magic, 0.93)
+      if (token !== requestRef.current) return
+      const magicUrl = URL.createObjectURL(magicBlob)
+      const current = previewRef.current
+      replacePreview({
+        url: magicUrl,
+        warpUrl: current?.warpUrl ?? warpUrl,
+        magicUrl,
+        width: canvas.width,
+        height: canvas.height,
       })
     } catch (error) {
       console.error(error)
       if (token === requestRef.current) setToast(errorMessage(error))
     } finally {
-      if (token === requestRef.current) setBusy(null)
+      endBusy()
     }
   }
 
@@ -322,7 +418,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     try {
       setScreen('preview')
       window.setTimeout(() => beginVisionLoad(), 50)
-      void renderPreview(current, current.filter)
+      void renderPreview(current)
     } catch (error) {
       console.error(error)
       setToast(errorMessage(error))
@@ -353,47 +449,137 @@ export function ScanProvider({ children }: { children: ReactNode }) {
 
   function setFilter(filter: FilterMode) {
     const current = draftRef.current
-    if (!current) return
+    if (!current || current.filter === filter) return
     const next = { ...current, filter }
     draftRef.current = next
     setDraft(next)
-    void renderPreview(next, filter)
   }
 
   function retryPreview() {
     const current = draftRef.current
     if (!current) return
-    void renderPreview(current, current.filter)
+    void renderPreview(current)
   }
 
-  function commitPage(scanAnother: boolean) {
+  function leavePreview() {
+    const current = draftRef.current
+    if (!current) {
+      setScreen('home')
+      return
+    }
+    const saved = current.editingId != null && pagesRef.current.some((page) => page.id === current.editingId)
+    const question = saved
+      ? 'לחזור למסך הראשי? שינויים אחרונים בעמוד הזה יבוטלו.'
+      : 'לצאת בלי לשמור את העמוד?'
+    if (!window.confirm(question)) return
+    requestRef.current += 1
+    replacePreview(null)
+    if (!pagesRef.current.some((page) => page.sourceUrl === current.sourceUrl)) {
+      URL.revokeObjectURL(current.sourceUrl)
+    }
+    draftRef.current = null
+    setDraft(null)
+    setScreen('home')
+  }
+
+  function rememberPage(page: ScanPage) {
+    const prev = pagesRef.current
+    const exists = prev.some((item) => item.id === page.id)
+    const next = exists
+      ? prev.map((item) => {
+          if (item.id !== page.id) return item
+          const kept = new Set([page.resultUrl, page.warpUrl, page.magicUrl, page.sourceUrl])
+          for (const url of [item.resultUrl, item.warpUrl, item.magicUrl]) {
+            if (url && !kept.has(url)) URL.revokeObjectURL(url)
+          }
+          return page
+        })
+      : [...prev, page]
+    pagesRef.current = next
+    setPages(next)
+    setSelectedId(page.id)
+    const draft = draftRef.current
+    if (draft && draft.editingId !== page.id && draft.sourceUrl === page.sourceUrl) {
+      const linked = { ...draft, editingId: page.id }
+      draftRef.current = linked
+      setDraft(linked)
+    }
+  }
+
+  async function bakedPage(): Promise<ScanPage | null> {
     const current = draftRef.current
     const shot = previewRef.current
-    if (!current || !shot) return
-    const page: ScanPage = {
+    if (!current || !shot) return null
+    let resultUrl = current.filter === 'original' ? shot.warpUrl : shot.url
+    if (current.filter === 'gray' || current.filter === 'bw' || (current.filter === 'magic' && !shot.magicUrl)) {
+      const blob = await blobFor(current.sourceUrl, current.corners, current.filter, shot)
+      resultUrl = URL.createObjectURL(blob)
+    } else if (current.filter === 'magic' && shot.magicUrl) {
+      resultUrl = shot.magicUrl
+    }
+    return {
       id: current.editingId ?? crypto.randomUUID(),
       sourceUrl: current.sourceUrl,
       width: current.width,
       height: current.height,
       corners: current.corners,
       filter: current.filter,
-      resultUrl: shot.url,
+      resultUrl,
+      warpUrl: shot.warpUrl,
+      magicUrl: shot.magicUrl ?? (current.filter === 'magic' ? resultUrl : null),
       resultWidth: shot.width,
       resultHeight: shot.height,
     }
-    previewRef.current = null
-    setPreview(null)
-    setPages((prev) => {
-      if (!current.editingId) return [...prev, page]
-      return prev.map((item) => {
-        if (item.id !== current.editingId) return item
-        if (item.resultUrl !== page.resultUrl) URL.revokeObjectURL(item.resultUrl)
-        return page
-      })
-    })
-    setDraft(null)
-    setSelectedId(page.id)
-    setScreen(scanAnother ? 'camera' : 'pages')
+  }
+
+  function commitPage(scanAnother: boolean) {
+    void addPageToDocument(scanAnother ? 'camera' : 'pages')
+  }
+
+  async function addPage() {
+    await addPageToDocument('camera')
+  }
+
+  async function addPageToDocument(nextScreen: 'camera' | 'pages') {
+    const endBusy = beginBusy('שומר את העמוד…')
+    try {
+      const page = await bakedPage()
+      if (!page) {
+        setToast('אין עמוד להוספה.')
+        return
+      }
+      rememberPage(page)
+      requestRef.current += 1
+      replacePreview(null)
+      draftRef.current = null
+      setDraft(null)
+      setScreen(nextScreen)
+    } catch (error) {
+      console.error(error)
+      setToast(errorMessage(error))
+    } finally {
+      endBusy()
+    }
+  }
+
+  async function downloadDraft() {
+    const current = draftRef.current
+    const shot = previewRef.current
+    if (!current || !shot) {
+      setToast('אין תמונה להורדה.')
+      return
+    }
+    const endBusy = beginBusy('שומר תמונה…')
+    try {
+      const blob = await blobFor(current.sourceUrl, current.corners, current.filter, shot)
+      const index = pagesRef.current.findIndex((page) => page.id === current.editingId)
+      downloadBlob(blob, pageFileName(index >= 0 ? index : pagesRef.current.length))
+    } catch (error) {
+      console.error(error)
+      setToast(errorMessage(error))
+    } finally {
+      endBusy()
+    }
   }
 
   function openPages() {
@@ -425,8 +611,9 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     const prev = pagesRef.current
     const page = prev.find((item) => item.id === id)
     if (!page) return
-    URL.revokeObjectURL(page.sourceUrl)
-    URL.revokeObjectURL(page.resultUrl)
+    const urls = new Set([page.sourceUrl, page.resultUrl, page.warpUrl])
+    if (page.magicUrl) urls.add(page.magicUrl)
+    for (const url of urls) URL.revokeObjectURL(url)
     const next = prev.filter((item) => item.id !== id)
     pagesRef.current = next
     setPages(next)
@@ -444,36 +631,44 @@ export function ScanProvider({ children }: { children: ReactNode }) {
   async function refilterPage(id: string, filter: FilterMode) {
     const page = pagesRef.current.find((item) => item.id === id)
     if (!page || page.filter === filter) return
-    const token = ++requestRef.current
-    setBusy(filterLabel(filter))
+    const instant = pagesRef.current.map((item) => (item.id === id ? { ...item, filter } : item))
+    pagesRef.current = instant
+    setPages(instant)
+    if (filter === 'original' || (filter === 'magic' && page.magicUrl)) {
+      const resultUrl = filter === 'original' ? page.warpUrl : (page.magicUrl ?? page.resultUrl)
+      const next = pagesRef.current.map((item) => (item.id === id ? { ...item, filter, resultUrl } : item))
+      pagesRef.current = next
+      setPages(next)
+      return
+    }
+    const endBusy = beginBusy(filterLabel(filter))
     try {
-      await nextFrame()
-      const image = await loadImage(page.sourceUrl)
-      const rendered = await renderDocument(image, page.corners, filter)
-      if (token !== requestRef.current) return
-      const blob = await canvasToJpegBlob(rendered.canvas, 0.93)
+      const blob = await blobFor(page.sourceUrl, page.corners, filter, page)
       const url = URL.createObjectURL(blob)
-      if (token !== requestRef.current) {
+      const latest = pagesRef.current.find((item) => item.id === id)
+      if (!latest || latest.filter !== filter) {
         URL.revokeObjectURL(url)
         return
       }
-      setPages((prev) =>
-        prev.map((item) => {
-          if (item.id !== id) return item
+      const next = pagesRef.current.map((item) => {
+        if (item.id !== id) return item
+        if (item.resultUrl !== url && item.resultUrl !== item.warpUrl && item.resultUrl !== item.magicUrl) {
           URL.revokeObjectURL(item.resultUrl)
-          return {
-            ...item,
-            filter,
-            resultUrl: url,
-            resultWidth: rendered.width,
-            resultHeight: rendered.height,
-          }
-        }),
-      )
+        }
+        return {
+          ...item,
+          filter,
+          resultUrl: url,
+          magicUrl: filter === 'magic' ? url : item.magicUrl,
+        }
+      })
+      pagesRef.current = next
+      setPages(next)
     } catch (error) {
+      console.error(error)
       setToast(errorMessage(error))
     } finally {
-      if (token === requestRef.current) setBusy(null)
+      endBusy()
     }
   }
 
@@ -504,27 +699,66 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     const index = list.findIndex((page) => page.id === id)
     const page = list[index]
     if (!page || index < 0) return
-    downloadUrl(page.resultUrl, pageFileName(index))
+    const endBusy = beginBusy('שומר תמונה…')
+    void blobFor(page.sourceUrl, page.corners, page.filter, page)
+      .then((blob) => downloadBlob(blob, pageFileName(index)))
+      .catch((error: unknown) => {
+        console.error(error)
+        setToast(errorMessage(error))
+      })
+      .finally(endBusy)
   }
 
   async function downloadAll() {
     const list = pagesRef.current
-    for (let index = 0; index < list.length; index += 1) {
-      const page = list[index]
-      if (!page) continue
-      downloadUrl(page.resultUrl, pageFileName(index))
-      await new Promise((resolve) => window.setTimeout(resolve, 280))
+    const endBusy = beginBusy('שומר תמונות…')
+    try {
+      for (let index = 0; index < list.length; index += 1) {
+        const page = list[index]
+        if (!page) continue
+        const blob = await blobFor(page.sourceUrl, page.corners, page.filter, page)
+        downloadBlob(blob, pageFileName(index))
+        await new Promise((resolve) => window.setTimeout(resolve, 280))
+      }
+    } catch (error) {
+      console.error(error)
+      setToast(errorMessage(error))
+    } finally {
+      endBusy()
     }
   }
 
   async function exportPdf() {
-    const list = pagesRef.current
-    if (list.length === 0) return
-    setBusy('מכין PDF…')
+    const endBusy = beginBusy('מכין PDF…')
+    const temps: string[] = []
     try {
       await nextFrame()
+      if (draftRef.current && previewRef.current) {
+        const page = await bakedPage()
+        if (page) rememberPage(page)
+      }
+      const list = pagesRef.current
+      if (list.length === 0) {
+        setToast('הוסף עמוד לפני הייצוא.')
+        return
+      }
+      const ready: ScanPage[] = []
+      for (const page of list) {
+        if (page.filter === 'original') {
+          ready.push({ ...page, resultUrl: page.warpUrl })
+          continue
+        }
+        if (page.filter === 'magic' && (page.magicUrl || page.resultUrl)) {
+          ready.push({ ...page, resultUrl: page.magicUrl ?? page.resultUrl })
+          continue
+        }
+        const blob = await blobFor(page.sourceUrl, page.corners, page.filter, page)
+        const url = URL.createObjectURL(blob)
+        temps.push(url)
+        ready.push({ ...page, resultUrl: url })
+      }
       const { exportPagesPdf } = await import('../lib/pdf')
-      await exportPagesPdf(list)
+      await exportPagesPdf(ready)
       try {
         const { default: confetti } = await import('canvas-confetti')
         void confetti({
@@ -539,9 +773,11 @@ export function ScanProvider({ children }: { children: ReactNode }) {
         console.error(error)
       }
     } catch (error) {
+      console.error(error)
       setToast(errorMessage(error))
     } finally {
-      setBusy(null)
+      for (const url of temps) URL.revokeObjectURL(url)
+      endBusy()
     }
   }
 
@@ -569,9 +805,12 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     confirmCorners,
     backFromCorners,
     backToCorners,
+    leavePreview,
     setFilter,
     retryPreview,
     commitPage,
+    addPage,
+    downloadDraft,
     openPages,
     closePages: () => setScreen('home'),
     selectPage,

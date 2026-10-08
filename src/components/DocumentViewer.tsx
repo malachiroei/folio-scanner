@@ -1,6 +1,8 @@
 import { ChevronLeft, ChevronRight, Crop, Download, FileDown, Trash2 } from 'lucide-react'
 import type { ReactNode } from 'react'
+import { filteredSource, filterCss } from '../lib/view-filter'
 import { useScan } from '../state/scan-context'
+import type { ScanPage } from '../types'
 import { Button } from './Button'
 import { FilterControls } from './FilterControls'
 import { Spinner } from './Spinner'
@@ -24,6 +26,7 @@ export function DocumentViewer() {
   const selected = pages.find((page) => page.id === selectedId) ?? pages[0]
   if (!selected) return null
   const index = pages.findIndex((page) => page.id === selected.id)
+  const view = pageView(selected)
 
   return (
     <div className="app-bg flex min-h-dvh flex-col text-ink dark:text-paper">
@@ -55,15 +58,15 @@ export function DocumentViewer() {
       <div className="flex min-h-0 flex-1 items-center justify-center p-4">
         <div className="relative" aria-busy={Boolean(busy)}>
           <img
-            src={selected.resultUrl}
+            src={view.src}
             alt={`עמוד ${index + 1}`}
+            style={{ filter: view.css }}
             className="max-h-[46dvh] max-w-full rounded-2xl bg-white object-contain shadow-[0_18px_50px_rgba(20,34,28,0.18)]"
           />
           {busy && (
-            <div className="absolute inset-0 grid place-items-center bg-night/30 text-paper">
-              <span className="flex items-center gap-2 rounded-full bg-night/80 px-3 py-2 text-sm">
-                <Spinner className="size-4" />
-                {busy}
+            <div className="pointer-events-none absolute inset-0 grid place-items-center">
+              <span className="grid size-12 place-items-center rounded-full bg-night/55 text-paper shadow-lg">
+                <Spinner className="size-5" />
               </span>
             </div>
           )}
@@ -83,7 +86,12 @@ export function DocumentViewer() {
                 aria-label={`בחר עמוד ${pageIndex + 1}`}
                 aria-current={isSelected}
               >
-                <img src={page.resultUrl} alt="" className="aspect-[3/4] w-full rounded-md object-cover" />
+                <img
+                  src={pageView(page).src}
+                  alt=""
+                  style={{ filter: pageView(page).css }}
+                  className="aspect-[3/4] w-full rounded-md object-cover"
+                />
               </button>
             )
           })}
@@ -91,11 +99,7 @@ export function DocumentViewer() {
       </div>
 
       <footer className="space-y-3 px-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
-        <FilterControls
-          value={selected.filter}
-          disabled={Boolean(busy)}
-          onChange={(filter) => void refilterPage(selected.id, filter)}
-        />
+        <FilterControls value={selected.filter} onChange={(filter) => void refilterPage(selected.id, filter)} />
         <p className="text-center text-xs font-semibold text-mist dark:text-paper/55">שנה סדר עמודים</p>
         <div className="grid grid-cols-4 gap-2">
           <IconAction
@@ -131,6 +135,13 @@ export function DocumentViewer() {
       </footer>
     </div>
   )
+}
+
+function pageView(page: ScanPage) {
+  return {
+    src: filteredSource(page.filter, page.warpUrl, page.magicUrl),
+    css: filterCss(page.filter),
+  }
 }
 
 function IconAction({
