@@ -288,8 +288,8 @@ export function CornerEditor() {
   }
 
   return (
-    <div className="app-bg flex min-h-dvh flex-col text-ink dark:text-paper">
-      <header className="flex items-center gap-2 px-3 pt-[max(0.75rem,env(safe-area-inset-top))]">
+    <div className="app-bg flex h-dvh max-h-dvh flex-col overflow-hidden text-ink dark:text-paper">
+      <header className="flex shrink-0 items-center gap-2 px-3 pt-[max(0.75rem,env(safe-area-inset-top))]">
         <button
           type="button"
           onClick={backFromCorners}
@@ -322,7 +322,7 @@ export function CornerEditor() {
 
       <div
         ref={stageRef}
-        className="relative min-h-0 flex-1 touch-none select-none"
+        className="relative min-h-0 flex-1 touch-none overflow-hidden select-none"
         style={{ touchAction: 'none', userSelect: 'none', WebkitUserSelect: 'none' }}
       >
         <div className="flex h-full items-center justify-center p-3">
@@ -489,7 +489,7 @@ export function CornerEditor() {
         )}
       </div>
 
-      <footer className="space-y-3 px-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
+      <footer className="relative z-40 shrink-0 space-y-3 px-4 pt-2 pb-[max(1rem,env(safe-area-inset-bottom))]">
         <p className="text-center text-sm text-mist dark:text-paper/60">
           {active
             ? `${LABELS[active]}. הצלב מסמן את הפינה המדויקת.`
