@@ -1,6 +1,6 @@
-import { ChevronLeft, Expand, RotateCcw } from 'lucide-react'
-import { useLayoutEffect, useRef, useState, type PointerEvent } from 'react'
-import { CORNER_KEYS, cornersValid } from '../lib/geometry'
+import { ChevronLeft, ChevronRight, Expand, RotateCcw } from 'lucide-react'
+import { useEffect, useLayoutEffect, useRef, useState, type PointerEvent } from 'react'
+import { CORNER_KEYS, cornersValid, defaultCorners, lerpCorners } from '../lib/geometry'
 import { useScan } from '../state/scan-context'
 import type { CornerKey, Corners, Point } from '../types'
 import { Button } from './Button'
@@ -15,14 +15,20 @@ const LABELS: Record<CornerKey, string> = {
 type Loupe = { x: number; y: number; point: Point }
 
 export function CornerEditor() {
-  const { draft, busy, updateCorners, resetDetection, useFullFrame, confirmCorners, backFromCorners } =
-    useScan()
+  const { draft, updateCorners, resetDetection, useFullFrame, confirmCorners, backFromCorners } = useScan()
   const stageRef = useRef<HTMLDivElement>(null)
   const frameRef = useRef<HTMLDivElement>(null)
   const imageRef = useRef<HTMLImageElement>(null)
   const loupeCanvasRef = useRef<HTMLCanvasElement>(null)
   const cornersRef = useRef<Corners | null>(null)
+  const visualRef = useRef<Corners | null>(null)
   const dragKey = useRef<CornerKey | null>(null)
+  const dragged = useRef(false)
+  const seenSnap = useRef(0)
+  const animRef = useRef(0)
+  const animSettled = useRef(false)
+  const [visual, setVisual] = useState<Corners | null>(null)
+  const [shownToken, setShownToken] = useState(0)
   const [stage, setStage] = useState({ w: 0, h: 0 })
   const [active, setActive] = useState<CornerKey | null>(null)
   const [loupe, setLoupe] = useState<Loupe | null>(null)
@@ -32,8 +38,58 @@ export function CornerEditor() {
   const corners = draft?.corners
 
   useLayoutEffect(() => {
-    if (!dragKey.current && corners) cornersRef.current = corners
-  }, [corners])
+    if (!draft?.corners || draft.snapToken !== seenSnap.current || dragKey.current) return
+    visualRef.current = draft.corners
+    cornersRef.current = draft.corners
+    setVisual(draft.corners)
+  }, [draft?.corners, draft?.snapToken])
+
+  useEffect(() => {
+    if (!draft || draft.snapToken === 0 || draft.snapToken === seenSnap.current) return
+    const token = draft.snapToken
+    const to = draft.corners
+    const previous = seenSnap.current
+    seenSnap.current = token
+    setShownToken(token)
+    if (dragKey.current) {
+      visualRef.current = to
+      cornersRef.current = to
+      setVisual(to)
+      return
+    }
+    animSettled.current = false
+    const from = defaultCorners(draft.width, draft.height, 0)
+    visualRef.current = from
+    cornersRef.current = from
+    setVisual(from)
+    const start = performance.now()
+    const step = (now: number) => {
+      if (dragKey.current) {
+        animSettled.current = true
+        animRef.current = 0
+        return
+      }
+      const t = Math.min(1, (now - start) / 420)
+      const next = t >= 1 ? to : lerpCorners(from, to, 1 - (1 - t) ** 3)
+      visualRef.current = next
+      cornersRef.current = next
+      setVisual(next)
+      if (t < 1) animRef.current = requestAnimationFrame(step)
+      else {
+        animSettled.current = true
+        animRef.current = 0
+      }
+    }
+    animRef.current = requestAnimationFrame(step)
+    return () => {
+      cancelAnimationFrame(animRef.current)
+      animRef.current = 0
+      if (!animSettled.current) {
+        seenSnap.current = previous
+        setShownToken(previous)
+      }
+    }
+  }, [draft])
 
   useLayoutEffect(() => {
     const stageEl = stageRef.current
@@ -93,9 +149,12 @@ export function CornerEditor() {
 
   if (!draft || !corners) return null
   const page = draft
-  const pins = corners
+  const pins =
+    page.snapToken !== 0 && page.snapToken !== shownToken
+      ? defaultCorners(page.width, page.height, 0)
+      : (visual ?? corners)
 
-  const valid = cornersValid(pins, page.width, page.height)
+  const valid = cornersValid(page.corners, page.width, page.height)
   const polygon = CORNER_KEYS.map((key) => `${pins[key].x},${pins[key].y}`).join(' ')
 
   function clientToImage(clientX: number, clientY: number): Point {
@@ -128,7 +187,10 @@ export function CornerEditor() {
     event.preventDefault()
     const point = clientToImage(event.clientX, event.clientY)
     const next = { ...cornersRef.current, [key]: point }
+    dragged.current = true
     cornersRef.current = next
+    visualRef.current = next
+    setVisual(next)
     updateCorners(next)
     placeLoupe(event.clientX, event.clientY, point)
   }
@@ -141,7 +203,10 @@ export function CornerEditor() {
       y: Math.min(page.height, Math.max(0, point.y + dy)),
     }
     const next = { ...cornersRef.current, [key]: nextPoint }
+    dragged.current = true
     cornersRef.current = next
+    visualRef.current = next
+    setVisual(next)
     updateCorners(next)
   }
 
@@ -162,8 +227,7 @@ export function CornerEditor() {
         </div>
         <button
           type="button"
-          onClick={() => void resetDetection()}
-          disabled={Boolean(busy)}
+          onClick={resetDetection}
           className="grid size-11 place-items-center rounded-full hover:bg-black/5 disabled:opacity-40 dark:hover:bg-white/8"
           aria-label="Detect edges again"
         >
@@ -172,7 +236,6 @@ export function CornerEditor() {
         <button
           type="button"
           onClick={useFullFrame}
-          disabled={Boolean(busy)}
           className="grid size-11 place-items-center rounded-full hover:bg-black/5 disabled:opacity-40 dark:hover:bg-white/8"
           aria-label="Use the full photo"
         >
@@ -227,25 +290,43 @@ export function CornerEditor() {
                   aria-label={LABELS[key]}
                   className="absolute z-20 size-11 -translate-x-1/2 -translate-y-1/2"
                   style={{
-                    left: `${(corners[key].x / draft.width) * 100}%`,
-                    top: `${(corners[key].y / draft.height) * 100}%`,
+                    left: `${(pins[key].x / draft.width) * 100}%`,
+                    top: `${(pins[key].y / draft.height) * 100}%`,
                     touchAction: 'none',
                   }}
                   onPointerDown={(event) => {
                     event.preventDefault()
+                    cancelAnimationFrame(animRef.current)
+                    animRef.current = 0
+                    animSettled.current = true
+                    seenSnap.current = page.snapToken
+                    setShownToken(page.snapToken)
+                    dragged.current = false
+                    const current = visualRef.current ?? page.corners
+                    cornersRef.current = current
                     dragKey.current = key
                     setActive(key)
                     event.currentTarget.setPointerCapture(event.pointerId)
-                    placeLoupe(event.clientX, event.clientY, cornersRef.current?.[key] ?? corners[key])
+                    placeLoupe(event.clientX, event.clientY, current[key])
                   }}
                   onPointerMove={(event) => movePin(event, key)}
                   onPointerUp={() => {
                     dragKey.current = null
+                    if (!dragged.current) {
+                      visualRef.current = page.corners
+                      cornersRef.current = page.corners
+                      setVisual(page.corners)
+                    }
                     setActive(null)
                     setLoupe(null)
                   }}
                   onPointerCancel={() => {
                     dragKey.current = null
+                    if (!dragged.current) {
+                      visualRef.current = page.corners
+                      cornersRef.current = page.corners
+                      setVisual(page.corners)
+                    }
                     setActive(null)
                     setLoupe(null)
                   }}
@@ -286,14 +367,17 @@ export function CornerEditor() {
 
       <footer className="space-y-3 px-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
         <p className="text-center text-sm text-mist dark:text-paper/60">
-          {!draft.detected
-            ? "Edges weren't found automatically. Drag the pins onto the page."
-            : valid
-              ? 'A magnifier follows your finger while you drag.'
-              : 'Those edges cross. Separate the pins so they frame the page.'}
+          {page.detecting
+            ? 'Looking for the page. Drag a pin whenever you want.'
+            : !page.detected
+              ? 'No clear page edge yet. The pins sit inside the frame — drag them to the corners.'
+              : valid
+                ? 'A magnifier follows your finger while you drag.'
+                : 'Those edges cross. Separate the pins so they frame the page.'}
         </p>
-        <Button className="w-full" disabled={!valid || Boolean(busy)} onClick={confirmCorners}>
-          Straighten page
+        <Button className="w-full" disabled={!valid} onClick={confirmCorners}>
+          Next / Process
+          <ChevronRight className="size-5" />
         </Button>
       </footer>
     </div>

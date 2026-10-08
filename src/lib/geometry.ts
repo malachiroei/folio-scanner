@@ -57,6 +57,19 @@ export function cornersValid(corners: Corners, width: number, height: number): b
   return edgeWidth >= 32 && edgeHeight >= 32
 }
 
+export function lerpCorners(from: Corners, to: Corners, t: number): Corners {
+  const mix = (a: Point, b: Point): Point => ({
+    x: a.x + (b.x - a.x) * t,
+    y: a.y + (b.y - a.y) * t,
+  })
+  return {
+    tl: mix(from.tl, to.tl),
+    tr: mix(from.tr, to.tr),
+    br: mix(from.br, to.br),
+    bl: mix(from.bl, to.bl),
+  }
+}
+
 export function defaultCorners(width: number, height: number, inset = 0.08): Corners {
   const x = width * inset
   const y = height * inset

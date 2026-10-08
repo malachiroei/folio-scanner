@@ -16,7 +16,7 @@ function AppFrame() {
     <>
       {screen === 'home' && <HomeScreen />}
       {screen === 'camera' && <CameraCapture />}
-      {screen === 'prepare' && <ProcessingScreen label={busy ?? 'Finding the page…'} />}
+      {screen === 'prepare' && <ProcessingScreen label={busy ?? 'Preparing photo…'} />}
       {screen === 'corners' && <CornerEditor />}
       {screen === 'preview' && <PreviewScreen />}
       {screen === 'pages' && <DocumentViewer />}
