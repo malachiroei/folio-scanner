@@ -4,20 +4,20 @@ import { useScan } from '../state/scan-context'
 
 function cameraMessage(error: unknown): string {
   if (!window.isSecureContext) {
-    return 'The camera needs a secure page (https or localhost). You can still upload a photo.'
+    return 'המצלמה דורשת דף מאובטח (https או localhost). עדיין אפשר להעלות תמונה.'
   }
   if (error instanceof DOMException) {
     if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
-      return 'Camera permission is blocked. Allow it in the browser, or upload a photo.'
+      return 'הגישה למצלמה חסומה. אשר אותה בדפדפן, או העלה תמונה.'
     }
     if (error.name === 'NotFoundError' || error.name === 'OverconstrainedError') {
-      return 'No usable camera was found. Upload a photo instead.'
+      return 'לא נמצאה מצלמה זמינה. העלה תמונה במקום.'
     }
     if (error.name === 'NotReadableError') {
-      return 'The camera is busy in another app.'
+      return 'המצלמה בשימוש באפליקציה אחרת.'
     }
   }
-  return 'The camera could not start. Upload a photo instead.'
+  return 'לא ניתן להפעיל את המצלמה. העלה תמונה במקום.'
 }
 
 export function CameraCapture() {
@@ -39,7 +39,7 @@ export function CameraCapture() {
 
     async function start() {
       if (!navigator.mediaDevices?.getUserMedia) {
-        setError('This browser cannot open the camera. Upload a photo instead.')
+        setError('הדפדפן הזה לא יכול לפתוח את המצלמה. העלה תמונה במקום.')
         return
       }
       try {
@@ -115,11 +115,11 @@ export function CameraCapture() {
           type="button"
           onClick={closeCamera}
           className="grid size-11 place-items-center rounded-full bg-black/50"
-          aria-label="Close camera"
+          aria-label="סגור מצלמה"
         >
           <X className="size-5" />
         </button>
-        <p className="rounded-full bg-black/50 px-3 py-1 text-xs tracking-wide">Fit the page in frame</p>
+        <p className="rounded-full bg-black/50 px-3 py-1 text-xs">מקם את הדף בתוך המסגרת</p>
         <span className="size-11" />
       </div>
 
@@ -133,7 +133,7 @@ export function CameraCapture() {
         <button
           type="button"
           className="grid size-12 place-items-center rounded-full bg-white/15"
-          aria-label="Upload a photo instead"
+          aria-label="העלאת תמונה מהגלריה"
           onClick={() => fileRef.current?.click()}
         >
           <Images className="size-5" />
@@ -142,7 +142,7 @@ export function CameraCapture() {
           type="button"
           onClick={capture}
           disabled={!ready}
-          aria-label="Capture photo"
+          aria-label="צילום"
           className="grid size-20 place-items-center rounded-full border-4 border-white disabled:opacity-40"
         >
           <span className="size-14 rounded-full bg-white active:scale-95" />
@@ -150,7 +150,7 @@ export function CameraCapture() {
         <button
           type="button"
           className="grid size-12 place-items-center rounded-full bg-white/15"
-          aria-label="Switch camera"
+          aria-label="החלפת מצלמה"
           onClick={() => setFacing((current) => (current === 'environment' ? 'user' : 'environment'))}
         >
           <SwitchCamera className="size-5" />

@@ -10,7 +10,7 @@ export function loadImage(src: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const image = new Image()
     image.onload = () => resolve(image)
-    image.onerror = () => reject(new Error("This photo couldn't be opened. Try JPEG or PNG."))
+    image.onerror = () => reject(new Error('לא ניתן לפתוח את התמונה. נסה JPEG או PNG.'))
     image.src = src
   })
 }
@@ -20,7 +20,7 @@ export function canvasToJpegBlob(canvas: HTMLCanvasElement, quality = 0.93): Pro
     canvas.toBlob(
       (blob) => {
         if (blob) resolve(blob)
-        else reject(new Error('Could not export that page.'))
+        else reject(new Error('לא ניתן לייצא את העמוד.'))
       },
       'image/jpeg',
       quality,
@@ -41,7 +41,7 @@ export async function normalizeImage(blob: Blob): Promise<{ url: string; width: 
   try {
     bitmap = await decodeBitmap(blob)
   } catch {
-    throw new Error("This photo couldn't be opened. Try JPEG or PNG.")
+    throw new Error('לא ניתן לפתוח את התמונה. נסה JPEG או PNG.')
   }
 
   const scale = Math.min(1, MAX_SOURCE_EDGE / Math.max(bitmap.width, bitmap.height))
@@ -53,7 +53,7 @@ export async function normalizeImage(blob: Blob): Promise<{ url: string; width: 
   const context = canvas.getContext('2d')
   if (!context) {
     bitmap.close()
-    throw new Error('Could not prepare this photo.')
+    throw new Error('לא ניתן להכין את התמונה.')
   }
   context.fillStyle = '#ffffff'
   context.fillRect(0, 0, width, height)
@@ -81,5 +81,5 @@ export function downloadBlob(blob: Blob, filename: string) {
 
 export function errorMessage(error: unknown): string {
   if (error instanceof Error && error.message) return error.message
-  return 'Something went wrong. Please try again.'
+  return 'משהו השתבש. נסה שוב.'
 }

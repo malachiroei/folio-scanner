@@ -1,7 +1,7 @@
 import Jscanify from 'jscanify/client'
 import type { Corners, FilterMode } from '../types'
 import { outputSize } from './geometry'
-import { renderCanvasDocument } from './canvas-scan'
+import { desaturateCanvas, renderCanvasDocument } from './canvas-scan'
 import { getCv, isOpenCvReady, MatBin, type Cv, type CvMat } from './opencv'
 
 function toJscanCorners(corners: Corners) {
@@ -212,6 +212,10 @@ export async function renderDocument(
       const size = outputSize(corners)
       const warped = warp(cv, image, corners, size.width, size.height)
       if (filter === 'original') {
+        return { canvas: warped, width: warped.width, height: warped.height }
+      }
+      if (filter === 'gray') {
+        desaturateCanvas(warped)
         return { canvas: warped, width: warped.width, height: warped.height }
       }
       const canvas = filter === 'bw' ? applyBlackAndWhite(cv, warped) : applyMagicColor(cv, warped)

@@ -6,10 +6,10 @@ import type { CornerKey, Corners, Point } from '../types'
 import { Button } from './Button'
 
 const LABELS: Record<CornerKey, string> = {
-  tl: 'Top left corner',
-  tr: 'Top right corner',
-  br: 'Bottom right corner',
-  bl: 'Bottom left corner',
+  tl: 'פינה שמאלית עליונה',
+  tr: 'פינה ימנית עליונה',
+  br: 'פינה ימנית תחתונה',
+  bl: 'פינה שמאלית תחתונה',
 }
 
 const LOUPE = 184
@@ -246,27 +246,27 @@ export function CornerEditor() {
           type="button"
           onClick={backFromCorners}
           className="grid size-11 place-items-center rounded-full hover:bg-black/5 dark:hover:bg-white/8"
-          aria-label="Back"
+          aria-label="חזרה"
         >
-          <ChevronLeft className="size-6" />
+          <ChevronLeft className="dir-icon size-6" />
         </button>
         <div className="min-w-0 flex-1">
-          <h1 className="font-display text-2xl leading-none">Adjust corners</h1>
-          <p className="mt-1 text-xs text-mist dark:text-paper/55">Drag each pin to a page corner</p>
+          <h1 className="font-display text-2xl leading-none font-semibold">התאמת פינות</h1>
+          <p className="mt-1 text-xs text-mist dark:text-paper/55">גרור כל פינה לקצה המסמך</p>
         </div>
         <button
           type="button"
           onClick={resetDetection}
-          className="grid size-11 place-items-center rounded-full hover:bg-black/5 disabled:opacity-40 dark:hover:bg-white/8"
-          aria-label="Detect edges again"
+          className="grid size-11 place-items-center rounded-full hover:bg-black/5 active:scale-[0.98] dark:hover:bg-white/8"
+          aria-label="זיהוי שוליים מחדש"
         >
           <RotateCcw className="size-5" />
         </button>
         <button
           type="button"
           onClick={useFullFrame}
-          className="grid size-11 place-items-center rounded-full hover:bg-black/5 disabled:opacity-40 dark:hover:bg-white/8"
-          aria-label="Use the full photo"
+          className="grid size-11 place-items-center rounded-full hover:bg-black/5 active:scale-[0.98] dark:hover:bg-white/8"
+          aria-label="השתמש בתמונה המלאה"
         >
           <Expand className="size-5" />
         </button>
@@ -277,13 +277,13 @@ export function CornerEditor() {
           {fitted && (
             <div
               ref={frameRef}
-              className="relative overflow-hidden rounded-lg shadow-[0_16px_40px_rgba(20,34,28,0.18)]"
+              className="relative overflow-hidden rounded-2xl shadow-[0_16px_40px_rgba(20,34,28,0.18)]"
               style={{ width: fitted.w, height: fitted.h }}
             >
               <img
                 ref={imageRef}
                 src={draft.sourceUrl}
-                alt="Photo to crop"
+                alt="תמונה לחיתוך"
                 draggable={false}
                 className="absolute inset-0 h-full w-full select-none"
               />
@@ -448,18 +448,18 @@ export function CornerEditor() {
       <footer className="space-y-3 px-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
         <p className="text-center text-sm text-mist dark:text-paper/60">
           {active
-            ? `${LABELS[active]}. The crosshair is the exact corner.`
+            ? `${LABELS[active]}. הצלב מסמן את הפינה המדויקת.`
             : page.detecting
-              ? 'Looking for the page. Drag a pin whenever you want.'
+              ? 'מחפש את העמוד. אפשר לגרור פינה בכל רגע.'
               : !page.detected
-                ? 'No clear page edge yet. The pins sit inside the frame — drag them to the corners.'
+                ? 'לא זוהו שוליים באופן אוטומטי. גרור את הפינות ידנית.'
                 : valid
-                  ? 'Drag a pin. A magnifier and crosshair show the exact corner.'
-                  : 'Those edges cross. Separate the pins so they frame the page.'}
+                  ? 'גרור פינה. הזכוכית המגדלת והצלב מסמנים את הנקודה המדויקת.'
+                  : 'הקווים נחתכים. הרחק את הפינות כך שיקיפו את העמוד.'}
         </p>
         <Button className="w-full" disabled={!valid} onClick={confirmCorners}>
-          Next / Process
-          <ChevronRight className="size-5" />
+          המשך לעיבוד
+          <ChevronRight className="dir-icon size-5" />
         </Button>
       </footer>
     </div>

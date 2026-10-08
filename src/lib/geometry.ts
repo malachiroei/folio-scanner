@@ -83,7 +83,7 @@ export function defaultCorners(width: number, height: number, inset = 0.08): Cor
 
 export function orderCorners(points: Point[]): Corners {
   if (points.length !== 4) {
-    throw new Error('A document crop needs 4 corners.')
+    throw new Error('לחיתוך דרושות 4 פינות.')
   }
   const bySum = [...points].sort((a, b) => a.x + a.y - (b.x + b.y))
   const tl = bySum[0]
@@ -92,7 +92,7 @@ export function orderCorners(points: Point[]): Corners {
   const first = rest[0]
   const second = rest[1]
   if (!first || !second) {
-    throw new Error('A document crop needs 4 corners.')
+    throw new Error('לחיתוך דרושות 4 פינות.')
   }
   const [tr, bl] =
     first.x - first.y > second.x - second.y ? [first, second] : [second, first]

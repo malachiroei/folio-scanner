@@ -3,8 +3,8 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 @theme {
-  --font-sans: "Outfit", ui-sans-serif, system-ui, sans-serif;
-  --font-display: "Fraunces", Georgia, serif;
+  --font-sans: "Rubik", "Assistant", "Segoe UI", system-ui, sans-serif;
+  --font-display: "Rubik", "Assistant", "Segoe UI", system-ui, sans-serif;
   --color-ink: #14221c;
   --color-moss: #1c6b56;
   --color-moss-bright: #2f9d80;
@@ -67,4 +67,8 @@ a {
 
 .rise {
   animation: rise 0.35s ease both;
+}
+
+[dir='rtl'] .dir-icon {
+  transform: scaleX(-1);
 }

@@ -23,7 +23,7 @@ function drawSource(image: CanvasImageSource): HTMLCanvasElement {
   canvas.width = Math.max(1, width)
   canvas.height = Math.max(1, height)
   const context = canvas.getContext('2d', { willReadFrequently: true })
-  if (!context) throw new Error('Could not prepare this photo.')
+  if (!context) throw new Error('לא ניתן להכין את התמונה.')
   context.drawImage(image, 0, 0, canvas.width, canvas.height)
   return canvas
 }
@@ -116,7 +116,7 @@ async function warpCanvas(
   height: number,
 ): Promise<HTMLCanvasElement> {
   const context = source.getContext('2d', { willReadFrequently: true })
-  if (!context) throw new Error('Could not read this photo.')
+  if (!context) throw new Error('לא ניתן לקרוא את התמונה.')
   const pixels = context.getImageData(0, 0, source.width, source.height)
   const from = [
     { x: 0, y: 0 },
@@ -130,7 +130,7 @@ async function warpCanvas(
   canvas.width = width
   canvas.height = height
   const output = canvas.getContext('2d', { willReadFrequently: true })
-  if (!output) throw new Error('Could not straighten this page.')
+  if (!output) throw new Error('לא ניתן ליישר את העמוד.')
   if (!map) {
     output.drawImage(source, 0, 0, width, height)
     return canvas
@@ -197,7 +197,24 @@ function magicCurve(value: number) {
   return Math.max(0, Math.min(255, Math.round(y * 255)))
 }
 
-function filterPixels(image: ImageData, filter: Exclude<FilterMode, 'original'>) {
+export function desaturateCanvas(canvas: HTMLCanvasElement): HTMLCanvasElement {
+  const context = canvas.getContext('2d', { willReadFrequently: true })
+  if (!context) return canvas
+  const image = context.getImageData(0, 0, canvas.width, canvas.height)
+  const { data } = image
+  for (let i = 0; i < data.length; i += 4) {
+    const tone = Math.round(
+      0.2126 * (data[i] ?? 0) + 0.7152 * (data[i + 1] ?? 0) + 0.0722 * (data[i + 2] ?? 0),
+    )
+    data[i] = tone
+    data[i + 1] = tone
+    data[i + 2] = tone
+  }
+  context.putImageData(image, 0, 0)
+  return canvas
+}
+
+function filterPixels(image: ImageData, filter: 'magic' | 'bw') {
   const { data, width, height } = image
   const gray = new Float32Array(width * height)
   for (let i = 0; i < gray.length; i += 1) gray[i] = luminance(data, i * 4)
@@ -242,6 +259,7 @@ export async function renderCanvasDocument(
   const height = Math.max(32, Math.round(fitted.height * scale))
   const warped = await warpCanvas(drawSource(image), corners, width, height)
   if (filter === 'original') return warped
+  if (filter === 'gray') return desaturateCanvas(warped)
   const context = warped.getContext('2d', { willReadFrequently: true })
   if (!context) return warped
   const pixels = context.getImageData(0, 0, warped.width, warped.height)

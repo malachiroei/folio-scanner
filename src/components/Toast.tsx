@@ -11,7 +11,7 @@ export function Toast({ message, onDismiss }: { message: string; onDismiss: () =
         <button
           type="button"
           className="rounded-full p-1 opacity-70 hover:opacity-100"
-          aria-label="Dismiss message"
+          aria-label="סגור הודעה"
           onClick={onDismiss}
         >
           <X className="size-4" />

@@ -1,10 +1,11 @@
-import { Contrast, Image as ImageIcon, Sparkles } from 'lucide-react'
+import { Blend, Contrast, Image as ImageIcon, Sparkles } from 'lucide-react'
 import type { FilterMode } from '../types'
 
 const FILTERS: { id: FilterMode; label: string; hint: string; icon: typeof Sparkles }[] = [
-  { id: 'magic', label: 'Magic Color', hint: 'White paper, colored ink', icon: Sparkles },
-  { id: 'bw', label: 'B&W', hint: 'Crisp black text', icon: Contrast },
-  { id: 'original', label: 'Original', hint: 'Color, straightened', icon: ImageIcon },
+  { id: 'magic', label: 'צבע קסם', hint: 'נייר לבן ודיו צבעונית', icon: Sparkles },
+  { id: 'bw', label: 'שחור לבן', hint: 'טקסט שחור וחד', icon: Contrast },
+  { id: 'gray', label: 'גווני אפור', hint: 'ללא צבע, אחרי יישור', icon: Blend },
+  { id: 'original', label: 'מקורי', hint: 'צבע מקורי, אחרי יישור', icon: ImageIcon },
 ]
 
 export function FilterControls({
@@ -19,8 +20,8 @@ export function FilterControls({
   const active = FILTERS.find((filter) => filter.id === value) ?? FILTERS[0]
 
   return (
-    <div>
-      <div className="grid grid-cols-3 gap-2" role="radiogroup" aria-label="Page filter">
+    <div className="rounded-2xl bg-paper/80 p-2 shadow-[0_8px_24px_rgba(20,34,28,0.06)] ring-1 ring-black/5 dark:bg-night-2/80 dark:ring-white/10">
+      <div className="grid grid-cols-4 gap-2" role="radiogroup" aria-label="מסנן עמוד">
         {FILTERS.map((filter) => {
           const selected = filter.id === value
           const Icon = filter.icon
@@ -32,10 +33,10 @@ export function FilterControls({
               aria-checked={selected}
               disabled={disabled}
               onClick={() => onChange(filter.id)}
-              className={`flex min-h-16 flex-col items-center justify-center gap-1 rounded-2xl px-2 text-xs font-semibold transition disabled:opacity-40 ${
+              className={`flex min-h-16 flex-col items-center justify-center gap-1 rounded-2xl px-1 text-[11px] leading-tight font-semibold transition active:scale-[0.98] disabled:opacity-40 ${
                 selected
                   ? 'bg-moss text-paper shadow-[0_8px_18px_rgba(28,107,86,0.2)]'
-                  : 'bg-paper text-ink ring-1 ring-black/10 dark:bg-night-2 dark:text-paper dark:ring-white/10'
+                  : 'bg-sand/70 text-ink dark:bg-white/6 dark:text-paper'
               }`}
             >
               <Icon className="size-4" />

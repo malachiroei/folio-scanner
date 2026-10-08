@@ -15,11 +15,11 @@ export function PreviewScreen() {
           type="button"
           onClick={backToCorners}
           className="grid size-11 place-items-center rounded-full hover:bg-black/5 dark:hover:bg-white/8"
-          aria-label="Back to corners"
+          aria-label="חזרה לפינות"
         >
-          <ChevronLeft className="size-6" />
+          <ChevronLeft className="dir-icon size-6" />
         </button>
-        <h1 className="font-display text-2xl">Preview</h1>
+        <h1 className="font-display text-2xl font-semibold">תצוגה מקדימה</h1>
       </header>
 
       <div className="flex min-h-0 flex-1 items-center justify-center p-4">
@@ -27,16 +27,16 @@ export function PreviewScreen() {
           {preview ? (
             <img
               src={preview.url}
-              alt="Straightened document preview"
-              className="max-h-[58dvh] max-w-full rounded-sm bg-white object-contain shadow-[0_18px_50px_rgba(20,34,28,0.18)]"
+              alt="תצוגה מקדימה של המסמך המיושר"
+              className="max-h-[58dvh] max-w-full rounded-2xl bg-white object-contain shadow-[0_18px_50px_rgba(20,34,28,0.18)]"
             />
           ) : (
-            <div className="grid h-64 w-56 place-items-center rounded-sm bg-paper text-moss shadow-lg dark:bg-night-2">
+            <div className="grid h-64 w-56 place-items-center rounded-2xl bg-paper text-moss shadow-lg dark:bg-night-2">
               <Spinner className="size-8" />
             </div>
           )}
           {busy && preview && (
-            <div className="absolute inset-0 grid place-items-center rounded-sm bg-night/35 text-paper">
+            <div className="absolute inset-0 grid place-items-center rounded-2xl bg-night/35 text-paper">
               <span className="flex items-center gap-2 rounded-full bg-night/80 px-3 py-2 text-sm">
                 <Spinner className="size-4" />
                 {busy}
@@ -50,20 +50,20 @@ export function PreviewScreen() {
         <FilterControls value={draft.filter} onChange={setFilter} disabled={Boolean(busy)} />
         {!preview && !busy && (
           <Button variant="secondary" className="w-full" onClick={retryPreview}>
-            Try again
+            נסה שוב
           </Button>
         )}
         {draft.editingId ? (
           <Button className="w-full" disabled={!preview || Boolean(busy)} onClick={() => commitPage(false)}>
-            Save page
+            שמור עמוד
           </Button>
         ) : (
           <div className="grid grid-cols-2 gap-2">
             <Button variant="secondary" disabled={!preview || Boolean(busy)} onClick={() => commitPage(false)}>
-              Add page
+              הוסף עמוד נוסף
             </Button>
             <Button disabled={!preview || Boolean(busy)} onClick={() => commitPage(true)}>
-              Scan next
+              סרוק עמוד נוסף
             </Button>
           </div>
         )}

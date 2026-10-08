@@ -151,7 +151,7 @@ export function isOpenCvReady(): boolean {
 export function getCv(): Cv {
   const cv = globalThis.cv
   if (!isReady(cv)) {
-    throw new Error('Vision engine is not ready yet.')
+    throw new Error('מנוע הזיהוי עדיין לא מוכן.')
   }
   return cv
 }
@@ -169,7 +169,7 @@ function startLoading(): Promise<Cv> {
   const started = Date.now()
   return new Promise((resolve, reject) => {
     const failAll = () => {
-      reject(new Error('The vision engine did not load. Basic adjustments are still available.'))
+      reject(new Error('מנוע הזיהוי לא נטען. עדיין אפשר ליישר ולסנן.'))
     }
 
     const attempt = (index: number) => {
@@ -213,10 +213,10 @@ function loadSource(src: string, budgetMs: number): Promise<Cv> {
         return
       }
       script.remove()
-      reject(error ?? new Error('OpenCV.js did not initialize'))
+      reject(error ?? new Error('מנוע הזיהוי לא אותחל.'))
     }
 
-    const timer = window.setTimeout(() => finish(new Error('OpenCV.js timed out')), budgetMs)
+    const timer = window.setTimeout(() => finish(new Error('טעינת מנוע הזיהוי נמשכה יותר מדי זמן.')), budgetMs)
     const poll = window.setInterval(() => {
       if (isReady(globalThis.cv)) finish(null)
     }, 100)
@@ -233,7 +233,7 @@ function loadSource(src: string, budgetMs: number): Promise<Cv> {
     script.onload = () => {
       if (isReady(globalThis.cv)) finish(null)
     }
-    script.onerror = () => finish(new Error('OpenCV.js failed to download'))
+    script.onerror = () => finish(new Error('לא ניתן להוריד את מנוע הזיהוי.'))
     document.head.appendChild(script)
   })
 }

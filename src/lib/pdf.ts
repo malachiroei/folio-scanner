@@ -13,9 +13,9 @@ async function blobToDataUrl(blob: Blob): Promise<string> {
     const reader = new FileReader()
     reader.onload = () => {
       if (typeof reader.result === 'string') resolve(reader.result)
-      else reject(new Error('Could not read a page for the PDF.'))
+      else reject(new Error('לא ניתן לקרוא עמוד לקובץ ה-PDF.'))
     }
-    reader.onerror = () => reject(new Error('Could not read a page for the PDF.'))
+    reader.onerror = () => reject(new Error('לא ניתן לקרוא עמוד לקובץ ה-PDF.'))
     reader.readAsDataURL(blob)
   })
 }
@@ -30,7 +30,7 @@ function pageFormat(width: number, height: number) {
 }
 
 export async function exportPagesPdf(pages: ScanPage[]) {
-  if (pages.length === 0) throw new Error('Add a page before exporting.')
+  if (pages.length === 0) throw new Error('הוסף עמוד לפני הייצוא.')
 
   let doc: jsPDF | null = null
   for (const page of pages) {
@@ -46,12 +46,12 @@ export async function exportPagesPdf(pages: ScanPage[]) {
       doc.addPage([pw, ph], orientation)
     }
     const response = await fetch(page.resultUrl)
-    if (!response.ok) throw new Error('Could not read a page for the PDF.')
+    if (!response.ok) throw new Error('לא ניתן לקרוא עמוד לקובץ ה-PDF.')
     const dataUrl = await blobToDataUrl(await response.blob())
     doc.addImage(dataUrl, 'JPEG', 0, 0, pw, ph, undefined, 'FAST')
   }
 
-  if (!doc) throw new Error('Add a page before exporting.')
-  doc.setProperties({ title: 'Folio scan', creator: 'Folio' })
+  if (!doc) throw new Error('הוסף עמוד לפני הייצוא.')
+  doc.setProperties({ title: 'Folio — סורק מסמכים', creator: 'Folio' })
   downloadBlob(doc.output('blob'), `folio-${pageStamp()}.pdf`)
 }

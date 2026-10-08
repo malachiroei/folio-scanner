@@ -1,4 +1,4 @@
-export type FilterMode = 'magic' | 'bw' | 'original'
+export type FilterMode = 'magic' | 'bw' | 'gray' | 'original'
 
 export type Point = { x: number; y: number }
 

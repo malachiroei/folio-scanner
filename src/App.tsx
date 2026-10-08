@@ -16,7 +16,7 @@ function AppFrame() {
     <>
       {screen === 'home' && <HomeScreen />}
       {screen === 'camera' && <CameraCapture />}
-      {screen === 'prepare' && <ProcessingScreen label={busy ?? 'Preparing photo…'} />}
+      {screen === 'prepare' && <ProcessingScreen label={busy ?? 'מכין את התמונה…'} />}
       {screen === 'corners' && <CornerEditor />}
       {screen === 'preview' && <PreviewScreen />}
       {screen === 'pages' && <DocumentViewer />}
@@ -31,7 +31,7 @@ class AppErrorBoundary extends Component<{ children: ReactNode }, BoundaryState>
   state: BoundaryState = { message: null }
 
   static getDerivedStateFromError(error: unknown): BoundaryState {
-    return { message: error instanceof Error ? error.message : 'Something went wrong.' }
+    return { message: error instanceof Error ? error.message : 'משהו השתבש.' }
   }
 
   render() {
@@ -39,14 +39,14 @@ class AppErrorBoundary extends Component<{ children: ReactNode }, BoundaryState>
       return (
         <div className="app-bg flex min-h-dvh items-center justify-center px-6 text-ink dark:text-paper">
           <div className="max-w-sm text-center">
-            <h1 className="font-display text-3xl">Folio hit a snag</h1>
+            <h1 className="font-display text-3xl font-semibold">משהו השתבש</h1>
             <p className="mt-3 text-sm text-mist dark:text-paper/65">{this.state.message}</p>
             <button
               type="button"
-              className="mt-6 rounded-2xl bg-moss px-5 py-3 font-semibold text-paper"
+              className="mt-6 rounded-2xl bg-moss px-5 py-3 font-semibold text-paper active:scale-[0.98]"
               onClick={() => window.location.reload()}
             >
-              Reload scanner
+              טען מחדש
             </button>
           </div>
         </div>

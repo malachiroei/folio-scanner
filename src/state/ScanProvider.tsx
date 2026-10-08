@@ -24,6 +24,12 @@ function pageFileName(index: number) {
   return `folio-page-${String(index + 1).padStart(2, '0')}.jpg`
 }
 
+function filterLabel(filter: FilterMode) {
+  if (filter === 'original') return 'מיישר את העמוד…'
+  if (filter === 'gray') return 'ממיר לגווני אפור…'
+  return 'מנקה את העמוד…'
+}
+
 export function ScanProvider({ children }: { children: ReactNode }) {
   const [theme, setTheme] = useState<'light' | 'dark'>(readTheme)
   const [engine, setEngine] = useState<EngineStatus>('idle')
@@ -49,6 +55,8 @@ export function ScanProvider({ children }: { children: ReactNode }) {
   }, [draft, pages, preview])
 
   useEffect(() => {
+    document.documentElement.lang = 'he'
+    document.documentElement.dir = 'rtl'
     document.documentElement.classList.toggle('dark', theme === 'dark')
     document.documentElement.style.colorScheme = theme
     localStorage.setItem('folio-theme', theme)
@@ -83,7 +91,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
   }
 
   function retryEngine() {
-    setToast('Retrying the vision engine in the background.')
+    setToast('מנסה לטעון שוב את מנוע הזיהוי ברקע.')
     beginVisionLoad()
   }
 
@@ -174,7 +182,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
 
   async function ingestBlob(blob: Blob) {
     setScreen('prepare')
-    setBusy('Preparing photo…')
+    setBusy('מכין את התמונה…')
     await nextFrame()
     let normalized: { url: string; width: number; height: number } | null = null
     try {
@@ -206,7 +214,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
 
   function ingestFile(file: File) {
     if (file.type && !file.type.startsWith('image/')) {
-      setToast('Choose a JPEG, PNG, or WebP photo.')
+      setToast('בחר תמונת JPEG, PNG או WebP.')
       return
     }
     void ingestBlob(file)
@@ -248,7 +256,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
 
   async function renderPreview(source: Draft, filter: FilterMode) {
     const token = ++requestRef.current
-    setBusy(filter === 'original' ? 'Straightening…' : 'Cleaning the page…')
+    setBusy(filterLabel(filter))
     try {
       await nextFrame()
       const image = await loadImage(source.sourceUrl)
@@ -272,7 +280,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     const current = draftRef.current
     if (!current) return
     if (!cornersValid(current.corners, current.width, current.height)) {
-      setToast('Drag the pins so they frame the page without crossing.')
+      setToast('גרור את הפינות כך שיקיפו את הדף בלי לחצות.')
       return
     }
     setScreen('preview')
@@ -395,7 +403,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     const page = pagesRef.current.find((item) => item.id === id)
     if (!page || page.filter === filter) return
     const token = ++requestRef.current
-    setBusy(filter === 'original' ? 'Straightening…' : 'Cleaning the page…')
+    setBusy(filterLabel(filter))
     try {
       await nextFrame()
       const image = await loadImage(page.sourceUrl)
@@ -470,7 +478,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
   async function exportPdf() {
     const list = pagesRef.current
     if (list.length === 0) return
-    setBusy('Building PDF…')
+    setBusy('מכין PDF…')
     try {
       await nextFrame()
       const { exportPagesPdf } = await import('../lib/pdf')

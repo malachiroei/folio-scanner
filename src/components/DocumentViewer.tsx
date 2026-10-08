@@ -32,21 +32,21 @@ export function DocumentViewer() {
           type="button"
           onClick={closePages}
           className="grid size-11 place-items-center rounded-full hover:bg-black/5 dark:hover:bg-white/8"
-          aria-label="Back home"
+          aria-label="חזרה למסך הראשי"
         >
-          <ChevronLeft className="size-6" />
+          <ChevronLeft className="dir-icon size-6" />
         </button>
         <div className="min-w-0 flex-1">
-          <h1 className="font-display text-2xl leading-none">Pages</h1>
+          <h1 className="font-display text-2xl leading-none font-semibold">עמודים</h1>
           <p className="mt-1 text-xs text-mist dark:text-paper/55">
-            {index + 1} of {pages.length}
+            {index + 1} מתוך {pages.length}
           </p>
         </div>
         <button
           type="button"
           onClick={() => downloadPage(selected.id)}
-          className="grid size-11 place-items-center rounded-full hover:bg-black/5 dark:hover:bg-white/8"
-          aria-label="Download this page"
+          className="grid size-11 place-items-center rounded-2xl hover:bg-black/5 active:scale-[0.98] dark:hover:bg-white/8"
+          aria-label="הורד כתמונה"
         >
           <Download className="size-5" />
         </button>
@@ -56,8 +56,8 @@ export function DocumentViewer() {
         <div className="relative" aria-busy={Boolean(busy)}>
           <img
             src={selected.resultUrl}
-            alt={`Page ${index + 1}`}
-            className="max-h-[46dvh] max-w-full rounded-sm bg-white object-contain shadow-[0_18px_50px_rgba(20,34,28,0.18)]"
+            alt={`עמוד ${index + 1}`}
+            className="max-h-[46dvh] max-w-full rounded-2xl bg-white object-contain shadow-[0_18px_50px_rgba(20,34,28,0.18)]"
           />
           {busy && (
             <div className="absolute inset-0 grid place-items-center bg-night/30 text-paper">
@@ -79,8 +79,8 @@ export function DocumentViewer() {
                 key={page.id}
                 type="button"
                 onClick={() => selectPage(page.id)}
-                className={`w-14 shrink-0 rounded-lg p-0.5 ${isSelected ? 'ring-2 ring-copper' : ''}`}
-                aria-label={`Select page ${pageIndex + 1}`}
+                className={`w-14 shrink-0 rounded-2xl p-0.5 active:scale-[0.98] ${isSelected ? 'ring-2 ring-copper' : ''}`}
+                aria-label={`בחר עמוד ${pageIndex + 1}`}
                 aria-current={isSelected}
               >
                 <img src={page.resultUrl} alt="" className="aspect-[3/4] w-full rounded-md object-cover" />
@@ -96,35 +96,36 @@ export function DocumentViewer() {
           disabled={Boolean(busy)}
           onChange={(filter) => void refilterPage(selected.id, filter)}
         />
+        <p className="text-center text-xs font-semibold text-mist dark:text-paper/55">שנה סדר עמודים</p>
         <div className="grid grid-cols-4 gap-2">
           <IconAction
-            label="Move earlier"
+            label="הזז אחורה"
             disabled={index <= 0 || Boolean(busy)}
             onClick={() => movePage(selected.id, -1)}
           >
-            <ChevronLeft className="size-5" />
+            <ChevronLeft className="dir-icon size-5" />
           </IconAction>
           <IconAction
-            label="Move later"
+            label="הזז קדימה"
             disabled={index >= pages.length - 1 || Boolean(busy)}
             onClick={() => movePage(selected.id, 1)}
           >
-            <ChevronRight className="size-5" />
+            <ChevronRight className="dir-icon size-5" />
           </IconAction>
-          <IconAction label="Adjust crop" disabled={Boolean(busy)} onClick={() => editPageCorners(selected.id)}>
+          <IconAction label="התאם פינות" disabled={Boolean(busy)} onClick={() => editPageCorners(selected.id)}>
             <Crop className="size-5" />
           </IconAction>
-          <IconAction label="Delete page" disabled={Boolean(busy)} onClick={() => deletePage(selected.id)}>
+          <IconAction label="מחק עמוד" disabled={Boolean(busy)} onClick={() => deletePage(selected.id)}>
             <Trash2 className="size-5" />
           </IconAction>
         </div>
         <div className="grid grid-cols-2 gap-2">
           <Button variant="secondary" disabled={Boolean(busy)} onClick={() => void downloadAll()}>
-            Save images
+            הורד כתמונה
           </Button>
           <Button disabled={Boolean(busy)} onClick={() => void exportPdf()}>
             <FileDown className="size-4" />
-            Export PDF
+            ייצוא ל-PDF
           </Button>
         </div>
       </footer>
@@ -149,7 +150,7 @@ function IconAction({
       aria-label={label}
       disabled={disabled}
       onClick={onClick}
-      className="grid min-h-12 place-items-center rounded-2xl bg-paper text-ink ring-1 ring-black/10 disabled:opacity-40 dark:bg-night-2 dark:text-paper dark:ring-white/10"
+      className="grid min-h-12 place-items-center rounded-2xl bg-paper text-ink shadow-[0_6px_16px_rgba(20,34,28,0.05)] ring-1 ring-black/10 active:scale-[0.98] disabled:opacity-40 dark:bg-night-2 dark:text-paper dark:ring-white/10"
     >
       {children}
     </button>
