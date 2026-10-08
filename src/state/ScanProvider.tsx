@@ -816,11 +816,21 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     }
   }
 
-  async function createPdfFile() {
+  /** `emailLimit` is the largest PDF in bytes; smaller pages are tried until it fits. */
+  async function createPdfFile(emailLimit?: number) {
     const assembled = await assemblePdfPages()
     try {
       const { buildPagesPdf, pdfFileName } = await import('../lib/pdf')
-      const blob = await buildPagesPdf(assembled.ready)
+      let blob = await buildPagesPdf(assembled.ready)
+      if (emailLimit) {
+        for (const step of [
+          { maxEdge: 2400, quality: 0.78 },
+          { maxEdge: 1900, quality: 0.7 },
+        ]) {
+          if (blob.size <= emailLimit) break
+          blob = await buildPagesPdf(assembled.ready, step)
+        }
+      }
       return new File([blob], pdfFileName(), { type: 'application/pdf' })
     } finally {
       assembled.release()
@@ -876,7 +886,8 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     let file: File | null = null
     try {
       await nextFrame()
-      file = await createPdfFile()
+      // Base64 adds a third; Vercel accepts about 4.5MB of body, so keep the PDF under ~3.2MB.
+      file = await createPdfFile(3_200_000)
       const pdfBase64 = await blobToBase64(file)
       const response = await fetch('/api/send-scan', {
         method: 'POST',

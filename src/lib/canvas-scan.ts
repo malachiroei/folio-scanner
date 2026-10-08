@@ -2,8 +2,23 @@
 import { outputSize } from './geometry'
 import { nextFrame } from './image'
 
+/**
+ * A page that is roughly paper-shaped (long/short between 1.25 and 1.6) snaps to the exact A4
+ * ratio 1:1.414 on its long side, so slightly off corners cannot stretch the text.
+ * Other shapes (receipts, cards) keep the measured size.
+ */
+function a4Size(size: { width: number; height: number }): { width: number; height: number } {
+  const long = Math.max(size.width, size.height)
+  const short = Math.min(size.width, size.height)
+  if (short < 1) return size
+  const ratio = long / short
+  if (ratio < 1.25 || ratio > 1.6) return size
+  const snapped = Math.round(long / Math.SQRT2)
+  return size.width >= size.height ? { width: long, height: snapped } : { width: snapped, height: long }
+}
+
 /** Long edge of the straightened page. Text in a dense table needs this much to stay sharp. */
-const MAX_EDGE = 2400
+const MAX_EDGE = 3000
 
 function sourceSize(image: CanvasImageSource): { width: number; height: number } {
   if (image instanceof HTMLImageElement) {
@@ -286,7 +301,7 @@ export async function straightenCanvas(
   corners: Corners,
   deadlineAt = Number.POSITIVE_INFINITY,
 ): Promise<HTMLCanvasElement> {
-  const fitted = outputSize(corners)
+  const fitted = a4Size(outputSize(corners))
   const scale = Math.min(1, MAX_EDGE / Math.max(fitted.width, fitted.height, 1))
   const width = Math.max(32, Math.round(fitted.width * scale))
   const height = Math.max(32, Math.round(fitted.height * scale))

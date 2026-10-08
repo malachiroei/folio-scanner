@@ -2,6 +2,12 @@ import { Images, SwitchCamera, X } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { useScan } from '../state/scan-context'
 
+type ImageCaptureInstance = {
+  takePhoto: (settings?: { imageWidth?: number; imageHeight?: number }) => Promise<Blob>
+  getPhotoCapabilities?: () => Promise<{ imageWidth?: { max?: number }; imageHeight?: { max?: number } }>
+}
+type ImageCaptureConstructor = new (track: MediaStreamTrack) => ImageCaptureInstance
+
 function cameraMessage(error: unknown): string {
   if (!window.isSecureContext) {
     return 'המצלמה דורשת דף מאובטח (https או localhost). עדיין אפשר להעלות תמונה.'
@@ -28,6 +34,8 @@ export function CameraCapture() {
   const [facing, setFacing] = useState<'environment' | 'user'>('environment')
   const [error, setError] = useState<string | null>(null)
   const [ready, setReady] = useState(false)
+  const [capturing, setCapturing] = useState(false)
+  const streamRef = useRef<MediaStream | null>(null)
 
   useEffect(() => {
     const video = videoRef.current
@@ -64,6 +72,7 @@ export function CameraCapture() {
           return
         }
         view.srcObject = stream
+        streamRef.current = stream
         try {
           await view.play()
         } catch (playError) {
@@ -81,6 +90,7 @@ export function CameraCapture() {
     return () => {
       cancelled = true
       stream?.getTracks().forEach((track) => track.stop())
+      if (streamRef.current === stream) streamRef.current = null
       view.srcObject = null
     }
   }, [facing])
@@ -93,10 +103,52 @@ export function CameraCapture() {
     return () => window.removeEventListener('keydown', onKey)
   }, [closeCamera])
 
-  function capture() {
+  /** Full sensor photo (e.g. 12MP) through ImageCapture, or null when the browser cannot. */
+  async function takeSensorPhoto(): Promise<Blob | null> {
+    const track = streamRef.current?.getVideoTracks()[0]
+    const Capture = (window as unknown as { ImageCapture?: ImageCaptureConstructor }).ImageCapture
+    if (!track || !Capture || track.readyState !== 'live') return null
+    try {
+      const imageCapture = new Capture(track)
+      let settings: { imageWidth?: number; imageHeight?: number } | undefined
+      try {
+        const capabilities = await imageCapture.getPhotoCapabilities?.()
+        const width = capabilities?.imageWidth?.max
+        const height = capabilities?.imageHeight?.max
+        if (width && height) settings = { imageWidth: width, imageHeight: height }
+      } catch {
+        // Some browsers expose takePhoto but not capabilities. The default photo is still full size.
+      }
+      try {
+        return await imageCapture.takePhoto(settings)
+      } catch {
+        return await imageCapture.takePhoto()
+      }
+    } catch (err) {
+      console.warn('ImageCapture failed, using the video frame', err)
+      return null
+    }
+  }
+
+  async function capture() {
+    if (capturing) return
+    setCapturing(true)
+    try {
+      const photo = await takeSensorPhoto()
+      if (photo && photo.size > 0) {
+        ingestBlob(photo)
+        return
+      }
+      captureFrame()
+    } finally {
+      setCapturing(false)
+    }
+  }
+
+  function captureFrame() {
     const video = videoRef.current
     if (!video || !video.videoWidth) return
-    const scale = Math.min(1, 3000 / Math.max(video.videoWidth, video.videoHeight))
+    const scale = Math.min(1, 4000 / Math.max(video.videoWidth, video.videoHeight))
     const width = Math.max(1, Math.round(video.videoWidth * scale))
     const height = Math.max(1, Math.round(video.videoHeight * scale))
     const canvas = document.createElement('canvas')
@@ -176,8 +228,8 @@ export function CameraCapture() {
         </button>
         <button
           type="button"
-          onClick={capture}
-          disabled={!ready}
+          onClick={() => void capture()}
+          disabled={!ready || capturing}
           aria-label="צילום"
           className="grid size-20 place-items-center rounded-full border-4 border-white disabled:opacity-40"
         >

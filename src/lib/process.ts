@@ -1,7 +1,7 @@
 import type { Corners, FilterMode } from '../types'
 import { applyCanvasMagic, renderCanvasDocument, straightenCanvas } from './canvas-scan'
 
-const PROCESS_BUDGET_MS = 9000
+const PROCESS_BUDGET_MS = 20_000
 
 function yieldToBrowser(): Promise<void> {
   return new Promise((resolve) => {
