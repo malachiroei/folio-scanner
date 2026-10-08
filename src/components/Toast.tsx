@@ -2,7 +2,7 @@ import { X } from 'lucide-react'
 
 export function Toast({ message, onDismiss }: { message: string; onDismiss: () => void }) {
   return (
-    <div className="pointer-events-none fixed inset-x-0 bottom-[max(1rem,env(safe-area-inset-bottom))] z-50 flex justify-center px-4">
+    <div className="pointer-events-none fixed inset-x-0 bottom-[max(1rem,env(safe-area-inset-bottom))] z-[90] flex justify-center px-4">
       <div
         role="status"
         className="pointer-events-auto rise flex max-w-md items-start gap-3 rounded-2xl bg-ink px-4 py-3 text-sm text-paper shadow-2xl dark:bg-paper dark:text-ink"

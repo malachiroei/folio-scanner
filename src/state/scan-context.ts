@@ -32,6 +32,7 @@ export type ScanContextValue = {
   addPage: () => Promise<void>
   downloadDraft: () => Promise<void>
   sharePdf: (email?: string) => Promise<void>
+  quickSend: (email: string) => Promise<boolean>
   openPages: () => void
   closePages: () => void
   selectPage: (id: string) => void

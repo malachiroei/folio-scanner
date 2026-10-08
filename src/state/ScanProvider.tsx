@@ -247,7 +247,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
         width: normalized.width,
         height: normalized.height,
         corners: defaultCorners(normalized.width, normalized.height, 0.1),
-        filter: 'magic' as const,
+        filter: 'original' as const,
         detected: false,
         detecting: true,
         snapToken: 0,
@@ -839,7 +839,23 @@ export function ScanProvider({ children }: { children: ReactNode }) {
 
   function openMailto(email: string) {
     const href = `mailto:${email}?subject=${encodeURIComponent('סריקת מסמך - Folio')}&body=${encodeURIComponent('מצורף מסמך סרוק.')}`
-    window.location.href = href
+    const link = document.createElement('a')
+    link.href = href
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+  }
+
+  async function shareFile(file: File, email?: string) {
+    const payload = {
+      files: [file],
+      title: 'סריקת מסמך - Folio',
+      text: email ? `אל: ${email}\nמצורף מסמך סרוק.` : 'מצורף מסמך סרוק.',
+    }
+    if (typeof navigator.share !== 'function' || typeof navigator.canShare !== 'function') return false
+    if (!navigator.canShare(payload)) return false
+    await navigator.share(payload)
+    return true
   }
 
   async function sharePdf(email?: string) {
@@ -847,21 +863,9 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     try {
       await nextFrame()
       const file = await createPdfFile()
-      const payload = {
-        files: [file],
-        title: 'סריקת מסמך - Folio',
-        text: email ? `אל: ${email}\nמצורף מסמך סרוק.` : 'מצורף מסמך סרוק.',
-      }
       let shared = false
       try {
-        if (
-          typeof navigator.share === 'function' &&
-          typeof navigator.canShare === 'function' &&
-          navigator.canShare(payload)
-        ) {
-          await navigator.share(payload)
-          shared = true
-        }
+        shared = await shareFile(file, email)
       } catch (error) {
         if (error instanceof DOMException && error.name === 'AbortError') return
         console.error(error)
@@ -876,6 +880,56 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     } finally {
       endBusy()
     }
+  }
+
+  async function quickSend(email: string) {
+    let file: File | null = null
+    try {
+      await nextFrame()
+      file = await createPdfFile()
+      const pdfBase64 = await blobToBase64(file)
+      const response = await fetch('/api/send-scan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ to: email, pdfBase64, filename: file.name }),
+      })
+      const payload = (await response.json().catch(() => null)) as { success?: boolean; error?: string } | null
+      if (!response.ok || !payload?.success) {
+        throw new Error(payload?.error || 'שליחת המייל נכשלה.')
+      }
+      setToast(`המסמך נשלח בהצלחה ל-${email}!`)
+      return true
+    } catch (error) {
+      console.error(error)
+      const detail = error instanceof Error ? error.message : 'שליחת המייל נכשלה.'
+      setToast(`${detail} אפשר לשתף או להוריד את הקובץ.`)
+      try {
+        file ??= await createPdfFile()
+        downloadBlob(file, file.name)
+        await shareFile(file, email)
+      } catch (fallbackError) {
+        if (fallbackError instanceof DOMException && fallbackError.name === 'AbortError') return false
+        console.error(fallbackError)
+      }
+      return false
+    }
+  }
+
+  function blobToBase64(blob: Blob): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onload = () => {
+        if (typeof reader.result !== 'string') {
+          reject(new Error('לא ניתן לקרוא את ה-PDF.'))
+          return
+        }
+        const marker = 'base64,'
+        const splitAt = reader.result.indexOf(marker)
+        resolve(splitAt >= 0 ? reader.result.slice(splitAt + marker.length) : reader.result)
+      }
+      reader.onerror = () => reject(new Error('לא ניתן לקרוא את ה-PDF.'))
+      reader.readAsDataURL(blob)
+    })
   }
 
   async function exportPdf() {
@@ -936,6 +990,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     addPage,
     downloadDraft,
     sharePdf,
+    quickSend,
     openPages,
     closePages: () => setScreen('home'),
     selectPage,

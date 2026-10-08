@@ -2,8 +2,8 @@ import { readFileSync } from 'node:fs'
 import tailwindcss from '@tailwindcss/vite'
 import type { Plugin as RolldownPlugin } from 'rolldown'
 import react from '@vitejs/plugin-react'
-import type { Plugin } from 'vite'
-import { defineConfig } from 'vite'
+import { defineConfig, loadEnv, type Plugin } from 'vite'
+import { sendScan } from './api/send-scan.ts'
 
 // jscanify is a UMD bundle: it has no ESM default export, and it reads a
 // global `cv`. Expose OpenCV through that name and publish the constructor.
@@ -49,8 +49,51 @@ function jscanifyCvProxy(): Plugin {
   }
 }
 
+function sendScanDevApi(): Plugin {
+  return {
+    name: 'folio-send-scan',
+    configureServer(server) {
+      server.middlewares.use((req, res, next) => {
+        const path = req.url?.split('?')[0]
+        if (path !== '/api/send-scan') {
+          next()
+          return
+        }
+        if (req.method !== 'POST') {
+          res.statusCode = 405
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify({ error: 'Method not allowed' }))
+          return
+        }
+        const env = loadEnv(server.config.mode, server.config.root, '')
+        if (env.RESEND_API_KEY) process.env.RESEND_API_KEY = env.RESEND_API_KEY
+        if (env.RESEND_FROM) process.env.RESEND_FROM = env.RESEND_FROM
+        const chunks: Buffer[] = []
+        req.on('data', (chunk: Buffer) => {
+          chunks.push(chunk)
+        })
+        req.on('end', () => {
+          void (async () => {
+            try {
+              const result = await sendScan(Buffer.concat(chunks).toString('utf8'))
+              res.statusCode = result.status
+              res.setHeader('Content-Type', 'application/json')
+              res.end(JSON.stringify(result.body))
+            } catch (error) {
+              console.error(error)
+              res.statusCode = 500
+              res.setHeader('Content-Type', 'application/json')
+              res.end(JSON.stringify({ error: 'שליחת המייל נכשלה.' }))
+            }
+          })()
+        })
+      })
+    },
+  }
+}
+
 export default defineConfig({
-  plugins: [jscanifyCvProxy(), react(), tailwindcss()],
+  plugins: [sendScanDevApi(), jscanifyCvProxy(), react(), tailwindcss()],
   optimizeDeps: {
     include: ['jscanify/client'],
     rolldownOptions: {

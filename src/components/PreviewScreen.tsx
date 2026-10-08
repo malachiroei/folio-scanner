@@ -1,5 +1,6 @@
-import { ChevronLeft, Crop, Download, FileDown, Plus, Share2 } from 'lucide-react'
+import { ChevronLeft, Crop, Download, FileDown, Plus, Send, Share2 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
+import { readQuickRecipient, type QuickRecipient } from '../lib/favorite-emails'
 import { filteredSource, filterCss } from '../lib/view-filter'
 import { useScan } from '../state/scan-context'
 import { Button } from './Button'
@@ -17,11 +18,14 @@ export function PreviewScreen() {
     downloadDraft,
     exportPdf,
     sharePdf,
+    quickSend,
     backToCorners,
     leavePreview,
     retryPreview,
   } = useScan()
-  const [sharing, setSharing] = useState(false)
+  const [sharing, setSharing] = useState<null | 'share' | 'quick'>(null)
+  const [sendingMail, setSendingMail] = useState(false)
+  const [quickRecipient, setQuickRecipient] = useState<QuickRecipient | null>(() => readQuickRecipient())
   const pageStamp = draft
     ? [
         draft.sourceUrl,
@@ -133,16 +137,51 @@ export function PreviewScreen() {
             ערוך חיתוך
           </Button>
         </div>
-        <Button variant="secondary" className="w-full" onClick={clicked(() => setSharing(true))}>
+        <Button
+          className="w-full"
+          disabled={sendingMail}
+          onClick={clicked(() => {
+            if (sendingMail) return
+            if (!quickRecipient) {
+              setSharing('quick')
+              return
+            }
+            const address = quickRecipient.email
+            setSendingMail(true)
+            void quickSend(address).finally(() => setSendingMail(false))
+          })}
+        >
+          <Send className="size-4" />
+          {sendingMail
+            ? 'שולח במייל...'
+            : quickRecipient?.name.trim()
+              ? `שלח ל${quickRecipient.name.trim()}`
+              : quickRecipient
+                ? `שלח ל${quickRecipient.email}`
+                : 'שליחה מהירה'}
+        </Button>
+        <Button variant="secondary" className="w-full" onClick={clicked(() => setSharing('share'))}>
           <Share2 className="size-4" />
           שלח במייל / שתף
         </Button>
-        <Button className="w-full" onClick={clicked(() => void exportPdf())}>
+        <Button variant="secondary" className="w-full" onClick={clicked(() => void exportPdf())}>
           <FileDown className="size-4" />
           ייצוא ל-PDF
         </Button>
       </footer>
-      <ShareDrawer open={sharing} onClose={() => setSharing(false)} onShare={sharePdf} />
+      <ShareDrawer
+        key={sharing ?? 'closed'}
+        open={sharing !== null}
+        purpose={sharing === 'quick' ? 'quick' : 'share'}
+        quickRecipient={quickRecipient}
+        onQuickRecipient={setQuickRecipient}
+        onClose={() => setSharing(null)}
+        onShare={sharePdf}
+        onQuickSend={async (email) => {
+          setQuickRecipient(readQuickRecipient())
+          return quickSend(email)
+        }}
+      />
     </div>
   )
 }
