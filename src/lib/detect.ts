@@ -85,6 +85,38 @@ function otsuMask(cv: Cv, bin: MatBin, gray: CvMat, invert: boolean): CvMat {
   return sealOutline(cv, bin, binary)
 }
 
+/** Bright, low-saturation pixels: white paper, not a black keyboard or dark border. */
+function paintPaperMask(canvas: HTMLCanvasElement, minBrightness: number, maxSaturation: number): Uint8Array | null {
+  const context = canvas.getContext('2d', { willReadFrequently: true })
+  if (!context) return null
+  const image = context.getImageData(0, 0, canvas.width, canvas.height)
+  const bytes = new Uint8Array(canvas.width * canvas.height)
+  const data = image.data
+  for (let pixel = 0, index = 0; index < data.length; pixel += 1, index += 4) {
+    const red = data[index] ?? 0
+    const green = data[index + 1] ?? 0
+    const blue = data[index + 2] ?? 0
+    const max = Math.max(red, green, blue)
+    const min = Math.min(red, green, blue)
+    const brightness = max / 255
+    const saturation = max === 0 ? 0 : (max - min) / max
+    bytes[pixel] = brightness >= minBrightness && saturation <= maxSaturation ? 255 : 0
+  }
+  return bytes
+}
+
+function maskFromBytes(cv: Cv, bin: MatBin, width: number, height: number, bytes: Uint8Array): CvMat {
+  const mat = bin.keep(new cv.Mat(height, width, cv.CV_8UC1 || cv.CV_8U))
+  mat.data.set(bytes)
+  const closeKernel = bin.keep(cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(9, 9)))
+  const closed = bin.keep(new cv.Mat())
+  cv.morphologyEx(mat, closed, cv.MORPH_CLOSE, closeKernel)
+  const openKernel = bin.keep(cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(5, 5)))
+  const opened = bin.keep(new cv.Mat())
+  cv.morphologyEx(closed, opened, cv.MORPH_OPEN, openKernel)
+  return opened
+}
+
 function adaptiveMask(cv: Cv, bin: MatBin, gray: CvMat, invert: boolean): CvMat {
   const binary = bin.keep(new cv.Mat())
   const edge = Math.min(gray.rows, gray.cols)
@@ -221,6 +253,36 @@ export function detectDocumentCorners(
       if (scan.rect && (!fallback || polygonArea(scan.rect) > polygonArea(fallback))) fallback = scan.rect
       if (!scan.quad) return null
       return toCorners(scan.quad, src.cols, src.rows, width, height)
+    }
+
+    try {
+      const strictPaper = paintPaperMask(small, 0.62, 0.32)
+      let paperLit = 0
+      if (strictPaper) {
+        for (let i = 0; i < strictPaper.length; i += 1) if (strictPaper[i]) paperLit += 1
+      }
+      const paperBytes =
+        strictPaper && paperLit / Math.max(1, strictPaper.length) >= 0.12
+          ? strictPaper
+          : paintPaperMask(small, 0.5, 0.42)
+      if (paperBytes && performance.now() <= deadline) {
+        const paperScan = inspectContours(
+          cv,
+          maskFromBytes(cv, bin, small.width, small.height, paperBytes),
+          imageArea,
+          deadline,
+        )
+        const paper = take(paperScan)
+        if (paper) return { corners: paper, detected: true }
+        if (paperScan.contentRatio >= 0.15 && fallback) {
+          const outlined = toCorners(fallback, src.cols, src.rows, width, height)
+          if (outlined) return { corners: outlined, detected: true }
+        }
+        fallback = null
+      }
+    } catch (error) {
+      console.error(error)
+      fallback = null
     }
 
     const otsuScan = inspectContours(cv, otsuMask(cv, bin, gray, false), imageArea, deadline)

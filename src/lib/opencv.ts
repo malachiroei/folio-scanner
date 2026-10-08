@@ -115,7 +115,9 @@ export type Cv = {
   MORPH_RECT: number
   MORPH_ELLIPSE: number
   MORPH_CLOSE: number
+  MORPH_OPEN: number
   CV_8U: number
+  CV_8UC1: number
   CV_32F: number
   CV_32FC2: number
   ADAPTIVE_THRESH_GAUSSIAN_C: number

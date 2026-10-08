@@ -222,9 +222,11 @@ export function ScanProvider({ children }: { children: ReactNode }) {
 
   function updateCorners(corners: Corners) {
     userAdjustedRef.current = true
-    setDraft((current) =>
-      current ? { ...current, corners, detected: true, detecting: false } : current,
-    )
+    const current = draftRef.current
+    if (!current) return
+    const next = { ...current, corners, detected: true, detecting: false }
+    draftRef.current = next
+    setDraft(next)
   }
 
   async function resetDetection() {
@@ -270,6 +272,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
         height: rendered.height,
       })
     } catch (error) {
+      console.error(error)
       if (token === requestRef.current) setToast(errorMessage(error))
     } finally {
       if (token === requestRef.current) setBusy(null)
@@ -278,13 +281,21 @@ export function ScanProvider({ children }: { children: ReactNode }) {
 
   function confirmCorners() {
     const current = draftRef.current
-    if (!current) return
-    if (!cornersValid(current.corners, current.width, current.height)) {
-      setToast('גרור את הפינות כך שיקיפו את הדף בלי לחצות.')
+    if (!current) {
+      console.error('confirmCorners: no page is ready to process')
+      setToast('אין עמוד לעיבוד.')
       return
     }
-    setScreen('preview')
-    void renderPreview(current, current.filter)
+    if (!cornersValid(current.corners, current.width, current.height)) {
+      console.error('confirmCorners: pins are not a perfect quad, continuing', current.corners)
+    }
+    try {
+      setScreen('preview')
+      void renderPreview(current, current.filter)
+    } catch (error) {
+      console.error(error)
+      setToast(errorMessage(error))
+    }
   }
 
   function backFromCorners() {

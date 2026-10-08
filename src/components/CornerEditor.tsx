@@ -111,6 +111,20 @@ export function CornerEditor() {
     return () => observer.disconnect()
   }, [])
 
+  useEffect(() => {
+    const stageEl = stageRef.current
+    if (!stageEl) return
+    const blockScroll = (event: TouchEvent) => {
+      if (dragKey.current) event.preventDefault()
+    }
+    stageEl.addEventListener('touchstart', blockScroll, { passive: false })
+    stageEl.addEventListener('touchmove', blockScroll, { passive: false })
+    return () => {
+      stageEl.removeEventListener('touchstart', blockScroll)
+      stageEl.removeEventListener('touchmove', blockScroll)
+    }
+  }, [])
+
   const scale = Math.min(stage.w / width, stage.h / height)
   const fitted =
     stage.w > 0 && stage.h > 0 && Number.isFinite(scale) && scale > 0
@@ -211,8 +225,9 @@ export function CornerEditor() {
     setLoupe({ x, y, point, key: dragKey.current ?? 'tl' })
   }
 
-  function movePin(event: PointerEvent<HTMLButtonElement>, key: CornerKey) {
+  function movePin(event: PointerEvent<HTMLDivElement>, key: CornerKey) {
     if (dragKey.current !== key || !cornersRef.current) return
+    if (event.pointerType === 'mouse' && event.buttons === 0) return
     event.preventDefault()
     const point = clientToImage(event.clientX, event.clientY)
     const next = { ...cornersRef.current, [key]: point }
@@ -220,8 +235,33 @@ export function CornerEditor() {
     cornersRef.current = next
     visualRef.current = next
     setVisual(next)
-    updateCorners(next)
     placeLoupe(event.clientX, event.clientY, point)
+  }
+
+  function finishDrag() {
+    const next = visualRef.current
+    const moved = dragged.current
+    dragged.current = false
+    dragKey.current = null
+    if (moved && next) {
+      buzz(8)
+      updateCorners(next)
+    }
+    setActive(null)
+    setLoupe(null)
+  }
+
+  function processPage() {
+    try {
+      const next = dragKey.current ? (visualRef.current ?? page.corners) : page.corners
+      if (!cornersValid(next, page.width, page.height)) {
+        console.error('הפינות לא יוצרות מרובע מושלם, ממשיכים לעיבוד', next)
+      }
+      updateCorners(next)
+      confirmCorners()
+    } catch (error) {
+      console.error(error)
+    }
   }
 
   function nudge(key: CornerKey, dx: number, dy: number) {
@@ -272,14 +312,19 @@ export function CornerEditor() {
         </button>
       </header>
 
-      <div ref={stageRef} className="relative min-h-0 flex-1 touch-none">
+      <div
+        ref={stageRef}
+        className="relative min-h-0 flex-1 touch-none select-none"
+        style={{ touchAction: 'none', userSelect: 'none', WebkitUserSelect: 'none' }}
+      >
         <div className="flex h-full items-center justify-center p-3">
           {fitted && (
             <div
               ref={frameRef}
-              className="relative overflow-hidden rounded-2xl shadow-[0_16px_40px_rgba(20,34,28,0.18)]"
-              style={{ width: fitted.w, height: fitted.h }}
+              className="relative touch-none select-none"
+              style={{ width: fitted.w, height: fitted.h, touchAction: 'none', userSelect: 'none' }}
             >
+              <div className="pointer-events-none absolute inset-0 overflow-hidden rounded-2xl shadow-[0_16px_40px_rgba(20,34,28,0.18)]">
               <img
                 ref={imageRef}
                 src={draft.sourceUrl}
@@ -289,7 +334,8 @@ export function CornerEditor() {
               />
               <svg
                 viewBox={`0 0 ${draft.width} ${draft.height}`}
-                className="absolute inset-0 h-full w-full"
+                className="pointer-events-none absolute inset-0 h-full w-full touch-none select-none"
+                style={{ touchAction: 'none' }}
                 aria-hidden="true"
               >
                 <defs>
@@ -352,19 +398,26 @@ export function CornerEditor() {
                   </g>
                 )}
               </svg>
+              </div>
               {CORNER_KEYS.map((key) => (
-                <button
+                <div
                   key={key}
-                  type="button"
+                  role="button"
+                  tabIndex={0}
                   aria-label={LABELS[key]}
-                  className={`absolute size-14 -translate-x-1/2 -translate-y-1/2 ${active === key ? 'z-30' : 'z-20'}`}
+                  className={`absolute z-20 h-14 w-14 -translate-x-1/2 -translate-y-1/2 touch-none select-none ${
+                    active === key ? 'z-30' : ''
+                  }`}
                   style={{
                     left: `${(pins[key].x / draft.width) * 100}%`,
                     top: `${(pins[key].y / draft.height) * 100}%`,
                     touchAction: 'none',
+                    userSelect: 'none',
+                    WebkitUserSelect: 'none',
                   }}
                   onPointerDown={(event) => {
                     event.preventDefault()
+                    event.stopPropagation()
                     cancelAnimationFrame(animRef.current)
                     animRef.current = 0
                     animSettled.current = true
@@ -376,31 +429,19 @@ export function CornerEditor() {
                     dragKey.current = key
                     setActive(key)
                     buzz(12)
-                    event.currentTarget.setPointerCapture(event.pointerId)
+                    try {
+                      event.currentTarget.setPointerCapture(event.pointerId)
+                    } catch (error) {
+                      console.error(error)
+                    }
                     placeLoupe(event.clientX, event.clientY, current[key])
                   }}
                   onPointerMove={(event) => movePin(event, key)}
-                  onPointerUp={() => {
-                    if (dragged.current) buzz(8)
-                    dragKey.current = null
-                    if (!dragged.current) {
-                      visualRef.current = page.corners
-                      cornersRef.current = page.corners
-                      setVisual(page.corners)
-                    }
-                    setActive(null)
-                    setLoupe(null)
-                  }}
-                  onPointerCancel={() => {
-                    dragKey.current = null
-                    if (!dragged.current) {
-                      visualRef.current = page.corners
-                      cornersRef.current = page.corners
-                      setVisual(page.corners)
-                    }
-                    setActive(null)
-                    setLoupe(null)
-                  }}
+                  onPointerUp={finishDrag}
+                  onPointerCancel={finishDrag}
+                  onTouchStart={(event) => event.preventDefault()}
+                  onTouchMove={(event) => event.preventDefault()}
+                  onTouchEnd={(event) => event.preventDefault()}
                   onKeyDown={(event) => {
                     const step = event.shiftKey ? 12 : 2
                     const delta: Record<string, [number, number] | undefined> = {
@@ -424,7 +465,7 @@ export function CornerEditor() {
                   >
                     <span className="absolute top-1/2 left-1/2 size-1.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-white" />
                   </span>
-                </button>
+                </div>
               ))}
             </div>
           )}
@@ -457,7 +498,7 @@ export function CornerEditor() {
                   ? 'גרור פינה. הזכוכית המגדלת והצלב מסמנים את הנקודה המדויקת.'
                   : 'הקווים נחתכים. הרחק את הפינות כך שיקיפו את העמוד.'}
         </p>
-        <Button className="w-full" disabled={!valid} onClick={confirmCorners}>
+        <Button className="relative z-40 w-full" onClick={processPage}>
           המשך לעיבוד
           <ChevronRight className="dir-icon size-5" />
         </Button>
