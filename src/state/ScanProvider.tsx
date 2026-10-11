@@ -392,14 +392,14 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     }
     if (filter === 'magic') {
       const magic = cachedMagic(key) ?? (await loadMagic(key, () => renderMagic(canvas)))
-      return canvasToJpegBlob(magic, 0.93)
+      return canvasToJpegBlob(magic, 0.95)
     }
     if (filter === 'bw') {
       const bwKey = `${key}|bw`
       const bw = cachedMagic(bwKey) ?? (await loadMagic(bwKey, () => renderBlackWhite(canvas)))
-      return canvasToJpegBlob(bw, 0.93)
+      return canvasToJpegBlob(bw, 0.95)
     }
-    return canvasToJpegBlob(paintFastFilter(canvas), 0.93)
+    return canvasToJpegBlob(paintFastFilter(canvas), 0.95)
   }
 
   async function renderPreview(source: Draft) {
@@ -471,7 +471,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
       const produce = () => (kind === 'bw' ? renderBlackWhite(warp) : renderMagic(warp))
       const processed = cachedMagic(cacheKey) ?? (await loadMagic(cacheKey, produce))
       if (token !== requestRef.current) return
-      const blob = await canvasToJpegBlob(processed, 0.93)
+      const blob = await canvasToJpegBlob(processed, 0.95)
       if (token !== requestRef.current) return
       const url = URL.createObjectURL(blob)
       const current = previewRef.current ?? shot
@@ -869,8 +869,10 @@ export function ScanProvider({ children }: { children: ReactNode }) {
       let blob = await buildPagesPdf(assembled.ready)
       if (emailLimit) {
         for (const step of [
-          { maxEdge: 2400, quality: 0.78 },
-          { maxEdge: 1900, quality: 0.7 },
+          // Never below 2800px on the long edge: dense tables turn to mush at lower sizes.
+          { maxEdge: 2800, quality: 0.8 },
+          { maxEdge: 2800, quality: 0.7 },
+          { maxEdge: 2800, quality: 0.6 },
         ]) {
           if (blob.size <= emailLimit) break
           blob = await buildPagesPdf(assembled.ready, step)

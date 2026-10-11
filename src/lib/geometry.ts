@@ -125,7 +125,7 @@ export function orderCorners(points: Point[]): Corners {
   return { tl, tr, br, bl }
 }
 
-const MAX_OUTPUT_EDGE = 3000
+const MAX_OUTPUT_EDGE = 3508
 
 export function outputSize(corners: Corners): { width: number; height: number } {
   const width = Math.max(distance(corners.tl, corners.tr), distance(corners.bl, corners.br))

@@ -2,9 +2,12 @@ import { jsPDF } from 'jspdf'
 import type { ScanPage } from '../types'
 import { canvasToJpegBlob, downloadBlob, loadImage } from './image'
 
-/** Page image: long edge ~3000px (about 300 DPI on A4) at JPEG 85%, roughly 1MB per text page. */
-export const PDF_MAX_EDGE = 3000
+/** Page image: up to full A4 at 300 DPI (3508px long edge) at JPEG 85%. */
+export const PDF_MAX_EDGE = 3508
 export const PDF_JPEG_QUALITY = 0.85
+
+/** A page stored at full size is embedded as is (no second JPEG pass) when it is smaller than this. */
+const REUSE_LIMIT_BYTES = 2_200_000
 
 export type PdfOptions = { maxEdge?: number; quality?: number }
 
@@ -26,18 +29,40 @@ async function blobToDataUrl(blob: Blob): Promise<string> {
   })
 }
 
-/** Page size in points. The long edge is A4 (841.89pt); the aspect follows the image. */
+const A4_LONG = 841.89
+const A4_SHORT = 595.28
+
+/**
+ * Page size in points, orientation strictly from the image: landscape when wider than tall.
+ * A page with A4 proportions gets exact A4 (841.89 x 595.28 pt); other shapes keep their aspect.
+ */
 function pageFormat(width: number, height: number) {
-  const longEdge = 841.89
-  const scale = longEdge / Math.max(width, height)
-  const pw = width * scale
-  const ph = height * scale
-  const orientation = pw >= ph ? 'landscape' : 'portrait'
-  return { pw, ph, orientation } as const
+  const landscape = width > height
+  const long = Math.max(width, height)
+  const short = Math.min(width, height)
+  const ratio = long / Math.max(1, short)
+  const isA4 = Math.abs(ratio - Math.SQRT2) < 0.04
+  const scale = A4_LONG / long
+  const pLong = A4_LONG
+  const pShort = isA4 ? A4_SHORT : short * scale
+  return {
+    pw: landscape ? pLong : pShort,
+    ph: landscape ? pShort : pLong,
+    orientation: landscape ? 'landscape' : 'portrait',
+  } as const
 }
 
 /** Re-encode a stored page at the PDF size and quality so the file stays small enough to email. */
 async function encodePage(url: string, maxEdge: number, quality: number): Promise<string> {
+  if (quality >= PDF_JPEG_QUALITY) {
+    const stored = await fetch(url).then((response) => response.blob()).catch(() => null)
+    if (stored && stored.type === 'image/jpeg' && stored.size <= REUSE_LIMIT_BYTES) {
+      const size = await createImageBitmap(stored).catch(() => null)
+      const fits = size ? Math.max(size.width, size.height) <= maxEdge : false
+      size?.close()
+      if (fits) return await blobToDataUrl(stored)
+    }
+  }
   const image = await loadImage(url)
   const sourceWidth = image.naturalWidth || image.width
   const sourceHeight = image.naturalHeight || image.height

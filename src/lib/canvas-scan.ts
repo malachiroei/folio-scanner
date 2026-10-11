@@ -3,8 +3,8 @@ import { distance, outputSize } from './geometry'
 import { nextFrame } from './image'
 
 /**
- * Strict A4 container (1:1.414). A wider-than-tall quad becomes a landscape page (3000x2121 at
- * most), anything else a portrait page (2121x3000), so a document is never rotated or squeezed
+ * Strict A4 container (1:1.414). A wider-than-tall quad becomes a landscape page (3508x2480 at
+ * most), anything else a portrait page (2480x3508), so a document is never rotated or squeezed
  * into the wrong orientation. Very elongated shapes (receipts) keep their measured size.
  */
 function a4Size(
@@ -30,8 +30,14 @@ function isLandscape(corners: Corners): boolean {
   return width > height
 }
 
-/** Long edge of the straightened page (about 256 DPI on A4). */
-const MAX_EDGE = 3000
+/**
+ * Long edge of the straightened page: never below 2800px (about 240 DPI on A4), up to full A4 at
+ * 300 DPI (3508x2480 landscape, 2480x3508 portrait). Smaller quads are enlarged with bilinear
+ * sampling, but never more than 3x, so a tiny source does not blow up memory for nothing.
+ */
+const MIN_EDGE = 2800
+const MAX_EDGE = 3508
+const MAX_UPSCALE = 3
 
 /** Cells of the low-resolution lighting map are this many pixels wide. */
 const LIGHT_CELL = 8
@@ -222,8 +228,13 @@ async function warpCanvas(
 
 type LowMap = { values: Float32Array; cols: number; rows: number }
 
-/** Average luminance per LIGHT_CELL block (sampled every 2px), so the pass stays cheap. */
-async function lowLuminance(image: ImageData): Promise<LowMap> {
+/**
+ * One luminance value per LIGHT_CELL block (sampled every 2px), so the pass stays cheap.
+ * 'mean' is the plain average; 'paper' is the brightness of the paper in that block (the ~75th
+ * percentile of its samples), so print, table lines and shading inside the block do not drag it down
+ * while sharpening halos next to dark strokes cannot inflate it.
+ */
+async function lowLuminance(image: ImageData, mode: 'mean' | 'paper' = 'mean'): Promise<LowMap> {
   const { data, width, height } = image
   const cols = Math.ceil(width / LIGHT_CELL)
   const rows = Math.ceil(height / LIGHT_CELL)
@@ -237,14 +248,26 @@ async function lowLuminance(image: ImageData): Promise<LowMap> {
       const x1 = Math.min(width, x0 + LIGHT_CELL)
       let sum = 0
       let count = 0
+      const ranked: number[] = []
       for (let y = y0; y < y1; y += 2) {
         for (let x = x0; x < x1; x += 2) {
           const index = (y * width + x) * 4
-          sum += 0.299 * (data[index] ?? 0) + 0.587 * (data[index + 1] ?? 0) + 0.114 * (data[index + 2] ?? 0)
+          const level = 0.299 * (data[index] ?? 0) + 0.587 * (data[index + 1] ?? 0) + 0.114 * (data[index + 2] ?? 0)
+          sum += level
           count += 1
+          ranked.push(level)
         }
       }
-      values[row * cols + col] = count ? sum / count : 255
+      let value = count ? sum / count : 255
+      if (mode === 'paper' && count > 0) {
+        ranked.sort((a, b) => b - a)
+        const from = Math.floor(count * 0.15)
+        const to = Math.max(from + 1, Math.floor(count * 0.35))
+        let total = 0
+        for (let k = from; k < to; k += 1) total += ranked[k] ?? 0
+        value = total / (to - from)
+      }
+      values[row * cols + col] = value
     }
   }
   return { values, cols, rows }
@@ -289,11 +312,12 @@ function boxFilter(map: LowMap, radius: number, mode: 'max' | 'mean'): LowMap {
 }
 
 /**
- * Paper brightness under the print. A large grayscale closing (max filter, ~90px) removes text
- * and thin lines, then blurring smooths the result. Dividing by it flattens shadows.
+ * Paper brightness under the print. A large max filter (~120px across) skips dense text blocks,
+ * dark header bars and shaded table rows, then blurring smooths the result. Dividing by it flattens
+ * shadows without mistaking table shading for lighting.
  */
 function paperLight(low: LowMap): LowMap {
-  let map = boxFilter(low, 5, 'max')
+  let map = boxFilter(low, 7, 'max')
   map = boxFilter(map, 3, 'mean')
   return boxFilter(map, 3, 'mean')
 }
@@ -335,7 +359,7 @@ function smoothstep(edge0: number, edge1: number, value: number) {
  */
 async function filterMagic(image: ImageData) {
   const { data, width, height } = image
-  const light = paperLight(await lowLuminance(image))
+  const light = paperLight(await lowLuminance(image, 'paper'))
   const columns = columnSampler(width, light.cols)
 
   for (let y = 0; y < height; y += 1) {
@@ -361,21 +385,27 @@ async function filterMagic(image: ImageData) {
   }
 }
 
+const INK_BLACK = 80 // at or below this level a pixel is fully inked
+const INK_FLOOR = 17 // #111111, the darkest ink
+const PAPER_KNEE = 192 // normalized levels from here up fade to paper (fully white by ~208)
+const PAPER_KNEE_OUT = 232 // where the linear stretch ends before the white ramp
+
 /**
- * Tone curve on the shadow-flattened, sharpened page: a smooth S-curve (not a threshold) keeps
- * antialiased text, pencil and thin grid lines continuous, and paper tones above ~215 blend
- * softly into pure #FFFFFF. Strongly colored pixels (stamps, logos, signatures) keep their hue.
+ * Tone curve on the shadow-flattened, sharpened page: a steep but continuous stretch (not a
+ * threshold) pushes ink to deep black while keeping antialiased strokes smooth, and paper tones
+ * above ~200 become pure #FFFFFF. Strongly colored pixels (stamps, logos) keep their hue.
  */
 async function inkCurve(image: ImageData) {
   const { data, width, height } = image
   const lut = new Uint8ClampedArray(256)
   for (let level = 0; level < 256; level += 1) {
-    // Smooth S-curve on the flattened page: ink and pencil keep their tonal range (no binary
-    // clipping), shadows deepen a little, and paper tones above ~215 blend softly into #FFFFFF.
-    const tone = Math.min(1, Math.max(0, (level - 30) / (225 - 30)))
-    const curved = tone * tone * (3 - 2 * tone)
-    const toWhite = smoothstep(205, 232, level)
-    lut[level] = 255 * (curved ** 1.4 * (1 - toWhite) + toWhite)
+    // Steep linear stretch below the paper level: anything under ~60 goes to deep ink (#111), the
+    // range up to the knee climbs linearly (no binary clipping, so antialiased strokes stay continuous),
+    // and everything from the knee up blends into pure #FFFFFF.
+    const stretch = INK_FLOOR + ((Math.min(level, PAPER_KNEE) - INK_BLACK) / (PAPER_KNEE - INK_BLACK)) * (PAPER_KNEE_OUT - INK_FLOOR)
+    const ink = level <= INK_BLACK ? INK_FLOOR * (level / INK_BLACK) : stretch
+    const toWhite = smoothstep(PAPER_KNEE, PAPER_KNEE + 16, level)
+    lut[level] = ink * (1 - toWhite) + 255 * toWhite
   }
   for (let y = 0; y < height; y += 1) {
     if (y % 64 === 0) await nextFrame()
@@ -520,7 +550,8 @@ export async function straightenCanvas(
   deadlineAt = Number.POSITIVE_INFINITY,
 ): Promise<HTMLCanvasElement> {
   const fitted = a4Size(outputSize(corners), isLandscape(corners))
-  const scale = Math.min(1, MAX_EDGE / Math.max(fitted.width, fitted.height, 1))
+  const longEdge = Math.max(fitted.width, fitted.height, 1)
+  const scale = Math.min(MAX_EDGE / longEdge, Math.min(MAX_UPSCALE, Math.max(1, MIN_EDGE / longEdge)))
   const width = Math.max(32, Math.round(fitted.width * scale))
   const height = Math.max(32, Math.round(fitted.height * scale))
   const copy = drawSource(image)
@@ -553,7 +584,8 @@ async function processCopy(
 export async function applyCanvasMagic(source: HTMLCanvasElement): Promise<HTMLCanvasElement> {
   return processCopy(source, async (pixels) => {
     await filterMagic(pixels)
-    await unsharp(pixels, 0.7)
+    await unsharp(pixels, 0.8)
+    await unsharp(pixels, 0.5, 1)
     await inkCurve(pixels)
   })
 }

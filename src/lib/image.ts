@@ -15,7 +15,7 @@ export function loadImage(src: string): Promise<HTMLImageElement> {
   })
 }
 
-export function canvasToJpegBlob(canvas: HTMLCanvasElement, quality = 0.93): Promise<Blob> {
+export function canvasToJpegBlob(canvas: HTMLCanvasElement, quality = 0.95): Promise<Blob> {
   return new Promise((resolve, reject) => {
     canvas.toBlob(
       (blob) => {
