@@ -368,11 +368,9 @@ function growPhoto(seeds: Float32Array, low: LowMap): Float32Array {
     let maxC = 0
     let minR = rows
     let maxR = 0
-    const blob: number[] = []
     while (top > 0) {
       top -= 1
       const i = stack[top] ?? 0
-      blob.push(i)
       count += 1
       const c = i % cols
       const r = (i - c) / cols
@@ -392,7 +390,16 @@ function growPhoto(seeds: Float32Array, low: LowMap): Float32Array {
     const height = maxR - minR + 1
     if (count < PHOTO_MIN_CELLS || width < 6 || height < 6) continue
     if (height <= 5 && width > height * 5) continue
-    for (const i of blob) out[i] = 1
+    // A printed photo is a rectangle. Filling the box keeps sky, asphalt and plate backgrounds
+    // inside the zone, and keeps the paper around it strictly paper.
+    const left = Math.max(0, minC - 1)
+    const right = Math.min(cols - 1, maxC + 1)
+    const north = Math.max(0, minR - 1)
+    const south = Math.min(rows - 1, maxR + 1)
+    for (let row = north; row <= south; row += 1) {
+      const base = row * cols
+      for (let col = left; col <= right; col += 1) out[base + col] = 1
+    }
   }
   return out
 }
@@ -491,6 +498,77 @@ function inpaintPaper(values: Float32Array, photo: Float32Array, cols: number): 
   return out
 }
 
+/**
+ * Local contrast stretch inside a photograph (CLAHE-lite). Each photo cell keeps its own 10th/90th
+ * percentile; pixels are stretched between those bounds so vehicle paint, plate digits and halftone
+ * dots stay visible. Paper cells are left untouched.
+ */
+async function photoContrast(image: ImageData, photo: LowMap) {
+  const { data, width, height } = image
+  const { cols, rows } = photo
+  const lo = new Float32Array(cols * rows)
+  const hi = new Float32Array(cols * rows)
+  const tile = LIGHT_CELL * 3
+  lo.fill(40)
+  hi.fill(220)
+  const ranked: number[] = []
+  for (let row = 0; row < rows; row += 1) {
+    if (row % 16 === 0) await nextFrame()
+    const y0 = Math.max(0, row * LIGHT_CELL - tile + LIGHT_CELL)
+    const y1 = Math.min(height, row * LIGHT_CELL + tile)
+    for (let col = 0; col < cols; col += 1) {
+      if ((photo.values[row * cols + col] ?? 0) < 0.2) continue
+      ranked.length = 0
+      const x0 = Math.max(0, col * LIGHT_CELL - tile + LIGHT_CELL)
+      const x1 = Math.min(width, col * LIGHT_CELL + tile)
+      for (let y = y0; y < y1; y += 2) {
+        for (let x = x0; x < x1; x += 2) {
+          const i = (y * width + x) * 4
+          ranked.push(0.299 * (data[i] ?? 0) + 0.587 * (data[i + 1] ?? 0) + 0.114 * (data[i + 2] ?? 0))
+        }
+      }
+      if (ranked.length < 8) continue
+      ranked.sort((a, b) => a - b)
+      const p10 = ranked[Math.floor(ranked.length * 0.1)] ?? 0
+      const p90 = ranked[Math.min(ranked.length - 1, Math.floor(ranked.length * 0.9))] ?? 255
+      lo[row * cols + col] = p10
+      hi[row * cols + col] = Math.max(p10 + 55, p90)
+    }
+  }
+  const lowAt = mapSampler({ values: boxFilter({ values: lo, cols, rows }, 1, 'mean').values, cols, rows }, width, height)
+  const highAt = mapSampler({ values: boxFilter({ values: hi, cols, rows }, 1, 'mean').values, cols, rows }, width, height)
+  const photoAt = mapSampler(photo, width, height)
+  for (let y = 0; y < height; y += 1) {
+    if (y % 32 === 0) await nextFrame()
+    let index = y * width * 4
+    for (let x = 0; x < width; x += 1) {
+      const weight = photoAt(x, y)
+      if (weight < 0.2) {
+        index += 4
+        continue
+      }
+      const red = data[index] ?? 0
+      const green = data[index + 1] ?? 0
+      const blue = data[index + 2] ?? 0
+      const level = 0.299 * red + 0.587 * green + 0.114 * blue
+      const floor = lowAt(x, y)
+      const ceil = Math.max(floor + 55, highAt(x, y))
+      const boosted = 18 + ((level - floor) / (ceil - floor)) * 220
+      const limited = Math.min(level + 72, Math.max(level - 72, boosted))
+      const target = level * 0.4 + limited * 0.6
+      const lift = level > 1 ? target / level : 0
+      const mixed = (channel: number) => {
+        const photoCh = Math.min(255, Math.max(0, channel * lift))
+        return channel * (1 - weight) + photoCh * weight
+      }
+      data[index] = mixed(red)
+      data[index + 1] = mixed(green)
+      data[index + 2] = mixed(blue)
+      index += 4
+    }
+  }
+}
+
 function paperLight(low: LowMap, photo?: LowMap | null): LowMap {
   const source = photo
     ? { values: inpaintPaper(low.values, photo.values, low.cols), cols: low.cols, rows: low.rows }
@@ -586,33 +664,26 @@ async function filterMagic(image: ImageData, light: LowMap) {
   }
 }
 
-const INK_BLACK = 90 // at or below this level a pixel is fully inked
-const INK_FLOOR = 10 // #0A0A0A, the darkest ink
-const EDGE_MARGIN = 0.05 // width of the perimeter band, as a share of the shorter side
-const EDGE_KNEE = 130 // inside that band, levels from here up fade to pure white at the very edge
-const PAPER_KNEE = 192 // normalized levels from here up fade to paper (fully white by ~208)
-const PAPER_KNEE_OUT = 232 // where the linear stretch ends before the white ramp
+const INK_BLACK = 82 // at or below this level a pixel is fully inked
+const INK_FLOOR = 0 // #000000, the darkest ink
+const EDGE_MARGIN = 0.06 // width of the perimeter band, as a share of the shorter side
+const EDGE_KNEE = 120 // inside that band, levels from here up fade to pure white at the very edge
+const PAPER_KNEE = 168 // paper haze (brown-gray ~170-200) snaps toward white
+const PAPER_KNEE_OUT = 220 // where the linear stretch ends before the white ramp
 
 /**
- * Tone curve on the shadow-flattened, sharpened page. Print (text, tables, barcodes) gets a steep
- * stretch to deep black and paper above ~200 becomes pure #FFFFFF. Continuous-tone photographs are
- * blended toward a gentle gamma instead, so cars, plates and stamps keep their midtones. Strongly
- * colored pixels (stamps, logos) keep their hue.
+ * Tone curve for print and paper only. Photographs were already locally stretched; they are left
+ * alone here so vehicle paint and plates are not washed to white. Paper haze above ~168 becomes
+ * pure #FFFFFF (chroma is discarded so a brown-gray tint cannot linger). Ink goes to #000000.
  */
 async function inkCurve(image: ImageData, photo?: LowMap | null) {
   const { data, width, height } = image
   const lut = new Uint8ClampedArray(256)
-  const photoLut = new Uint8ClampedArray(256)
   for (let level = 0; level < 256; level += 1) {
-    // Steep linear stretch below the paper level: anything under ~60 goes to deep ink (#111), the
-    // range up to the knee climbs linearly (no binary clipping, so antialiased strokes stay continuous),
-    // and everything from the knee up blends into pure #FFFFFF.
     const stretch = INK_FLOOR + ((Math.min(level, PAPER_KNEE) - INK_BLACK) / (PAPER_KNEE - INK_BLACK)) * (PAPER_KNEE_OUT - INK_FLOOR)
     const ink = level <= INK_BLACK ? INK_FLOOR * (level / INK_BLACK) : stretch
-    const toWhite = smoothstep(PAPER_KNEE, PAPER_KNEE + 16, level)
+    const toWhite = smoothstep(PAPER_KNEE, PAPER_KNEE + 18, level)
     lut[level] = ink * (1 - toWhite) + 255 * toWhite
-    // Photographs: a gentle gamma keeps midtones, shadows and highlights. Nothing is snapped to white.
-    photoLut[level] = 255 * (0.06 + 0.94 * (level / 255) ** 0.9)
   }
   const photoAt = photo ? mapSampler(photo, width, height) : null
   // Lens vignette and the shadow of the page edge leave the outer margin grayer than the light map
@@ -630,19 +701,25 @@ async function inkCurve(image: ImageData, photo?: LowMap | null) {
       const blue = data[index + 2] ?? 0
       const level = 0.299 * red + 0.587 * green + 0.114 * blue
       const tone = Math.round(level)
-      const inkTarget = lut[tone] ?? 255
       const picture = photoAt ? Math.min(1, photoAt(x, y)) : 0
-      let target = picture > 0 ? inkTarget * (1 - picture) + (photoLut[tone] ?? level) * picture : inkTarget
+      if (picture > 0.65) {
+        index += 4
+        continue
+      }
+      let target = lut[tone] ?? 255
       const fromEdge = Math.min(x, width - 1 - x, fromY)
       if (fromEdge < margin && picture < 0.35) {
         const strength = (1 - smoothstep(0, margin, fromEdge)) * (1 - picture)
         const edgeWhite = smoothstep(EDGE_KNEE, EDGE_KNEE + 20, level) * strength
         target = target * (1 - edgeWhite) + 255 * edgeWhite
       }
+      const print = 1 - picture
+      target = target * print + level * picture
       const lift = level > 1 ? target / level : 0
       const peak = Math.max(red, green, blue)
       const saturation = peak > 1 ? (peak - Math.min(red, green, blue)) / peak : 0
-      const keep = Math.max(smoothstep(0.2, 0.42, saturation), picture * 0.9)
+      // Paper must not keep a brown-gray tint. Color is kept only on stamps/logos, never on haze.
+      const keep = smoothstep(0.28, 0.5, saturation) * print * (target < 210 ? 1 : 0)
       data[index] = target + (Math.min(255, red * lift) - target) * keep
       data[index + 1] = target + (Math.min(255, green * lift) - target) * keep
       data[index + 2] = target + (Math.min(255, blue * lift) - target) * keep
@@ -734,7 +811,7 @@ async function unsharp(image: ImageData, amount: number, radius = 2, brighten = 
       // Photographs get a light touch so plate digits stay readable without speckling the grain.
       const photoW = photoAt ? photoAt(x, y) : 0
       const diff = (gray[p] ?? 0) - (column[y] ?? 0)
-      const raw = diff * amount * (diff > 0 ? brighten : 1) * (photoW > 0.35 ? 0.28 : 1)
+      const raw = diff * amount * (diff > 0 ? brighten : 1) * (photoW > 0.35 ? 0.15 : 1)
       const delta = raw - Math.max(-2, Math.min(2, raw))
       if (delta === 0) continue
       const i = p * 4
@@ -816,10 +893,10 @@ export async function applyCanvasMagic(source: HTMLCanvasElement): Promise<HTMLC
     const photo = photoWeights(low)
     const light = paperLight(low, photo)
     await filterMagic(pixels, light)
-    // Micro-contrast on ink edges: a broad pass for stroke body, then the strong 1px pass (amount 1.3).
-    // Photographs are skipped so their grain is not sharpened into speckle.
-    await unsharp(pixels, 0.6, 2, 0.6, photo)
-    await unsharp(pixels, 1.3, 1, 0.5, photo)
+    if (photo) await photoContrast(pixels, photo)
+    // Stroke-only sharpening: a broad pass then a 1px pass. Photographs stay nearly untouched.
+    await unsharp(pixels, 0.75, 2, 0.45, photo)
+    await unsharp(pixels, 1.45, 1, 0.35, photo)
     await inkCurve(pixels, photo)
   })
 }
