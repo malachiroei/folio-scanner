@@ -39,22 +39,14 @@ const MIN_EDGE = 2800
 const MAX_EDGE = 3508
 const MAX_UPSCALE = 3
 
-/** Cells of the low-resolution lighting map are this many pixels wide. */
+/** Cells of the low-resolution lighting and texture maps are this many pixels wide. */
 const LIGHT_CELL = 8
-
-/** A cell is photo-like when this share of its samples sit in the middle of its own tone range. */
-const PHOTO_TEXTURE = 0.36
-/** Smallest printed photo (cells). Stamps and logos sit below this. */
-const PHOTO_MIN_CELLS = 36
-/** Shortest side of a photo rectangle (cells). ~64px at LIGHT_CELL. */
-const PHOTO_MIN_SIDE = 8
-/** A second, smaller print (plate crop) may be slightly under the primary size floor. */
-const PHOTO_MIN_CELLS_SECOND = 24
-const PHOTO_MIN_SIDE_SECOND = 6
-/** Keep at most this many independent photo rectangles (overview + plate, rarely a third). */
-const PHOTO_MAX_BOXES = 3
-/** A projection column/row is the printed photo once its edge density reaches this share of the peak. */
-const PHOTO_EDGE_SNAP = 0.32
+/** Local stddev below this is paper / smooth vignette, not a photograph. */
+const TEXTURE_PAPER = 6
+/** Local stddev at or above this is full continuous-tone energy. */
+const TEXTURE_PHOTO = 22
+/** Mid-tone share below this is a binary ink edge (text/barcode), not a photo. */
+const TEXTURE_MID = 0.22
 
 function sourceSize(image: CanvasImageSource): { width: number; height: number } {
   if (image instanceof HTMLImageElement) {
@@ -244,12 +236,10 @@ type LowMap = {
   values: Float32Array
   cols: number
   rows: number
-  /** 'paper' maps only: how photo-like (continuous mid-tones) each cell is, 0..1. */
+  /** Continuous-tone energy 0..1: high in printed photos, near 0 on paper and text edges. */
   texture?: Float32Array
   /** Mean HSV-style saturation per cell, 0..1. */
   sat?: Float32Array
-  /** Mean absolute neighbor gradient per cell. Low on the oval vignette, high on a printed frame. */
-  edge?: Float32Array
 }
 
 /**
@@ -265,7 +255,6 @@ async function lowLuminance(image: ImageData, mode: 'mean' | 'paper' = 'mean'): 
   const values = new Float32Array(cols * rows)
   const texture = mode === 'paper' ? new Float32Array(cols * rows) : undefined
   const sat = mode === 'paper' ? new Float32Array(cols * rows) : undefined
-  const edge = mode === 'paper' ? new Float32Array(cols * rows) : undefined
   for (let row = 0; row < rows; row += 1) {
     if (row % 24 === 0) await nextFrame()
     const y0 = row * LIGHT_CELL
@@ -276,8 +265,6 @@ async function lowLuminance(image: ImageData, mode: 'mean' | 'paper' = 'mean'): 
       let sum = 0
       let satSum = 0
       let count = 0
-      let grad = 0
-      let gradCount = 0
       const ranked: number[] = []
       for (let y = y0; y < y1; y += 2) {
         for (let x = x0; x < x1; x += 2) {
@@ -291,19 +278,8 @@ async function lowLuminance(image: ImageData, mode: 'mean' | 'paper' = 'mean'): 
           satSum += peak > 1 ? (peak - Math.min(red, green, blue)) / peak : 0
           count += 1
           ranked.push(level)
-          if (x + 2 < x1) {
-            const iR = (y * width + x + 2) * 4
-            grad += Math.abs(level - (0.299 * (data[iR] ?? 0) + 0.587 * (data[iR + 1] ?? 0) + 0.114 * (data[iR + 2] ?? 0)))
-            gradCount += 1
-          }
-          if (y + 2 < y1) {
-            const iD = ((y + 2) * width + x) * 4
-            grad += Math.abs(level - (0.299 * (data[iD] ?? 0) + 0.587 * (data[iD + 1] ?? 0) + 0.114 * (data[iD + 2] ?? 0)))
-            gradCount += 1
-          }
         }
       }
-      if (edge) edge[row * cols + col] = gradCount ? grad / gradCount : 0
       let value = count ? sum / count : 255
       const chroma = count ? satSum / count : 0
       const mean = count ? sum / count : 0
@@ -316,263 +292,33 @@ async function lowLuminance(image: ImageData, mode: 'mean' | 'paper' = 'mean'): 
         for (let k = from; k < to; k += 1) total += ranked[k] ?? 0
         value = total / (to - from)
 
-        // Photo-likeness: text and bars put their pixels at the two extremes (paper and ink) with only
-        // antialiased edges between, while a continuous-tone picture spreads over the middle of the range.
         const top = ranked[0] ?? 0
         const bottom = ranked[count - 1] ?? 0
         const range = top - bottom
-        if (texture && mean > 20 && mean < 245) {
-          const low = bottom + range * 0.18
-          const high = bottom + range * 0.82
-          let middle = 0
-          let moment = 0
-          for (const level of ranked) {
-            if (level > low && level < high) middle += 1
-            moment += (level - mean) * (level - mean)
+        const bandLow = bottom + range * 0.18
+        const bandHigh = bottom + range * 0.82
+        let middle = 0
+        let moment = 0
+        for (const level of ranked) {
+          if (level > bandLow && level < bandHigh) middle += 1
+          moment += (level - mean) * (level - mean)
+        }
+        const spread = Math.sqrt(moment / count)
+        const midShare = middle / count
+        if (texture && mean > 18 && mean < 248) {
+          const grain = Math.min(1, Math.max(0, (spread - TEXTURE_PAPER) / (TEXTURE_PHOTO - TEXTURE_PAPER)))
+          const tone = Math.min(1, Math.max(0, (midShare - TEXTURE_MID) / 0.28))
+          let energy = grain * tone
+          if (chroma > 0.1 && mean > 28 && mean < 232) {
+            energy = Math.max(energy, Math.min(1, (chroma - 0.08) / 0.2) * Math.min(1, Math.max(0, (spread - 4) / 14)))
           }
-          const spread = Math.sqrt(moment / count)
-          const midShare = middle / count
-          if (range >= 22 && midShare >= 0.28 && spread >= 10) {
-            texture[row * cols + col] = Math.min(1, midShare + spread / 80)
-          } else if (chroma > 0.12 && mean > 30 && mean < 230) {
-            texture[row * cols + col] = Math.min(1, chroma * 1.8)
-          }
+          texture[row * cols + col] = energy
         }
       }
       values[row * cols + col] = value
     }
   }
-  return texture ? { values, cols, rows, texture, sat, edge } : { values, cols, rows }
-}
-
-/** Morphology on a 0/1 cell map through box means (a cell survives erosion only if its whole window is set). */
-function morphCells(map: Float32Array, cols: number, rows: number, radius: number, grow: boolean): Float32Array {
-  const mean = boxFilter({ values: map, cols, rows }, radius, 'mean').values
-  const result = new Float32Array(map.length)
-  for (let i = 0; i < map.length; i += 1) {
-    const value = mean[i] ?? 0
-    result[i] = grow ? (value > 0.001 ? 1 : 0) : value > 0.999 ? 1 : 0
-  }
-  return result
-}
-
-type PhotoBox = { left: number; right: number; north: number; south: number }
-
-function boxArea(box: PhotoBox): number {
-  return (box.right - box.left + 1) * (box.south - box.north + 1)
-}
-
-function validPhotoBox(box: PhotoBox, minCells: number, minSide: number): boolean {
-  const width = box.right - box.left + 1
-  const height = box.south - box.north + 1
-  if (width < minSide || height < minSide || width * height < minCells) return false
-  return Math.max(width, height) / Math.min(width, height) <= 3.8
-}
-
-function seedPhoto(low: LowMap): Float32Array {
-  const { cols, rows, texture } = low
-  const seeds = new Float32Array(cols * rows)
-  if (!texture) return seeds
-  // Radius 1 only — a wider blur glues two nearby prints (car + plate) into one blob.
-  const local = boxFilter({ values: texture, cols, rows }, 1, 'mean').values
-  for (let i = 0; i < seeds.length; i += 1) {
-    const grain = local[i] ?? 0
-    const chroma = low.sat?.[i] ?? 0
-    const bright = low.values[i] ?? 0
-    if (grain >= PHOTO_TEXTURE) {
-      seeds[i] = 1
-      continue
-    }
-    // Paint / sky: colored mid-tones with some grain. A solid stamp on paper does not qualify.
-    if (chroma > 0.16 && bright > 35 && bright < 225 && grain >= PHOTO_TEXTURE * 0.35) seeds[i] = 1
-  }
-  return seeds
-}
-
-/**
- * Snap each side inward to the printed photo frame. The oval illumination vignette is a
- * low-gradient ramp; the real rectangle is the first projection peak in edge density.
- */
-function snapToPrintedBorder(low: LowMap, box: PhotoBox): PhotoBox {
-  const { cols, edge } = low
-  if (!edge) return box
-  const width = box.right - box.left + 1
-  const height = box.south - box.north + 1
-  const colEdge = new Float32Array(width)
-  const rowEdge = new Float32Array(height)
-  for (let row = box.north; row <= box.south; row += 1) {
-    for (let col = box.left; col <= box.right; col += 1) {
-      const value = edge[row * cols + col] ?? 0
-      colEdge[col - box.left] += value
-      rowEdge[row - box.north] += value
-    }
-  }
-  for (let i = 0; i < width; i += 1) colEdge[i] = (colEdge[i] ?? 0) / height
-  for (let i = 0; i < height; i += 1) rowEdge[i] = (rowEdge[i] ?? 0) / width
-
-  const peakOf = (profile: Float32Array) => {
-    let peak = 0
-    for (const value of profile) if (value > peak) peak = value
-    return peak
-  }
-  const inward = (profile: Float32Array, fromStart: boolean, minKeep: number) => {
-    const peak = peakOf(profile)
-    const floor = Math.max(4, peak * PHOTO_EDGE_SNAP)
-    const last = profile.length - 1
-    const maxWalk = Math.max(0, profile.length - minKeep)
-    if (fromStart) {
-      let i = 0
-      while (i < maxWalk && i < last && (profile[i] ?? 0) < floor) i += 1
-      return i
-    }
-    let i = last
-    while (i > 0 && last - i < maxWalk && (profile[i] ?? 0) < floor) i -= 1
-    return last - i
-  }
-
-  const left = box.left + inward(colEdge, true, PHOTO_MIN_SIDE)
-  const right = box.right - inward(colEdge, false, PHOTO_MIN_SIDE)
-  const north = box.north + inward(rowEdge, true, PHOTO_MIN_SIDE)
-  const south = box.south - inward(rowEdge, false, PHOTO_MIN_SIDE)
-  if (right - left + 1 < PHOTO_MIN_SIDE_SECOND || south - north + 1 < PHOTO_MIN_SIDE_SECOND) return box
-  return { left, right, north, south }
-}
-
-/**
- * If a connected component is actually two prints with a paper gutter, the seed projection has a
- * valley. Split there so each photo stays its own hard rectangle.
- */
-function splitIfTwo(seeds: Float32Array, cols: number, box: PhotoBox): PhotoBox[] {
-  const width = box.right - box.left + 1
-  const height = box.south - box.north + 1
-  const colHits = new Float32Array(width)
-  const rowHits = new Float32Array(height)
-  for (let row = box.north; row <= box.south; row += 1) {
-    for (let col = box.left; col <= box.right; col += 1) {
-      if ((seeds[row * cols + col] ?? 0) < 0.5) continue
-      colHits[col - box.left] += 1
-      rowHits[row - box.north] += 1
-    }
-  }
-
-  const valley = (hits: Float32Array, span: number, minSpan: number) => {
-    if (span < minSpan) return null
-    let peak = 1
-    for (const value of hits) if (value > peak) peak = value
-    const from = Math.max(2, Math.floor(span * 0.18))
-    const to = Math.min(span - 4, Math.ceil(span * 0.82))
-    let bestAt = -1
-    let bestScore = 0.18
-    for (let i = from; i <= to; i += 1) {
-      const rel = ((hits[i] ?? 0) + (hits[i + 1] ?? 0)) / 2 / peak
-      if (rel < bestScore) {
-        bestScore = rel
-        bestAt = i
-      }
-    }
-    return bestAt >= 0 ? bestAt : null
-  }
-
-  const cutCol = valley(colHits, width, 16)
-  const cutRow = valley(rowHits, height, 16)
-  if (cutCol !== null && (cutRow === null || width >= height)) {
-    const a = { ...box, right: box.left + cutCol }
-    const b = { ...box, left: box.left + cutCol + 2 }
-    if (validPhotoBox(a, PHOTO_MIN_CELLS_SECOND, PHOTO_MIN_SIDE_SECOND) && validPhotoBox(b, PHOTO_MIN_CELLS_SECOND, PHOTO_MIN_SIDE_SECOND)) {
-      return [a, b]
-    }
-  }
-  if (cutRow !== null) {
-    const a = { ...box, south: box.north + cutRow }
-    const b = { ...box, north: box.north + cutRow + 2 }
-    if (validPhotoBox(a, PHOTO_MIN_CELLS_SECOND, PHOTO_MIN_SIDE_SECOND) && validPhotoBox(b, PHOTO_MIN_CELLS_SECOND, PHOTO_MIN_SIDE_SECOND)) {
-      return [a, b]
-    }
-  }
-  return [box]
-}
-
-function containsBox(outer: PhotoBox, inner: PhotoBox): boolean {
-  return (
-    inner.left >= outer.left &&
-    inner.right <= outer.right &&
-    inner.north >= outer.north &&
-    inner.south <= outer.south
-  )
-}
-
-/**
- * Independent hard rectangles for each printed photograph. Components are not grown through the
- * oval fog, not merged across a paper gutter, and a second valid box is never discarded.
- */
-function findPhotoBoxes(low: LowMap): PhotoBox[] {
-  const { cols, rows } = low
-  if (!low.texture) return []
-  const raw = seedPhoto(low)
-  const seeds = morphCells(morphCells(raw, cols, rows, 1, true), cols, rows, 1, false)
-  const seen = new Uint8Array(seeds.length)
-  const stack = new Int32Array(seeds.length)
-  const found: PhotoBox[] = []
-
-  for (let start = 0; start < seeds.length; start += 1) {
-    if ((seeds[start] ?? 0) < 0.5 || seen[start]) continue
-    let top = 0
-    stack[top] = start
-    top += 1
-    seen[start] = 1
-    let count = 0
-    let minC = cols
-    let maxC = 0
-    let minR = rows
-    let maxR = 0
-    while (top > 0) {
-      top -= 1
-      const i = stack[top] ?? 0
-      count += 1
-      const c = i % cols
-      const r = (i - c) / cols
-      if (c < minC) minC = c
-      if (c > maxC) maxC = c
-      if (r < minR) minR = r
-      if (r > maxR) maxR = r
-      const neighbors = [c > 0 ? i - 1 : -1, c + 1 < cols ? i + 1 : -1, r > 0 ? i - cols : -1, r + 1 < rows ? i + cols : -1]
-      for (const n of neighbors) {
-        if (n < 0 || seen[n] || (seeds[n] ?? 0) < 0.5) continue
-        seen[n] = 1
-        stack[top] = n
-        top += 1
-      }
-    }
-    if (count < PHOTO_MIN_CELLS_SECOND) continue
-    const loose = { left: minC, right: maxC, north: minR, south: maxR }
-    for (const part of splitIfTwo(seeds, cols, loose)) found.push(snapToPrintedBorder(low, part))
-  }
-
-  found.sort((a, b) => boxArea(b) - boxArea(a))
-  const kept: PhotoBox[] = []
-  for (const box of found) {
-    if (kept.some((other) => containsBox(other, box))) continue
-    const minCells = kept.length === 0 ? PHOTO_MIN_CELLS : PHOTO_MIN_CELLS_SECOND
-    const minSide = kept.length === 0 ? PHOTO_MIN_SIDE : PHOTO_MIN_SIDE_SECOND
-    if (!validPhotoBox(box, minCells, minSide)) continue
-    kept.push(box)
-    if (kept.length >= PHOTO_MAX_BOXES) break
-  }
-  return kept
-}
-
-/** Hard 0/1 mask: photo processing runs only inside these rectangles. Everything else is paper. */
-function photoWeights(low: LowMap): LowMap | null {
-  const boxes = findPhotoBoxes(low)
-  if (!boxes.length) return null
-  const values = new Float32Array(low.cols * low.rows)
-  for (const box of boxes) {
-    for (let row = box.north; row <= box.south; row += 1) {
-      const base = row * low.cols
-      for (let col = box.left; col <= box.right; col += 1) values[base + col] = 1
-    }
-  }
-  return { values, cols: low.cols, rows: low.rows }
+  return texture ? { values, cols, rows, texture, sat } : { values, cols, rows }
 }
 
 /** Separable box max (dilate), min (erode) or mean over a small window of cells. */
@@ -619,125 +365,133 @@ function boxFilter(map: LowMap, radius: number, mode: 'max' | 'min' | 'mean'): L
 }
 
 /**
- * Paper brightness under the print. A large max filter (~120px across) skips dense text blocks,
- * dark header bars and shaded table rows, then blurring smooths the result. Dividing by it flattens
- * shadows without mistaking table shading for lighting.
+ * Lift isolated low-energy cells that sit inside a photograph (sky, asphalt) without growing
+ * outward into the smooth vignette, which has low-energy neighbors on the paper side.
  */
-/** Copies surrounding paper brightness into cells covered by a photograph (nearest-known BFS). */
-function inpaintPaper(values: Float32Array, photo: Float32Array, cols: number): Float32Array {
-  const out = new Float32Array(values.length)
-  const ready = new Uint8Array(values.length)
-  const queue = new Int32Array(values.length)
-  let head = 0
-  let tail = 0
-  for (let i = 0; i < values.length; i += 1) {
-    if ((photo[i] ?? 0) > 0.25) continue
-    out[i] = values[i] ?? 0
-    ready[i] = 1
-    queue[tail] = i
-    tail += 1
-  }
-  if (tail === 0) return values
-  while (head < tail) {
-    const i = queue[head] ?? 0
-    head += 1
-    const x = i % cols
-    const neighbors = [x > 0 ? i - 1 : -1, x + 1 < cols ? i + 1 : -1, i >= cols ? i - cols : -1, i + cols < values.length ? i + cols : -1]
-    for (const n of neighbors) {
-      if (n < 0 || ready[n]) continue
-      out[n] = out[i] ?? 0
-      ready[n] = 1
-      queue[tail] = n
-      tail += 1
+function fillPhotoHoles(values: Float32Array, cols: number, rows: number, seed = 0.36): Float32Array {
+  let current = values
+  for (let pass = 0; pass < 3; pass += 1) {
+    const next = new Float32Array(current)
+    for (let i = 0; i < current.length; i += 1) {
+      if ((current[i] ?? 0) >= seed) continue
+      const c = i % cols
+      const r = (i - c) / cols
+      let high = 0
+      let sum = 0
+      const look = [c > 0 ? i - 1 : -1, c + 1 < cols ? i + 1 : -1, r > 0 ? i - cols : -1, r + 1 < rows ? i + cols : -1]
+      for (const n of look) {
+        const value = n >= 0 ? (current[n] ?? 0) : 0
+        if (value < seed) continue
+        high += 1
+        sum += value
+      }
+      if (high >= 3) next[i] = sum / high
     }
+    current = next
   }
-  return out
+  return current
+}
+
+/** Soft 0..1 photo weight from local stddev / mid-tone energy. No bounding boxes. */
+function photoEnergy(low: LowMap): LowMap | null {
+  const { cols, rows, texture } = low
+  if (!texture) return null
+  const smooth = boxFilter({ values: texture, cols, rows }, 1, 'mean').values
+  const filled = fillPhotoHoles(smooth, cols, rows)
+  let any = 0
+  for (const value of filled) any += value
+  if (any < 8) return null
+  return { values: filled, cols, rows }
 }
 
 /**
- * Each hard photo rectangle is stretched from its own histogram: darks → 15, lights → 240.
- * Paper (mask == 0) is never touched.
+ * CLAHE-lite on the original source: each texture cell uses its own 10th/90th luminance
+ * so vehicles and plates keep depth. Output is a separate RGB buffer (Layer 2).
  */
-async function photoContrast(image: ImageData, photo: LowMap) {
-  const { data, width, height } = image
+async function claheLayer(
+  source: Uint8ClampedArray,
+  width: number,
+  height: number,
+  photo: LowMap,
+): Promise<Uint8ClampedArray> {
+  const out = new Uint8ClampedArray(source)
   const { cols, rows } = photo
   const lo = new Float32Array(cols * rows)
   const hi = new Float32Array(cols * rows)
   lo.fill(0)
   hi.fill(255)
-  const seen = new Uint8Array(photo.values.length)
-  const stack = new Int32Array(photo.values.length)
-
-  for (let start = 0; start < photo.values.length; start += 1) {
-    if ((photo.values[start] ?? 0) < 0.5 || seen[start]) continue
-    let top = 0
-    stack[top] = start
-    top += 1
-    seen[start] = 1
-    const cells: number[] = []
-    while (top > 0) {
-      top -= 1
-      const i = stack[top] ?? 0
-      cells.push(i)
-      const c = i % cols
-      const r = (i - c) / cols
-      const neighbors = [c > 0 ? i - 1 : -1, c + 1 < cols ? i + 1 : -1, r > 0 ? i - cols : -1, r + 1 < rows ? i + cols : -1]
-      for (const n of neighbors) {
-        if (n < 0 || seen[n] || (photo.values[n] ?? 0) < 0.5) continue
-        seen[n] = 1
-        stack[top] = n
-        top += 1
-      }
-    }
-    if (cells.length < PHOTO_MIN_CELLS_SECOND) continue
-    const samples: number[] = []
-    for (const i of cells) {
-      const col = i % cols
-      const row = (i - col) / cols
-      const x0 = col * LIGHT_CELL
-      const y0 = row * LIGHT_CELL
-      const x1 = Math.min(width, x0 + LIGHT_CELL)
-      const y1 = Math.min(height, y0 + LIGHT_CELL)
+  const tile = LIGHT_CELL * 6
+  const ranked: number[] = []
+  for (let row = 0; row < rows; row += 1) {
+    if (row % 16 === 0) await nextFrame()
+    const y0 = Math.max(0, row * LIGHT_CELL - tile + LIGHT_CELL)
+    const y1 = Math.min(height, row * LIGHT_CELL + tile)
+    for (let col = 0; col < cols; col += 1) {
+      if ((photo.values[row * cols + col] ?? 0) < 0.12) continue
+      ranked.length = 0
+      const x0 = Math.max(0, col * LIGHT_CELL - tile + LIGHT_CELL)
+      const x1 = Math.min(width, col * LIGHT_CELL + tile)
       for (let y = y0; y < y1; y += 2) {
         for (let x = x0; x < x1; x += 2) {
-          const p = (y * width + x) * 4
-          samples.push(0.299 * (data[p] ?? 0) + 0.587 * (data[p + 1] ?? 0) + 0.114 * (data[p + 2] ?? 0))
+          const i = (y * width + x) * 4
+          ranked.push(0.299 * (source[i] ?? 0) + 0.587 * (source[i + 1] ?? 0) + 0.114 * (source[i + 2] ?? 0))
         }
       }
-    }
-    if (samples.length < 16) continue
-    samples.sort((a, b) => a - b)
-    const floor = samples[Math.floor(samples.length * 0.01)] ?? 0
-    const ceil = Math.max(floor + 24, samples[Math.min(samples.length - 1, Math.floor(samples.length * 0.99))] ?? 255)
-    for (const i of cells) {
-      lo[i] = floor
-      hi[i] = ceil
+      if (ranked.length < 8) continue
+      ranked.sort((a, b) => a - b)
+      const p10 = ranked[Math.floor(ranked.length * 0.1)] ?? 0
+      const p90 = ranked[Math.min(ranked.length - 1, Math.floor(ranked.length * 0.9))] ?? 255
+      lo[row * cols + col] = p10
+      hi[row * cols + col] = Math.max(p10 + 24, p90)
     }
   }
-
   const photoAt = nearestSampler(photo)
   for (let y = 0; y < height; y += 1) {
     if (y % 32 === 0) await nextFrame()
     let index = y * width * 4
     for (let x = 0; x < width; x += 1) {
-      const col = Math.min(cols - 1, Math.max(0, (x / LIGHT_CELL) | 0))
-      const row = Math.min(rows - 1, Math.max(0, (y / LIGHT_CELL) | 0))
-      if (photoAt(x, y) < 0.5) {
+      if (photoAt(x, y) < 0.08) {
         index += 4
         continue
       }
-      const red = data[index] ?? 0
-      const green = data[index + 1] ?? 0
-      const blue = data[index + 2] ?? 0
+      const col = Math.min(cols - 1, Math.max(0, (x / LIGHT_CELL) | 0))
+      const row = Math.min(rows - 1, Math.max(0, (y / LIGHT_CELL) | 0))
+      const red = source[index] ?? 0
+      const green = source[index + 1] ?? 0
+      const blue = source[index + 2] ?? 0
       const level = 0.299 * red + 0.587 * green + 0.114 * blue
       const floor = lo[row * cols + col] ?? 0
       const ceil = Math.max(floor + 24, hi[row * cols + col] ?? 255)
-      const stretched = 15 + ((level - floor) / (ceil - floor)) * 225
+      const stretched = 18 + ((level - floor) / (ceil - floor)) * 217
       const target = Math.min(240, Math.max(15, stretched))
       const lift = level > 1 ? target / level : 0
-      data[index] = Math.min(255, Math.max(0, red * lift))
-      data[index + 1] = Math.min(255, Math.max(0, green * lift))
-      data[index + 2] = Math.min(255, Math.max(0, blue * lift))
+      out[index] = Math.min(255, Math.max(0, red * lift))
+      out[index + 1] = Math.min(255, Math.max(0, green * lift))
+      out[index + 2] = Math.min(255, Math.max(0, blue * lift))
+      out[index + 3] = 255
+      index += 4
+    }
+  }
+  return out
+}
+
+async function compositeLayers(document: ImageData, photo: Uint8ClampedArray, weight: LowMap) {
+  const { data, width, height } = document
+  const at = bilinearSampler(weight, width)
+  for (let y = 0; y < height; y += 1) {
+    if (y % 32 === 0) await nextFrame()
+    let index = y * width * 4
+    for (let x = 0; x < width; x += 1) {
+      const w = Math.min(1, Math.max(0, at(x, y)))
+      if (w < 0.04) {
+        index += 4
+        continue
+      }
+      const keep = 1 - w
+      data[index] = (data[index] ?? 0) * keep + (photo[index] ?? 0) * w
+      data[index + 1] = (data[index + 1] ?? 0) * keep + (photo[index + 1] ?? 0) * w
+      data[index + 2] = (data[index + 2] ?? 0) * keep + (photo[index + 2] ?? 0) * w
+      data[index + 3] = 255
       index += 4
     }
   }
@@ -747,11 +501,8 @@ async function photoContrast(image: ImageData, photo: LowMap) {
  * Wide morphological closing (~220px) estimates the paper illumination surface: text and table
  * lines disappear, folds and shadows remain. A Gaussian-like blur then makes the divide stable.
  */
-function paperLight(low: LowMap, photo?: LowMap | null): LowMap {
-  const source = photo
-    ? { values: inpaintPaper(low.values, photo.values, low.cols), cols: low.cols, rows: low.rows }
-    : low
-  const closed = boxFilter(boxFilter(source, 14, 'max'), 10, 'min')
+function paperLight(low: LowMap): LowMap {
+  const closed = boxFilter(boxFilter(low, 14, 'max'), 10, 'min')
   return boxFilter(boxFilter(closed, 4, 'mean'), 3, 'mean')
 }
 
@@ -781,7 +532,6 @@ function sampleRow(map: LowMap, y: number): { top: number; bottom: number; weigh
   return { top: base * map.cols, bottom: Math.min(map.rows - 1, base + 1) * map.cols, weight: position - base }
 }
 
-/** Hard cell lookup — no bilinear fade — so paper whitening stops on the photo's rectangular edge. */
 function nearestSampler(map: LowMap): (x: number, y: number) => number {
   const { cols, rows, values } = map
   return (x, y) => {
@@ -791,24 +541,30 @@ function nearestSampler(map: LowMap): (x: number, y: number) => number {
   }
 }
 
-/**
- * Absolute background normalization for paper only (mask == 0): `pixel = source / bg * 255`.
- * Photo rectangles keep their own tones for the later histogram stretch.
- */
-async function filterMagic(image: ImageData, light: LowMap, photo?: LowMap | null) {
+function bilinearSampler(map: LowMap, width: number): (x: number, y: number) => number {
+  const columns = columnSampler(width, map.cols)
+  const values = map.values
+  return (x, y) => {
+    const row = sampleRow(map, y)
+    const l = columns.left[x] ?? 0
+    const r = columns.right[x] ?? 0
+    const wx = columns.weight[x] ?? 0
+    const top = (values[row.top + l] ?? 0) * (1 - wx) + (values[row.top + r] ?? 0) * wx
+    const bottom = (values[row.bottom + l] ?? 0) * (1 - wx) + (values[row.bottom + r] ?? 0) * wx
+    return top * (1 - row.weight) + bottom * row.weight
+  }
+}
+
+/** Layer 1 flatten: `pixel = source / background * 255` across the whole page. */
+async function flattenIllumination(image: ImageData, light: LowMap) {
   const { data, width, height } = image
   const columns = columnSampler(width, light.cols)
-  const photoAt = photo ? nearestSampler(photo) : null
 
   for (let y = 0; y < height; y += 1) {
     if (y % 32 === 0) await nextFrame()
     const row = sampleRow(light, y)
     let index = y * width * 4
     for (let x = 0; x < width; x += 1) {
-      if (photoAt && photoAt(x, y) >= 0.5) {
-        index += 4
-        continue
-      }
       const l = columns.left[x] ?? 0
       const r = columns.right[x] ?? 0
       const wx = columns.weight[x] ?? 0
@@ -826,26 +582,20 @@ async function filterMagic(image: ImageData, light: LowMap, photo?: LowMap | nul
   }
 }
 
-const INK_BLACK = 118 // flattened ink after the divide; anything lighter is paper or fog
-const INK_FLOOR = 10 // #0A0A0A, inside the #000000–#101010 scanner black range
-const PAPER_CLAMP = 165 // any non-photo normalized pixel above this is forced to #FFFFFF
+const INK_BLACK = 118
+const INK_FLOOR = 5 // #050505
+const PAPER_CLAMP = 165
 
 /**
- * Paper/text only. Normalized pixels > 165 become #FFFFFF with no fade across the photo border.
- * Remaining gray fog is also bleached. Dark ink goes to #0A0A0A; colored stamps keep their hue.
+ * Layer 1 polish: paper > 165 → #FFFFFF, high-contrast ink → #050505, saturated stamps keep hue.
+ * Gray fog and vignette (not ink, not color) become white.
  */
-async function inkCurve(image: ImageData, photo?: LowMap | null, edge?: LowMap | null) {
+async function polishDocument(image: ImageData) {
   const { data, width, height } = image
-  const photoAt = photo ? nearestSampler(photo) : null
-  const edgeAt = edge?.values && edge.values.length ? nearestSampler(edge) : null
   for (let y = 0; y < height; y += 1) {
     if (y % 64 === 0) await nextFrame()
     let index = y * width * 4
     for (let x = 0; x < width; x += 1) {
-      if (photoAt && photoAt(x, y) >= 0.5) {
-        index += 4
-        continue
-      }
       const red = data[index] ?? 0
       const green = data[index + 1] ?? 0
       const blue = data[index + 2] ?? 0
@@ -860,16 +610,15 @@ async function inkCurve(image: ImageData, photo?: LowMap | null, edge?: LowMap |
       }
       const peak = Math.max(red, green, blue)
       const saturation = peak > 1 ? (peak - Math.min(red, green, blue)) / peak : 0
-      const colorInk = saturation > 0.22 && level < 220
-      if (colorInk) {
+      if (saturation > 0.22 && level < 220) {
         const deepened = 255 * (level / 255) ** 1.35
         const target = Math.max(16, Math.min(200, deepened))
         const lift = level > 1 ? target / level : 0
         data[index] = Math.min(255, red * lift)
         data[index + 1] = Math.min(255, green * lift)
         data[index + 2] = Math.min(255, blue * lift)
-      } else if (level <= INK_BLACK && (!edgeAt || edgeAt(x, y) >= 7)) {
-        const target = INK_FLOOR + (level / INK_BLACK) * 6
+      } else if (level <= INK_BLACK) {
+        const target = INK_FLOOR + (level / INK_BLACK) * 4
         const lift = level > 1 ? target / level : 0
         data[index] = Math.min(255, red * lift)
         data[index + 1] = Math.min(255, green * lift)
@@ -1051,24 +800,22 @@ async function processCopy(
   return canvas
 }
 
-/** Magic scan: flat white paper, hard photo rectangles, bold ink, colors kept. */
+/** Dual-layer magic scan: cleaned document composited with CLAHE photos by texture energy. */
 export async function applyCanvasMagic(source: HTMLCanvasElement): Promise<HTMLCanvasElement> {
   return processCopy(source, async (pixels) => {
+    const original = new Uint8ClampedArray(pixels.data)
     const low = await lowLuminance(pixels, 'paper')
-    const photo = photoWeights(low)
-    const light = paperLight(low, photo)
-    await filterMagic(pixels, light, photo)
+    const photo = photoEnergy(low)
+    const light = paperLight(low)
+    await flattenIllumination(pixels, light)
+    await unsharp(pixels, 0.9, 2, 0.32, photo, 'print')
+    await unsharp(pixels, 1.55, 1, 0.25, photo, 'print')
+    await polishDocument(pixels)
     if (photo) {
-      await photoContrast(pixels, photo)
-      await unsharp(pixels, 1.2, 1, 1, photo, 'photo')
+      const enhanced = await claheLayer(original, pixels.width, pixels.height, photo)
+      await compositeLayers(pixels, enhanced, photo)
+      await unsharp(pixels, 0.85, 1, 0.7, photo, 'photo')
     }
-    await unsharp(pixels, 0.9, 2, 0.35, photo, 'print')
-    await unsharp(pixels, 1.6, 1, 0.28, photo, 'print')
-    await inkCurve(
-      pixels,
-      photo,
-      low.edge ? { values: low.edge, cols: low.cols, rows: low.rows } : null,
-    )
   })
 }
 
