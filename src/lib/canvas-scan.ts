@@ -46,10 +46,15 @@ const LIGHT_CELL = 8
 const PHOTO_TEXTURE = 0.36
 /** Opening (in cells) that drops thin text/barcode bands mistaken for texture. */
 const PHOTO_OPEN = 1
-/** Closing (in cells) that fills holes inside a photograph. */
-const PHOTO_CLOSE = 2
+/** Closing (in cells) that fills holes inside a photograph. Keep this small so the oval fog
+ * around a printed car picture is not swallowed into the photo rectangle. */
+const PHOTO_CLOSE = 1
 /** Ignore specks: a real picture covers at least this many cells (~16 × 8px). */
 const PHOTO_MIN_CELLS = 16
+/** A border strip is still the photo when at least this share of its cells look like a picture. */
+const PHOTO_EDGE = 0.36
+/** How far (in cells) the vignette wash may travel out from a tight photo rectangle. */
+const PHOTO_HALO = 8
 
 function sourceSize(image: CanvasImageSource): { width: number; height: number } {
   if (image instanceof HTMLImageElement) {
@@ -335,28 +340,140 @@ function morphCells(map: Float32Array, cols: number, rows: number, radius: numbe
   return result
 }
 
+/** Continuous-tone / colored cell — a vehicle, sky or plate, not the smooth gray fog around a print. */
+function photoLike(low: LowMap, i: number): boolean {
+  return (low.texture?.[i] ?? 0) >= PHOTO_TEXTURE * 0.55 || (low.sat?.[i] ?? 0) > 0.12
+}
+
+/** Smooth mid-gray halo around a printed photo. Solid ink bars and already-white paper are excluded. */
+function vignetteLike(low: LowMap, i: number): boolean {
+  if (photoLike(low, i)) return false
+  const brightness = low.values[i] ?? 0
+  const chroma = low.sat?.[i] ?? 0
+  return chroma < 0.22 && brightness > 70 && brightness < 210
+}
+
+function stripPhotoShare(
+  low: LowMap,
+  left: number,
+  right: number,
+  north: number,
+  south: number,
+  side: 'left' | 'right' | 'top' | 'bottom',
+): number {
+  const { cols } = low
+  let hit = 0
+  let total = 0
+  if (side === 'left' || side === 'right') {
+    const col = side === 'left' ? left : right
+    for (let row = north; row <= south; row += 1) {
+      total += 1
+      if (photoLike(low, row * cols + col)) hit += 1
+    }
+  } else {
+    const row = side === 'top' ? north : south
+    for (let col = left; col <= right; col += 1) {
+      total += 1
+      if (photoLike(low, row * cols + col)) hit += 1
+    }
+  }
+  return total ? hit / total : 0
+}
+
 /**
- * Grows each photo seed through cells that are not confident paper (bright, flat, gray). Smooth car
- * paint and sky are included; a line of text is not, because it sits on paper cells that stop the flood.
+ * Peel vignette / paper strips off a loose photo box until every side is mostly picture content.
+ * The remaining rectangle is the printed photo; paper whitening then runs right up to its edges.
+ */
+function tightenPhotoBox(
+  low: LowMap,
+  left: number,
+  right: number,
+  north: number,
+  south: number,
+): { left: number; right: number; north: number; south: number } {
+  const minSpan = 6
+  for (let step = 0; step < 48; step += 1) {
+    const width = right - left + 1
+    const height = south - north + 1
+    if (width <= minSpan && height <= minSpan) break
+    const candidates: { side: 'left' | 'right' | 'top' | 'bottom'; share: number; ok: boolean }[] = [
+      { side: 'left', share: stripPhotoShare(low, left, right, north, south, 'left'), ok: width > minSpan },
+      { side: 'right', share: stripPhotoShare(low, left, right, north, south, 'right'), ok: width > minSpan },
+      { side: 'top', share: stripPhotoShare(low, left, right, north, south, 'top'), ok: height > minSpan },
+      { side: 'bottom', share: stripPhotoShare(low, left, right, north, south, 'bottom'), ok: height > minSpan },
+    ]
+    let pick: (typeof candidates)[number] | null = null
+    for (const item of candidates) {
+      if (!item.ok || item.share >= PHOTO_EDGE) continue
+      if (!pick || item.share < pick.share) pick = item
+    }
+    if (!pick) break
+    if (pick.side === 'left') left += 1
+    else if (pick.side === 'right') right -= 1
+    else if (pick.side === 'top') north += 1
+    else south -= 1
+  }
+  return { left, right, north, south }
+}
+
+/**
+ * Flood the smooth dark halo that bleeds out of a printed photo. Text (textured) and solid header
+ * bars (too dark / too flat-black) stop the walk, so only the fog is marked for #FFFFFF.
+ */
+function vignetteWash(photo: Float32Array, low: LowMap): Float32Array {
+  const { cols, rows } = low
+  const wash = new Float32Array(photo.length)
+  const dist = new Int16Array(photo.length)
+  dist.fill(-1)
+  const queue = new Int32Array(photo.length)
+  let head = 0
+  let tail = 0
+
+  const enqueue = (i: number, d: number) => {
+    if (i < 0 || (dist[i] ?? -1) >= 0) return
+    if ((photo[i] ?? 0) > 0.5) return
+    if (!vignetteLike(low, i)) return
+    dist[i] = d
+    wash[i] = 1
+    queue[tail] = i
+    tail += 1
+  }
+
+  for (let i = 0; i < photo.length; i += 1) {
+    if ((photo[i] ?? 0) < 0.5) continue
+    const c = i % cols
+    const r = (i - c) / cols
+    if (c > 0) enqueue(i - 1, 1)
+    if (c + 1 < cols) enqueue(i + 1, 1)
+    if (r > 0) enqueue(i - cols, 1)
+    if (r + 1 < rows) enqueue(i + cols, 1)
+  }
+
+  while (head < tail) {
+    const i = queue[head] ?? 0
+    head += 1
+    const d = dist[i] ?? 0
+    if (d >= PHOTO_HALO) continue
+    const c = i % cols
+    const r = (i - c) / cols
+    if (c > 0) enqueue(i - 1, d + 1)
+    if (c + 1 < cols) enqueue(i + 1, d + 1)
+    if (r > 0) enqueue(i - cols, d + 1)
+    if (r + 1 < rows) enqueue(i + cols, d + 1)
+  }
+  return wash
+}
+
+/**
+ * Grows each photo seed through continuous-tone or colored cells. The oval gray vignette around a
+ * printed vehicle is not walkable — it stays paper so whitening can flatten it to #FFFFFF.
  */
 function growPhoto(seeds: Float32Array, low: LowMap): Float32Array {
-  const { cols, rows, values } = low
-  const texture = low.texture
-  const sat = low.sat
+  const { cols, rows } = low
   const out = new Float32Array(seeds.length)
   const seen = new Uint8Array(seeds.length)
   const stack = new Int32Array(seeds.length)
-  const walkable = (i: number) => {
-    if (seeds[i]) return true
-    const brightness = values[i] ?? 0
-    const grain = texture?.[i] ?? 0
-    const chroma = sat?.[i] ?? 0
-    if (chroma > 0.1) return true
-    if (grain >= PHOTO_TEXTURE * 0.65) return true
-    // Only quite dark interiors (car body, asphalt). A gray vignette around the print is ~160–190
-    // and must stay paper so it can be washed to white.
-    return brightness < 140 && grain < 0.2
-  }
+  const walkable = (i: number) => Boolean(seeds[i]) || photoLike(low, i)
 
   for (let start = 0; start < seeds.length; start += 1) {
     if (!(seeds[start] ?? 0) || seen[start]) continue
@@ -391,15 +508,10 @@ function growPhoto(seeds: Float32Array, low: LowMap): Float32Array {
     const height = maxR - minR + 1
     if (count < PHOTO_MIN_CELLS || width < 6 || height < 6) continue
     if (height <= 5 && width > height * 5) continue
-    // A printed photo is a rectangle. Filling the box keeps sky, asphalt and plate backgrounds
-    // inside the zone, and keeps the paper around it strictly paper.
-    const left = minC
-    const right = maxC
-    const north = minR
-    const south = maxR
-    for (let row = north; row <= south; row += 1) {
+    const box = tightenPhotoBox(low, minC, maxC, minR, maxR)
+    for (let row = box.north; row <= box.south; row += 1) {
       const base = row * cols
-      for (let col = left; col <= right; col += 1) out[base + col] = 1
+      for (let col = box.left; col <= box.right; col += 1) out[base + col] = 1
     }
   }
   return out
@@ -422,7 +534,7 @@ function photoWeights(low: LowMap): LowMap | null {
   let any = 0
   for (const value of grown) any += value
   if (any < PHOTO_MIN_CELLS) return null
-  // Hard rectangle, no feather: paper next to the photo must stay paper so it washes to #FFFFFF.
+  // Tight rectangle, hard edge: paper and the oval fog around a print stay paper so they wash to #FFFFFF.
   return { values: grown, cols, rows }
 }
 
@@ -568,7 +680,7 @@ async function photoContrast(image: ImageData, photo: LowMap) {
 
   const lowAt = mapSampler({ values: lo, cols, rows }, width, height)
   const highAt = mapSampler({ values: hi, cols, rows }, width, height)
-  const photoAt = mapSampler(photo, width, height)
+  const photoAt = nearestSampler(photo)
   for (let y = 0; y < height; y += 1) {
     if (y % 32 === 0) await nextFrame()
     let index = y * width * 4
@@ -659,6 +771,16 @@ function mapSampler(map: LowMap, width: number, height: number): (x: number, y: 
   }
 }
 
+/** Hard cell lookup — no bilinear fade — so paper whitening stops on the photo's rectangular edge. */
+function nearestSampler(map: LowMap): (x: number, y: number) => number {
+  const { cols, rows, values } = map
+  return (x, y) => {
+    const col = Math.min(cols - 1, Math.max(0, (x / LIGHT_CELL) | 0))
+    const row = Math.min(rows - 1, Math.max(0, (y / LIGHT_CELL) | 0))
+    return values[row * cols + col] ?? 0
+  }
+}
+
 function smoothstep(edge0: number, edge1: number, value: number) {
   const t = Math.min(1, Math.max(0, (value - edge0) / (edge1 - edge0)))
   return t * t * (3 - 2 * t)
@@ -707,7 +829,7 @@ const PAPER_CLAMP = 175 // any non-photo pixel at or above this is forced to #FF
  * Ink and barcode bars below the threshold go to deep solid #080808. Saturated red/blue ink keeps
  * its hue and is deepened, instead of being flattened to gray.
  */
-async function inkCurve(image: ImageData, photo?: LowMap | null) {
+async function inkCurve(image: ImageData, photo?: LowMap | null, wash?: LowMap | null) {
   const { data, width, height } = image
   const lut = new Uint8ClampedArray(256)
   for (let level = 0; level < 256; level += 1) {
@@ -722,7 +844,8 @@ async function inkCurve(image: ImageData, photo?: LowMap | null) {
     const t = (level - INK_BLACK) / (PAPER_CLAMP - INK_BLACK)
     lut[level] = INK_FLOOR + 4 + t * (255 - INK_FLOOR - 4)
   }
-  const photoAt = photo ? mapSampler(photo, width, height) : null
+  const photoAt = photo ? nearestSampler(photo) : null
+  const washAt = wash ? nearestSampler(wash) : null
   // Lens vignette and the shadow of the page edge leave the outer margin grayer than the light map
   // can explain. Inside this band the paper threshold drops toward the very edge, so the margin
   // is lifted to pure white. Real ink is far darker than the lowered threshold and is untouched.
@@ -739,7 +862,15 @@ async function inkCurve(image: ImageData, photo?: LowMap | null) {
       const level = 0.299 * red + 0.587 * green + 0.114 * blue
       const tone = Math.round(level)
       const picture = photoAt ? Math.min(1, photoAt(x, y)) : 0
-      if (picture > 0.65) {
+      if (picture > 0.5) {
+        index += 4
+        continue
+      }
+      if (washAt && washAt(x, y) > 0.5) {
+        data[index] = 255
+        data[index + 1] = 255
+        data[index + 2] = 255
+        data[index + 3] = 255
         index += 4
         continue
       }
@@ -826,7 +957,7 @@ async function unsharp(
   region: 'print' | 'photo' = 'print',
 ) {
   const { data, width, height } = image
-  const photoAt = photo ? mapSampler(photo, width, height) : null
+  const photoAt = photo ? nearestSampler(photo) : null
   const gray = new Float32Array(width * height)
   for (let i = 0, p = 0; p < gray.length; p += 1, i += 4) {
     gray[p] = 0.299 * (data[i] ?? 0) + 0.587 * (data[i + 1] ?? 0) + 0.114 * (data[i + 2] ?? 0)
@@ -947,6 +1078,9 @@ export async function applyCanvasMagic(source: HTMLCanvasElement): Promise<HTMLC
   return processCopy(source, async (pixels) => {
     const low = await lowLuminance(pixels, 'paper')
     const photo = photoWeights(low)
+    const wash = photo
+      ? { values: vignetteWash(photo.values, low), cols: photo.cols, rows: photo.rows }
+      : null
     const light = paperLight(low, photo)
     await filterMagic(pixels, light)
     if (photo) {
@@ -956,7 +1090,7 @@ export async function applyCanvasMagic(source: HTMLCanvasElement): Promise<HTMLC
     // Stroke-only sharpening on text and barcodes (photographs use the pass above).
     await unsharp(pixels, 0.75, 2, 0.45, photo, 'print')
     await unsharp(pixels, 1.45, 1, 0.35, photo, 'print')
-    await inkCurve(pixels, photo)
+    await inkCurve(pixels, photo, wash)
   })
 }
 

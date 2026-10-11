@@ -7,6 +7,7 @@ import { Button } from './Button'
 import { FilterControls } from './FilterControls'
 import { ShareDrawer } from './ShareDrawer'
 import { Spinner } from './Spinner'
+import { ZoomableImage } from './ZoomableImage'
 
 export function PreviewScreen() {
   const {
@@ -82,22 +83,14 @@ export function PreviewScreen() {
         </button>
       </header>
 
-      <div
-        className="pointer-events-none relative z-0 min-h-0 overflow-hidden p-4"
-        style={{ pointerEvents: 'none', zIndex: 0 }}
-      >
-        <div className="flex h-full items-center justify-center">
-          {view ? (
-            <img
-              src={view.src}
-              alt="תצוגה מקדימה של המסמך המיושר"
-              style={{ filter: view.css, pointerEvents: 'none' }}
-              className="pointer-events-none max-h-full max-w-full rounded-2xl bg-white object-contain shadow-[0_18px_50px_rgba(20,34,28,0.18)]"
-            />
-          ) : (
+      <div className="relative z-0 h-full min-h-0 overflow-hidden">
+        {view ? (
+          <ZoomableImage src={view.src} alt="תצוגה מקדימה של המסמך המיושר" filter={view.css} />
+        ) : (
+          <div className="flex h-full items-center justify-center">
             <WaitingPage />
-          )}
-        </div>
+          </div>
+        )}
       </div>
 
       <footer
