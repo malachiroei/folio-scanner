@@ -262,7 +262,8 @@ export function CameraCapture() {
   }
 
   return (
-    <div className="fixed inset-0 z-40 bg-black text-white">
+    <div className="fixed inset-0 z-40 flex h-[100dvh] max-h-[100dvh] flex-col overflow-hidden bg-black text-white">
+      <div className="relative min-h-0 flex-1 overflow-hidden">
       <video
         ref={videoRef}
         className={`absolute inset-0 h-full w-full object-contain ${facing === 'user' ? '-scale-x-100' : ''}`}
@@ -330,7 +331,8 @@ export function CameraCapture() {
         }}
       />
 
-      <div className="absolute inset-x-0 bottom-0 flex items-center justify-between px-8 pb-[max(1.25rem,env(safe-area-inset-bottom))]">
+      </div>
+      <div className="relative z-10 flex shrink-0 items-center justify-between px-8 pt-3 pb-[max(1rem,env(safe-area-inset-bottom,16px))]">
         <button
           type="button"
           className="grid size-12 place-items-center rounded-full bg-white/15"

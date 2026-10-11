@@ -353,8 +353,9 @@ function growPhoto(seeds: Float32Array, low: LowMap): Float32Array {
     const chroma = sat?.[i] ?? 0
     if (chroma > 0.1) return true
     if (grain >= PHOTO_TEXTURE * 0.65) return true
-    // Smooth and darker than paper (car paint, asphalt) — not a vignette on white paper.
-    return brightness < 175 && grain < 0.2
+    // Only quite dark interiors (car body, asphalt). A gray vignette around the print is ~160–190
+    // and must stay paper so it can be washed to white.
+    return brightness < 140 && grain < 0.2
   }
 
   for (let start = 0; start < seeds.length; start += 1) {
@@ -392,10 +393,10 @@ function growPhoto(seeds: Float32Array, low: LowMap): Float32Array {
     if (height <= 5 && width > height * 5) continue
     // A printed photo is a rectangle. Filling the box keeps sky, asphalt and plate backgrounds
     // inside the zone, and keeps the paper around it strictly paper.
-    const left = Math.max(0, minC - 1)
-    const right = Math.min(cols - 1, maxC + 1)
-    const north = Math.max(0, minR - 1)
-    const south = Math.min(rows - 1, maxR + 1)
+    const left = minC
+    const right = maxC
+    const north = minR
+    const south = maxR
     for (let row = north; row <= south; row += 1) {
       const base = row * cols
       for (let col = left; col <= right; col += 1) out[base + col] = 1
@@ -421,7 +422,8 @@ function photoWeights(low: LowMap): LowMap | null {
   let any = 0
   for (const value of grown) any += value
   if (any < PHOTO_MIN_CELLS) return null
-  return boxFilter({ values: grown, cols, rows }, 1, 'mean')
+  // Hard rectangle, no feather: paper next to the photo must stay paper so it washes to #FFFFFF.
+  return { values: grown, cols, rows }
 }
 
 /** Separable box max (dilation) or mean over a small window of cells. */
@@ -702,7 +704,8 @@ const PAPER_CLAMP = 175 // any non-photo pixel at or above this is forced to #FF
 /**
  * Tone curve for print and paper only. Photographs were already stretched; they are left alone.
  * Any non-photo pixel at or above 175 becomes pure #FFFFFF (no gray haze, no brown cast).
- * Ink and barcode bars below the threshold go to deep solid #080808.
+ * Ink and barcode bars below the threshold go to deep solid #080808. Saturated red/blue ink keeps
+ * its hue and is deepened, instead of being flattened to gray.
  */
 async function inkCurve(image: ImageData, photo?: LowMap | null) {
   const { data, width, height } = image
@@ -740,20 +743,30 @@ async function inkCurve(image: ImageData, photo?: LowMap | null) {
         index += 4
         continue
       }
-      let target = lut[tone] ?? 255
-      const fromEdge = Math.min(x, width - 1 - x, fromY)
-      if (fromEdge < margin && picture < 0.35) {
-        const strength = (1 - smoothstep(0, margin, fromEdge)) * (1 - picture)
-        const edgeWhite = smoothstep(EDGE_KNEE, EDGE_KNEE + 20, level) * strength
-        target = target * (1 - edgeWhite) + 255 * edgeWhite
-      }
-      const print = 1 - picture
-      target = target * print + level * picture
-      const lift = level > 1 ? target / level : 0
       const peak = Math.max(red, green, blue)
       const saturation = peak > 1 ? (peak - Math.min(red, green, blue)) / peak : 0
-      // Paper must not keep a brown-gray tint. Color is kept only on stamps/logos, never on haze.
-      const keep = smoothstep(0.28, 0.5, saturation) * print * (target < 210 ? 1 : 0)
+      const print = 1 - picture
+      // Red alerts and blue voucher ink: keep the hue and deepen it. Never run them through the
+      // paper/gray curve, which turns saturated strokes into faint gray.
+      const colorInk = print > 0.5 && saturation > 0.22 && level < 220
+      let target: number
+      let keep: number
+      if (colorInk) {
+        const deepened = 255 * (level / 255) ** 1.45
+        target = Math.max(18, Math.min(190, deepened))
+        keep = 1
+      } else {
+        target = lut[tone] ?? 255
+        const fromEdge = Math.min(x, width - 1 - x, fromY)
+        if (fromEdge < margin && picture < 0.35) {
+          const strength = (1 - smoothstep(0, margin, fromEdge)) * (1 - picture)
+          const edgeWhite = smoothstep(EDGE_KNEE, EDGE_KNEE + 20, level) * strength
+          target = target * (1 - edgeWhite) + 255 * edgeWhite
+        }
+        target = target * print + level * picture
+        keep = 0
+      }
+      const lift = level > 1 ? target / level : 0
       data[index] = target + (Math.min(255, red * lift) - target) * keep
       data[index + 1] = target + (Math.min(255, green * lift) - target) * keep
       data[index + 2] = target + (Math.min(255, blue * lift) - target) * keep
