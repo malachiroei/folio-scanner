@@ -7,8 +7,9 @@ import { clampPoint, cornersValid, distance, inwardPageCorners, orderCorners, po
  * screen can never freeze after a photo.
  */
 const DETECT_MAX = 360
-const MIN_AREA = 0.15
+const MIN_AREA = 0.3
 const MAX_AREA = 0.95
+const A4_ASPECT = Math.SQRT2
 const CLOSE_RADIUS = 2
 const OPEN_RADIUS = 4
 
@@ -245,7 +246,41 @@ function fitSides(members: Int32Array, count: number, width: number, height: num
  * extreme points along the two diagonals, then scored by size, how well the blob
  * fills that quad, and how page-shaped it is.
  */
-function rankBlobs(mask: Uint8Array, width: number, height: number): Candidate[] {
+function sampleGray(gray: Float32Array, width: number, height: number, x: number, y: number) {
+  const xx = Math.min(width - 1, Math.max(0, x | 0))
+  const yy = Math.min(height - 1, Math.max(0, y | 0))
+  return gray[yy * width + xx] ?? 0
+}
+
+/** Mean |inside−outside| luma along the four sides — a paper sheet has a strong border. */
+function boundaryStrength(gray: Float32Array, width: number, height: number, points: Point[]): number {
+  const ordered = orderCorners(points)
+  const edges: [Point, Point][] = [
+    [ordered.tl, ordered.tr],
+    [ordered.tr, ordered.br],
+    [ordered.br, ordered.bl],
+    [ordered.bl, ordered.tl],
+  ]
+  let sum = 0
+  let count = 0
+  for (const [a, b] of edges) {
+    const dx = b.x - a.x
+    const dy = b.y - a.y
+    const len = Math.hypot(dx, dy) || 1
+    const nx = -dy / len
+    const ny = dx / len
+    for (let step = 0; step <= 20; step += 1) {
+      const t = step / 20
+      const x = a.x + dx * t
+      const y = a.y + dy * t
+      sum += Math.abs(sampleGray(gray, width, height, x - nx * 2.2, y - ny * 2.2) - sampleGray(gray, width, height, x + nx * 2.2, y + ny * 2.2))
+      count += 1
+    }
+  }
+  return count ? sum / count / 255 : 0
+}
+
+function rankBlobs(mask: Uint8Array, width: number, height: number, gray: Float32Array): Candidate[] {
   const area = width * height
   const seen = new Uint8Array(mask.length)
   const stack = new Int32Array(mask.length)
@@ -350,9 +385,11 @@ function rankBlobs(mask: Uint8Array, width: number, height: number): Candidate[]
     // A sheet sits inside the photo; a wall or table runs off the frame.
     const touching =
       Number(minX <= 1) + Number(minY <= 1) + Number(maxX >= width - 2) + Number(maxY >= height - 2)
-    let score = ratio + fill * 1.5 - touching * 1.2
-    if (aspect >= 1 && aspect <= 1.6) score += 1
-    if (Math.abs(aspect - Math.SQRT2) <= 0.12) score += 0.3
+    const a4 = Math.abs(aspect - A4_ASPECT)
+    const edge = boundaryStrength(gray, width, height, points)
+    let score = ratio * 2.4 + fill * 1.1 + edge * 1.8 - touching * 1.5
+    if (a4 <= 0.16) score += 1.8
+    else if (aspect >= 1.15 && aspect <= 1.7) score += 0.7
     candidates.push({ points, score, touching })
   }
 
@@ -509,12 +546,36 @@ function insideQuad(points: Point[], x: number, y: number, slack = 0): boolean {
   return true
 }
 
+/** Among strong scores, lock onto the largest A4-like sheet — not a keyboard or stapler. */
+function lockLargestSheet(candidates: Candidate[]): Candidate | null {
+  if (!candidates.length) return null
+  const ranked = [...candidates].sort((a, b) => b.score - a.score)
+  const top = ranked[0]
+  if (!top) return null
+  const floor = top.score * 0.72
+  let chosen = top
+  let chosenArea = polygonArea(top.points)
+  for (const candidate of ranked) {
+    if (candidate.score < floor) continue
+    const aspect = pageAspect(orderCorners(candidate.points))
+    if (Math.abs(aspect - A4_ASPECT) > 0.35) continue
+    const area = polygonArea(candidate.points)
+    if (area > chosenArea * 1.05) {
+      chosen = candidate
+      chosenArea = area
+    }
+  }
+  return chosen
+}
+
 /**
  * A white sheet on a darker board is a bright child inside a darker parent. When a strong
  * candidate sits inside the chosen one and the ring between them is not paper (red board, tray
  * rim, wall), the inner sheet is the page.
  */
 function preferNested(sample: Sample, outer: Candidate, others: Candidate[]): Candidate {
+  const outerCorners = orderCorners(outer.points)
+  if (outer.touching === 0 && Math.abs(pageAspect(outerCorners) - A4_ASPECT) <= 0.2) return outer
   const outerArea = polygonArea(outer.points)
   const { data, width, height } = sample
   let chosen = outer
@@ -713,6 +774,7 @@ export function detectDocumentCorners(
     const maxEdge = options.maxEdge ?? DETECT_MAX
     const sample = takeSample(image, maxEdge)
     if (!sample) return missed
+    const gray = lumaOf(sample)
     const scale = maxEdge / DETECT_MAX
     // Strictest first: bright white paper, then looser passes. A passing blob must not run
     // off two or more edges of the photo (that is the room, not the sheet).
@@ -728,7 +790,7 @@ export function detectDocumentCorners(
     let best: Candidate | null = null
     const inside: Candidate[] = []
     for (const build of passes) {
-      const blobs = rankBlobs(close(build(), sample.width, sample.height, scale), sample.width, sample.height)
+      const blobs = rankBlobs(close(build(), sample.width, sample.height, scale), sample.width, sample.height, gray)
       for (const blob of blobs) {
         if (blob.touching >= 2) {
           if (!fallback || blob.score > fallback.score) fallback = blob
@@ -738,12 +800,12 @@ export function detectDocumentCorners(
         if (!best || blob.score > best.score) best = blob
       }
     }
-    if (best) best = preferNested(sample, best, inside)
+    if (best) best = preferNested(sample, lockLargestSheet(inside) ?? best, inside)
     let points: Point[] | null = best ? best.points : null
     if (!points) {
       // White sheet on a white desk: the brightness passes see one big blob touching the frame.
       // Look for the sheet's own boundary instead, and ignore regions that run off the photo.
-      const regions = rankBlobs(edgeRegions(sample, scale), sample.width, sample.height)
+      const regions = rankBlobs(edgeRegions(sample, scale), sample.width, sample.height, gray)
       const region = regions.find((blob) => blob.touching < 2)
       if (region) points = pushOut(region.points, 2 * scale + 1)
     }
