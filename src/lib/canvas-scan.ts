@@ -42,6 +42,15 @@ const MAX_UPSCALE = 3
 /** Cells of the low-resolution lighting map are this many pixels wide. */
 const LIGHT_CELL = 8
 
+/** A cell is photo-like when this share of its samples sit in the middle of its own tone range. */
+const PHOTO_TEXTURE = 0.36
+/** Opening (in cells) that drops thin text/barcode bands mistaken for texture. */
+const PHOTO_OPEN = 1
+/** Closing (in cells) that fills holes inside a photograph. */
+const PHOTO_CLOSE = 2
+/** Ignore specks: a real picture covers at least this many cells (~16 × 8px). */
+const PHOTO_MIN_CELLS = 16
+
 function sourceSize(image: CanvasImageSource): { width: number; height: number } {
   if (image instanceof HTMLImageElement) {
     return { width: image.naturalWidth, height: image.naturalHeight }
@@ -226,7 +235,15 @@ async function warpCanvas(
 
 /* ---------- lighting map: shadows and uneven illumination ---------- */
 
-type LowMap = { values: Float32Array; cols: number; rows: number }
+type LowMap = {
+  values: Float32Array
+  cols: number
+  rows: number
+  /** 'paper' maps only: how photo-like (continuous mid-tones) each cell is, 0..1. */
+  texture?: Float32Array
+  /** Mean HSV-style saturation per cell, 0..1. */
+  sat?: Float32Array
+}
 
 /**
  * One luminance value per LIGHT_CELL block (sampled every 2px), so the pass stays cheap.
@@ -239,6 +256,8 @@ async function lowLuminance(image: ImageData, mode: 'mean' | 'paper' = 'mean'): 
   const cols = Math.ceil(width / LIGHT_CELL)
   const rows = Math.ceil(height / LIGHT_CELL)
   const values = new Float32Array(cols * rows)
+  const texture = mode === 'paper' ? new Float32Array(cols * rows) : undefined
+  const sat = mode === 'paper' ? new Float32Array(cols * rows) : undefined
   for (let row = 0; row < rows; row += 1) {
     if (row % 24 === 0) await nextFrame()
     const y0 = row * LIGHT_CELL
@@ -247,18 +266,27 @@ async function lowLuminance(image: ImageData, mode: 'mean' | 'paper' = 'mean'): 
       const x0 = col * LIGHT_CELL
       const x1 = Math.min(width, x0 + LIGHT_CELL)
       let sum = 0
+      let satSum = 0
       let count = 0
       const ranked: number[] = []
       for (let y = y0; y < y1; y += 2) {
         for (let x = x0; x < x1; x += 2) {
           const index = (y * width + x) * 4
-          const level = 0.299 * (data[index] ?? 0) + 0.587 * (data[index + 1] ?? 0) + 0.114 * (data[index + 2] ?? 0)
+          const red = data[index] ?? 0
+          const green = data[index + 1] ?? 0
+          const blue = data[index + 2] ?? 0
+          const level = 0.299 * red + 0.587 * green + 0.114 * blue
+          const peak = Math.max(red, green, blue)
           sum += level
+          satSum += peak > 1 ? (peak - Math.min(red, green, blue)) / peak : 0
           count += 1
           ranked.push(level)
         }
       }
       let value = count ? sum / count : 255
+      const chroma = count ? satSum / count : 0
+      const mean = count ? sum / count : 0
+      if (sat) sat[row * cols + col] = chroma
       if (mode === 'paper' && count > 0) {
         ranked.sort((a, b) => b - a)
         const from = Math.floor(count * 0.15)
@@ -266,11 +294,127 @@ async function lowLuminance(image: ImageData, mode: 'mean' | 'paper' = 'mean'): 
         let total = 0
         for (let k = from; k < to; k += 1) total += ranked[k] ?? 0
         value = total / (to - from)
+
+        // Photo-likeness: text and bars put their pixels at the two extremes (paper and ink) with only
+        // antialiased edges between, while a continuous-tone picture spreads over the middle of the range.
+        const top = ranked[0] ?? 0
+        const bottom = ranked[count - 1] ?? 0
+        const range = top - bottom
+        if (texture && mean > 20 && mean < 245) {
+          const low = bottom + range * 0.18
+          const high = bottom + range * 0.82
+          let middle = 0
+          let moment = 0
+          for (const level of ranked) {
+            if (level > low && level < high) middle += 1
+            moment += (level - mean) * (level - mean)
+          }
+          const spread = Math.sqrt(moment / count)
+          const midShare = middle / count
+          if (range >= 22 && midShare >= 0.28 && spread >= 10) {
+            texture[row * cols + col] = Math.min(1, midShare + spread / 80)
+          } else if (chroma > 0.12 && mean > 30 && mean < 230) {
+            texture[row * cols + col] = Math.min(1, chroma * 1.8)
+          }
+        }
       }
       values[row * cols + col] = value
     }
   }
-  return { values, cols, rows }
+  return texture ? { values, cols, rows, texture, sat } : { values, cols, rows }
+}
+
+/** Morphology on a 0/1 cell map through box means (a cell survives erosion only if its whole window is set). */
+function morphCells(map: Float32Array, cols: number, rows: number, radius: number, grow: boolean): Float32Array {
+  const mean = boxFilter({ values: map, cols, rows }, radius, 'mean').values
+  const result = new Float32Array(map.length)
+  for (let i = 0; i < map.length; i += 1) {
+    const value = mean[i] ?? 0
+    result[i] = grow ? (value > 0.001 ? 1 : 0) : value > 0.999 ? 1 : 0
+  }
+  return result
+}
+
+/**
+ * Grows each photo seed through cells that are not confident paper (bright, flat, gray). Smooth car
+ * paint and sky are included; a line of text is not, because it sits on paper cells that stop the flood.
+ */
+function growPhoto(seeds: Float32Array, low: LowMap): Float32Array {
+  const { cols, rows, values } = low
+  const texture = low.texture
+  const sat = low.sat
+  const out = new Float32Array(seeds.length)
+  const seen = new Uint8Array(seeds.length)
+  const stack = new Int32Array(seeds.length)
+  const walkable = (i: number) => {
+    if (seeds[i]) return true
+    const brightness = values[i] ?? 0
+    const grain = texture?.[i] ?? 0
+    const chroma = sat?.[i] ?? 0
+    if (chroma > 0.1) return true
+    if (grain >= PHOTO_TEXTURE * 0.65) return true
+    // Smooth and darker than paper (car paint, asphalt) — not a vignette on white paper.
+    return brightness < 175 && grain < 0.2
+  }
+
+  for (let start = 0; start < seeds.length; start += 1) {
+    if (!(seeds[start] ?? 0) || seen[start]) continue
+    let top = 0
+    stack[top] = start
+    top += 1
+    seen[start] = 1
+    let count = 0
+    let minC = cols
+    let maxC = 0
+    let minR = rows
+    let maxR = 0
+    const blob: number[] = []
+    while (top > 0) {
+      top -= 1
+      const i = stack[top] ?? 0
+      blob.push(i)
+      count += 1
+      const c = i % cols
+      const r = (i - c) / cols
+      if (c < minC) minC = c
+      if (c > maxC) maxC = c
+      if (r < minR) minR = r
+      if (r > maxR) maxR = r
+      const neighbors = [c > 0 ? i - 1 : -1, c + 1 < cols ? i + 1 : -1, r > 0 ? i - cols : -1, r + 1 < rows ? i + cols : -1]
+      for (const n of neighbors) {
+        if (n < 0 || seen[n] || !walkable(n)) continue
+        seen[n] = 1
+        stack[top] = n
+        top += 1
+      }
+    }
+    const width = maxC - minC + 1
+    const height = maxR - minR + 1
+    if (count < PHOTO_MIN_CELLS || width < 6 || height < 6) continue
+    if (height <= 5 && width > height * 5) continue
+    for (const i of blob) out[i] = 1
+  }
+  return out
+}
+
+/**
+ * Where the page holds a photograph (continuous tone) rather than print. Textured or colored cells
+ * are the seeds; the region then grows through everything that is not flat gray paper. Returns
+ * weights 0..1 per cell, or null when the page has no picture.
+ */
+function photoWeights(low: LowMap): LowMap | null {
+  const { cols, rows, texture } = low
+  if (!texture) return null
+  const smooth = boxFilter({ values: texture, cols, rows }, 2, 'mean').values
+  const seeds = new Float32Array(smooth.length)
+  for (let i = 0; i < seeds.length; i += 1) seeds[i] = (smooth[i] ?? 0) >= PHOTO_TEXTURE ? 1 : 0
+  const closed = morphCells(morphCells(seeds, cols, rows, PHOTO_CLOSE, true), cols, rows, PHOTO_CLOSE, false)
+  const opened = morphCells(morphCells(closed, cols, rows, PHOTO_OPEN, false), cols, rows, PHOTO_OPEN, true)
+  const grown = growPhoto(opened, low)
+  let any = 0
+  for (const value of grown) any += value
+  if (any < PHOTO_MIN_CELLS) return null
+  return boxFilter({ values: grown, cols, rows }, 1, 'mean')
 }
 
 /** Separable box max (dilation) or mean over a small window of cells. */
@@ -316,8 +460,42 @@ function boxFilter(map: LowMap, radius: number, mode: 'max' | 'mean'): LowMap {
  * dark header bars and shaded table rows, then blurring smooths the result. Dividing by it flattens
  * shadows without mistaking table shading for lighting.
  */
-function paperLight(low: LowMap): LowMap {
-  let map = boxFilter(low, 7, 'max')
+/** Copies surrounding paper brightness into cells covered by a photograph (nearest-known BFS). */
+function inpaintPaper(values: Float32Array, photo: Float32Array, cols: number): Float32Array {
+  const out = new Float32Array(values.length)
+  const ready = new Uint8Array(values.length)
+  const queue = new Int32Array(values.length)
+  let head = 0
+  let tail = 0
+  for (let i = 0; i < values.length; i += 1) {
+    if ((photo[i] ?? 0) > 0.25) continue
+    out[i] = values[i] ?? 0
+    ready[i] = 1
+    queue[tail] = i
+    tail += 1
+  }
+  if (tail === 0) return values
+  while (head < tail) {
+    const i = queue[head] ?? 0
+    head += 1
+    const x = i % cols
+    const neighbors = [x > 0 ? i - 1 : -1, x + 1 < cols ? i + 1 : -1, i >= cols ? i - cols : -1, i + cols < values.length ? i + cols : -1]
+    for (const n of neighbors) {
+      if (n < 0 || ready[n]) continue
+      out[n] = out[i] ?? 0
+      ready[n] = 1
+      queue[tail] = n
+      tail += 1
+    }
+  }
+  return out
+}
+
+function paperLight(low: LowMap, photo?: LowMap | null): LowMap {
+  const source = photo
+    ? { values: inpaintPaper(low.values, photo.values, low.cols), cols: low.cols, rows: low.rows }
+    : low
+  let map = boxFilter(source, 7, 'max')
   map = boxFilter(map, 3, 'mean')
   return boxFilter(map, 3, 'mean')
 }
@@ -348,6 +526,30 @@ function sampleRow(map: LowMap, y: number): { top: number; bottom: number; weigh
   return { top: base * map.cols, bottom: Math.min(map.rows - 1, base + 1) * map.cols, weight: position - base }
 }
 
+/** Bilinear lookup of a low-resolution map at a full-resolution pixel, with no per-pixel allocation. */
+function mapSampler(map: LowMap, width: number, height: number): (x: number, y: number) => number {
+  const columns = columnSampler(width, map.cols)
+  const top = new Int32Array(height)
+  const bottom = new Int32Array(height)
+  const weight = new Float32Array(height)
+  for (let y = 0; y < height; y += 1) {
+    const row = sampleRow(map, y)
+    top[y] = row.top
+    bottom[y] = row.bottom
+    weight[y] = row.weight
+  }
+  const values = map.values
+  return (x, y) => {
+    const l = columns.left[x] ?? 0
+    const r = columns.right[x] ?? 0
+    const wx = columns.weight[x] ?? 0
+    const t = (values[(top[y] ?? 0) + l] ?? 0) * (1 - wx) + (values[(top[y] ?? 0) + r] ?? 0) * wx
+    const b = (values[(bottom[y] ?? 0) + l] ?? 0) * (1 - wx) + (values[(bottom[y] ?? 0) + r] ?? 0) * wx
+    const wy = weight[y] ?? 0
+    return t * (1 - wy) + b * wy
+  }
+}
+
 function smoothstep(edge0: number, edge1: number, value: number) {
   const t = Math.min(1, Math.max(0, (value - edge0) / (edge1 - edge0)))
   return t * t * (3 - 2 * t)
@@ -357,9 +559,8 @@ function smoothstep(edge0: number, edge1: number, value: number) {
  * Magic scan, step one: divide by the paper light so shadows and lighting gradients vanish.
  * Sharpening and the ink curve follow in applyCanvasMagic.
  */
-async function filterMagic(image: ImageData) {
+async function filterMagic(image: ImageData, light: LowMap) {
   const { data, width, height } = image
-  const light = paperLight(await lowLuminance(image, 'paper'))
   const columns = columnSampler(width, light.cols)
 
   for (let y = 0; y < height; y += 1) {
@@ -393,13 +594,15 @@ const PAPER_KNEE = 192 // normalized levels from here up fade to paper (fully wh
 const PAPER_KNEE_OUT = 232 // where the linear stretch ends before the white ramp
 
 /**
- * Tone curve on the shadow-flattened, sharpened page: a steep but continuous stretch (not a
- * threshold) pushes ink to deep black while keeping antialiased strokes smooth, and paper tones
- * above ~200 become pure #FFFFFF. Strongly colored pixels (stamps, logos) keep their hue.
+ * Tone curve on the shadow-flattened, sharpened page. Print (text, tables, barcodes) gets a steep
+ * stretch to deep black and paper above ~200 becomes pure #FFFFFF. Continuous-tone photographs are
+ * blended toward a gentle gamma instead, so cars, plates and stamps keep their midtones. Strongly
+ * colored pixels (stamps, logos) keep their hue.
  */
-async function inkCurve(image: ImageData) {
+async function inkCurve(image: ImageData, photo?: LowMap | null) {
   const { data, width, height } = image
   const lut = new Uint8ClampedArray(256)
+  const photoLut = new Uint8ClampedArray(256)
   for (let level = 0; level < 256; level += 1) {
     // Steep linear stretch below the paper level: anything under ~60 goes to deep ink (#111), the
     // range up to the knee climbs linearly (no binary clipping, so antialiased strokes stay continuous),
@@ -408,10 +611,14 @@ async function inkCurve(image: ImageData) {
     const ink = level <= INK_BLACK ? INK_FLOOR * (level / INK_BLACK) : stretch
     const toWhite = smoothstep(PAPER_KNEE, PAPER_KNEE + 16, level)
     lut[level] = ink * (1 - toWhite) + 255 * toWhite
+    // Photographs: a gentle gamma keeps midtones, shadows and highlights. Nothing is snapped to white.
+    photoLut[level] = 255 * (0.06 + 0.94 * (level / 255) ** 0.9)
   }
+  const photoAt = photo ? mapSampler(photo, width, height) : null
   // Lens vignette and the shadow of the page edge leave the outer margin grayer than the light map
   // can explain. Inside this band the paper threshold drops toward the very edge, so the margin
   // is lifted to pure white. Real ink is far darker than the lowered threshold and is untouched.
+  // Pictures that sit on the margin (a car photo at the top of a ticket) are not lifted.
   const margin = Math.max(24, Math.round(Math.min(width, height) * EDGE_MARGIN))
   for (let y = 0; y < height; y += 1) {
     if (y % 64 === 0) await nextFrame()
@@ -422,17 +629,20 @@ async function inkCurve(image: ImageData) {
       const green = data[index + 1] ?? 0
       const blue = data[index + 2] ?? 0
       const level = 0.299 * red + 0.587 * green + 0.114 * blue
-      let target = lut[Math.round(level)] ?? 255
+      const tone = Math.round(level)
+      const inkTarget = lut[tone] ?? 255
+      const picture = photoAt ? Math.min(1, photoAt(x, y)) : 0
+      let target = picture > 0 ? inkTarget * (1 - picture) + (photoLut[tone] ?? level) * picture : inkTarget
       const fromEdge = Math.min(x, width - 1 - x, fromY)
-      if (fromEdge < margin) {
-        const strength = 1 - smoothstep(0, margin, fromEdge)
+      if (fromEdge < margin && picture < 0.35) {
+        const strength = (1 - smoothstep(0, margin, fromEdge)) * (1 - picture)
         const edgeWhite = smoothstep(EDGE_KNEE, EDGE_KNEE + 20, level) * strength
         target = target * (1 - edgeWhite) + 255 * edgeWhite
       }
       const lift = level > 1 ? target / level : 0
       const peak = Math.max(red, green, blue)
       const saturation = peak > 1 ? (peak - Math.min(red, green, blue)) / peak : 0
-      const keep = smoothstep(0.2, 0.42, saturation)
+      const keep = Math.max(smoothstep(0.2, 0.42, saturation), picture * 0.9)
       data[index] = target + (Math.min(255, red * lift) - target) * keep
       data[index + 1] = target + (Math.min(255, green * lift) - target) * keep
       data[index + 2] = target + (Math.min(255, blue * lift) - target) * keep
@@ -483,8 +693,9 @@ async function filterBlackWhite(image: ImageData) {
  * Unsharp mask on luminance (box blur of the given radius). Small deltas are ignored so the white
  * background does not pick up noise; edges of text and table lines gain micro-contrast.
  */
-async function unsharp(image: ImageData, amount: number, radius = 2, brighten = 1) {
+async function unsharp(image: ImageData, amount: number, radius = 2, brighten = 1, photo?: LowMap | null) {
   const { data, width, height } = image
+  const photoAt = photo ? mapSampler(photo, width, height) : null
   const gray = new Float32Array(width * height)
   for (let i = 0, p = 0; p < gray.length; p += 1, i += 4) {
     gray[p] = 0.299 * (data[i] ?? 0) + 0.587 * (data[i + 1] ?? 0) + 0.114 * (data[i + 2] ?? 0)
@@ -520,8 +731,10 @@ async function unsharp(image: ImageData, amount: number, radius = 2, brighten = 
       // ones fade in, so flat paper stays clean and edges are never kinked.
       // `brighten` scales only the positive side (pixels brighter than their surroundings), so dark
       // strokes gain the full boost while bright halos beside them stay small.
+      // Photographs get a light touch so plate digits stay readable without speckling the grain.
+      const photoW = photoAt ? photoAt(x, y) : 0
       const diff = (gray[p] ?? 0) - (column[y] ?? 0)
-      const raw = diff * amount * (diff > 0 ? brighten : 1)
+      const raw = diff * amount * (diff > 0 ? brighten : 1) * (photoW > 0.35 ? 0.28 : 1)
       const delta = raw - Math.max(-2, Math.min(2, raw))
       if (delta === 0) continue
       const i = p * 4
@@ -599,11 +812,15 @@ async function processCopy(
 /** Magic scan: clean white paper, crisp ink, colors kept. */
 export async function applyCanvasMagic(source: HTMLCanvasElement): Promise<HTMLCanvasElement> {
   return processCopy(source, async (pixels) => {
-    await filterMagic(pixels)
+    const low = await lowLuminance(pixels, 'paper')
+    const photo = photoWeights(low)
+    const light = paperLight(low, photo)
+    await filterMagic(pixels, light)
     // Micro-contrast on ink edges: a broad pass for stroke body, then the strong 1px pass (amount 1.3).
-    await unsharp(pixels, 0.6, 2, 0.6)
-    await unsharp(pixels, 1.3, 1, 0.5)
-    await inkCurve(pixels)
+    // Photographs are skipped so their grain is not sharpened into speckle.
+    await unsharp(pixels, 0.6, 2, 0.6, photo)
+    await unsharp(pixels, 1.3, 1, 0.5, photo)
+    await inkCurve(pixels, photo)
   })
 }
 
