@@ -39,16 +39,16 @@ const MIN_EDGE = 2800
 const MAX_EDGE = 3508
 const MAX_UPSCALE = 3
 
-/** Illumination is estimated on a ~300px-wide copy so the blur stays under 100ms on phones. */
-const LIGHT_WIDTH = 300
-const LIGHT_BLUR = 18
-const PAPER_SAT = 25
-const PAPER_LUMA = 165
-const INK_LUMA = 100
-const INK_FLOOR = 10
-const INK_CEIL = 26
-const SAT_BOOST = 1.2
-const PHOTO_RANGE = 14
+/** Illumination on a tiny copy so a max-filter can jump across dark photo blocks. */
+const LIGHT_WIDTH = 96
+const LIGHT_MAX = 22
+const LIGHT_BLUR = 6
+const TEX_WIDTH = 280
+const PAPER_FLAT = 9
+const PHOTO_VAR = 12
+const PAPER_KNEE = 225
+const GAMMA = 0.85
+const SAT_BOOST = 1.18
 
 function sourceSize(image: CanvasImageSource): { width: number; height: number } {
   if (image instanceof HTMLImageElement) {
@@ -232,7 +232,7 @@ async function warpCanvas(
   return canvas
 }
 
-/* ---------- CamScanner Magic Color (downsample blur + one tone pass) ---------- */
+/* ---------- CamScanner Magic Color (max-filter paper light + variance gate) ---------- */
 
 function downsample(source: HTMLCanvasElement, width: number, height: number): HTMLCanvasElement {
   const canvas = document.createElement('canvas')
@@ -256,6 +256,59 @@ function upsample(source: HTMLCanvasElement, width: number, height: number): Ima
   context.imageSmoothingQuality = 'high'
   context.drawImage(source, 0, 0, width, height)
   return context.getImageData(0, 0, width, height)
+}
+
+/** Separable max (dilation). Dark text / photo blocks do not pull the paper estimate down. */
+function maxFilterRgba(image: ImageData, radius: number) {
+  const { data, width, height } = image
+  const tmp = new Uint8ClampedArray(data.length)
+  for (let y = 0; y < height; y += 1) {
+    const row = y * width * 4
+    for (let x = 0; x < width; x += 1) {
+      let mr = 0
+      let mg = 0
+      let mb = 0
+      const x0 = Math.max(0, x - radius)
+      const x1 = Math.min(width - 1, x + radius)
+      for (let k = x0; k <= x1; k += 1) {
+        const i = row + k * 4
+        const r = data[i] ?? 0
+        const g = data[i + 1] ?? 0
+        const b = data[i + 2] ?? 0
+        if (r > mr) mr = r
+        if (g > mg) mg = g
+        if (b > mb) mb = b
+      }
+      const o = row + x * 4
+      tmp[o] = mr
+      tmp[o + 1] = mg
+      tmp[o + 2] = mb
+      tmp[o + 3] = 255
+    }
+  }
+  for (let x = 0; x < width; x += 1) {
+    for (let y = 0; y < height; y += 1) {
+      let mr = 0
+      let mg = 0
+      let mb = 0
+      const y0 = Math.max(0, y - radius)
+      const y1 = Math.min(height - 1, y + radius)
+      for (let k = y0; k <= y1; k += 1) {
+        const i = (k * width + x) * 4
+        const r = tmp[i] ?? 0
+        const g = tmp[i + 1] ?? 0
+        const b = tmp[i + 2] ?? 0
+        if (r > mr) mr = r
+        if (g > mg) mg = g
+        if (b > mb) mb = b
+      }
+      const o = (y * width + x) * 4
+      data[o] = mr
+      data[o + 1] = mg
+      data[o + 2] = mb
+      data[o + 3] = 255
+    }
+  }
 }
 
 /** Two-pass sliding-window box blur on a small RGBA buffer. */
@@ -313,7 +366,38 @@ function boxBlurRgba(image: ImageData, radius: number) {
   }
 }
 
-/** 5×5 luminance range on the small copy — photos have texture, paper does not. */
+function morphChannel(values: Uint8Array, width: number, height: number, radius: number, dilate: boolean): Uint8Array {
+  const tmp = new Uint8Array(values.length)
+  const out = new Uint8Array(values.length)
+  for (let y = 0; y < height; y += 1) {
+    const row = y * width
+    for (let x = 0; x < width; x += 1) {
+      let best = dilate ? 0 : 255
+      const x0 = Math.max(0, x - radius)
+      const x1 = Math.min(width - 1, x + radius)
+      for (let k = x0; k <= x1; k += 1) {
+        const value = values[row + k] ?? 0
+        if (dilate ? value > best : value < best) best = value
+      }
+      tmp[row + x] = best
+    }
+  }
+  for (let x = 0; x < width; x += 1) {
+    for (let y = 0; y < height; y += 1) {
+      let best = dilate ? 0 : 255
+      const y0 = Math.max(0, y - radius)
+      const y1 = Math.min(height - 1, y + radius)
+      for (let k = y0; k <= y1; k += 1) {
+        const value = tmp[k * width + x] ?? 0
+        if (dilate ? value > best : value < best) best = value
+      }
+      out[y * width + x] = best
+    }
+  }
+  return out
+}
+
+/** 5×5 luminance range — paper is flat, photos keep a midtone spread, ink is a thin spike. */
 function localRange(image: ImageData): Uint8Array {
   const { data, width, height } = image
   const gray = new Uint8Array(width * height)
@@ -359,74 +443,116 @@ function paintChannel(values: Uint8Array, width: number, height: number): HTMLCa
   return canvas
 }
 
+/** 80th-percentile of each channel — the actual paper white, ignoring dark blocks. */
+function paperPercentile(image: ImageData): [number, number, number] {
+  const { data } = image
+  const histR = new Uint32Array(256)
+  const histG = new Uint32Array(256)
+  const histB = new Uint32Array(256)
+  const pixels = data.length / 4
+  for (let i = 0; i < data.length; i += 4) {
+    histR[data[i] ?? 0] += 1
+    histG[data[i + 1] ?? 0] += 1
+    histB[data[i + 2] ?? 0] += 1
+  }
+  const pick = (hist: Uint32Array) => {
+    const target = pixels * 0.8
+    let acc = 0
+    for (let value = 0; value < 256; value += 1) {
+      acc += hist[value] ?? 0
+      if (acc >= target) return value
+    }
+    return 255
+  }
+  return [pick(histR), pick(histG), pick(histB)]
+}
+
 function lightingMaps(source: HTMLCanvasElement, width: number, height: number): { bg: ImageData; texture: Uint8Array } {
-  const dw = Math.min(LIGHT_WIDTH, width)
-  const dh = Math.max(1, Math.round((height * dw) / Math.max(width, 1)))
-  const small = downsample(source, dw, dh)
-  const context = small.getContext('2d', { willReadFrequently: true })
-  if (!context) return { bg: new ImageData(width, height), texture: new Uint8Array(width * height) }
-  const preview = context.getImageData(0, 0, dw, dh)
-  const range = localRange(preview)
+  const empty = { bg: new ImageData(width, height), texture: new Uint8Array(width * height) }
+  const tw = Math.min(TEX_WIDTH, width)
+  const th = Math.max(1, Math.round((height * tw) / Math.max(width, 1)))
+  const texCanvas = downsample(source, tw, th)
+  const texContext = texCanvas.getContext('2d', { willReadFrequently: true })
+  if (!texContext) return empty
+  const texPreview = texContext.getImageData(0, 0, tw, th)
+  const range = localRange(texPreview)
+  const photo = morphChannel(morphChannel(range, tw, th, 1, false), tw, th, Math.max(6, Math.round(tw * 0.045)), true)
+
+  const lw = Math.min(LIGHT_WIDTH, width)
+  const lh = Math.max(1, Math.round((height * lw) / Math.max(width, 1)))
+  const lightCanvas = downsample(source, lw, lh)
+  const lightContext = lightCanvas.getContext('2d', { willReadFrequently: true })
+  if (!lightContext) return empty
+  const preview = lightContext.getImageData(0, 0, lw, lh)
+  maxFilterRgba(preview, Math.max(LIGHT_MAX, Math.round(lw * 0.24)))
+  const [floorR, floorG, floorB] = paperPercentile(preview)
+  const liftR = floorR * 0.92
+  const liftG = floorG * 0.92
+  const liftB = floorB * 0.92
+  const light = preview.data
+  for (let i = 0; i < light.length; i += 4) {
+    if ((light[i] ?? 0) < liftR) light[i] = liftR
+    if ((light[i + 1] ?? 0) < liftG) light[i + 1] = liftG
+    if ((light[i + 2] ?? 0) < liftB) light[i + 2] = liftB
+  }
   boxBlurRgba(preview, LIGHT_BLUR)
-  context.putImageData(preview, 0, 0)
-  const bg = upsample(small, width, height)
-  const texture = upsample(paintChannel(range, dw, dh), width, height)
+  lightContext.putImageData(preview, 0, 0)
+  const bg = upsample(lightCanvas, width, height)
+  const texture = upsample(paintChannel(photo, tw, th), width, height)
   const channel = new Uint8Array(width * height)
   for (let p = 0, i = 0; p < channel.length; p += 1, i += 4) channel[p] = texture.data[i] ?? 0
   return { bg, texture: channel }
 }
 
-function sCurve(n: number) {
-  const x = Math.min(1, Math.max(0, n))
-  return x * x * (3 - 2 * x)
+function paperKnee(luma: number) {
+  if (luma >= 248) return 255
+  const t = Math.min(1, Math.max(0, (luma - PAPER_KNEE) / 23))
+  const s = t * t * (3 - 2 * t)
+  return luma + (255 - luma) * s
 }
 
 /**
- * Magic Color: white paper, bold ink, vivid stamps/vouchers, photos left intact.
- * One linear pass — no photo boxes, no CLAHE tiles, no full-res morphology.
+ * Magic Color: white paper, vivid stamps/vouchers, greyscale photos left intact.
+ * Paper vs photo is local variance — never saturation (cars and asphalt are monochrome).
  */
 function magicColor(src: Uint8ClampedArray, bg: Uint8ClampedArray, texture: Uint8Array) {
   const pixels = src.length / 4
   for (let p = 0, i = 0; p < pixels; p += 1, i += 4) {
-    const br = Math.max(bg[i] ?? 0, 12)
-    const bg_ = Math.max(bg[i + 1] ?? 0, 12)
-    const bb = Math.max(bg[i + 2] ?? 0, 12)
-    let red = Math.min(255, ((src[i] ?? 0) / br) * 255)
-    let green = Math.min(255, ((src[i + 1] ?? 0) / bg_) * 255)
-    let blue = Math.min(255, ((src[i + 2] ?? 0) / bb) * 255)
-    const peak = Math.max(red, green, blue)
-    const trough = Math.min(red, green, blue)
-    const sat = peak - trough
+    const red0 = src[i] ?? 0
+    const green0 = src[i + 1] ?? 0
+    const blue0 = src[i + 2] ?? 0
+    const br = Math.max(bg[i] ?? 0, 18)
+    const bg_ = Math.max(bg[i + 1] ?? 0, 18)
+    const bb = Math.max(bg[i + 2] ?? 0, 18)
+    const red = Math.min(255, (red0 / br) * 255)
+    const green = Math.min(255, (green0 / bg_) * 255)
+    const blue = Math.min(255, (blue0 / bb) * 255)
     const luma = 0.299 * red + 0.587 * green + 0.114 * blue
-    const photo = sat >= PAPER_SAT || ((texture[p] ?? 0) >= PHOTO_RANGE && luma > 30 && luma < 235)
+    const tex = texture[p] ?? 0
+    const photo = tex >= PHOTO_VAR
+    const flat = tex <= PAPER_FLAT
 
-    if (!photo && sat < PAPER_SAT && luma > PAPER_LUMA) {
-      src[i] = 255
-      src[i + 1] = 255
-      src[i + 2] = 255
-      src[i + 3] = 255
-      continue
-    }
-    if (!photo && sat < PAPER_SAT && luma < INK_LUMA) {
-      const target = INK_FLOOR + (luma / INK_LUMA) * (INK_CEIL - INK_FLOOR)
-      const lift = luma > 1 ? target / luma : 0
-      src[i] = Math.min(255, red * lift)
-      src[i + 1] = Math.min(255, green * lift)
-      src[i + 2] = Math.min(255, blue * lift)
-      src[i + 3] = 255
-      continue
+    let next = luma
+    if (!photo && flat && luma >= PAPER_KNEE) {
+      next = paperKnee(luma)
+    } else {
+      next = 255 * (luma / 255) ** GAMMA
     }
 
-    const n = luma / 255
-    const target = (n * 0.55 + sCurve(n) * 0.45) * 255
-    const lift = luma > 1 ? target / luma : 1
-    red = Math.min(255, Math.max(0, red * lift))
-    green = Math.min(255, Math.max(0, green * lift))
-    blue = Math.min(255, Math.max(0, blue * lift))
-    const mid = 0.299 * red + 0.587 * green + 0.114 * blue
-    src[i] = Math.min(255, Math.max(0, mid + (red - mid) * SAT_BOOST))
-    src[i + 1] = Math.min(255, Math.max(0, mid + (green - mid) * SAT_BOOST))
-    src[i + 2] = Math.min(255, Math.max(0, mid + (blue - mid) * SAT_BOOST))
+    const scale = luma > 1 ? next / luma : 0
+    let outR = red * scale
+    let outG = green * scale
+    let outB = blue * scale
+    const sat = Math.max(outR, outG, outB) - Math.min(outR, outG, outB)
+    if (sat > 12) {
+      const mid = 0.299 * outR + 0.587 * outG + 0.114 * outB
+      outR = mid + (outR - mid) * SAT_BOOST
+      outG = mid + (outG - mid) * SAT_BOOST
+      outB = mid + (outB - mid) * SAT_BOOST
+    }
+    src[i] = Math.min(255, Math.max(0, outR))
+    src[i + 1] = Math.min(255, Math.max(0, outG))
+    src[i + 2] = Math.min(255, Math.max(0, outB))
     src[i + 3] = 255
   }
 }
@@ -501,10 +627,10 @@ export function desaturateCanvas(canvas: HTMLCanvasElement): HTMLCanvasElement {
 }
 
 /**
- * Pulls the corners a hair toward the center (0.4% per side) so a sliver of board, clip shadow or
- * table that the corner snap could not remove never reaches the edge of the A4 output.
+ * Pulls the corners a hair toward the center so a sliver of table never reaches the A4 edge,
+ * without eating the license-plate crop at the top of the sheet.
  */
-function insetCorners(corners: Corners, amount = 0.004): Corners {
+function insetCorners(corners: Corners, amount = 0.001): Corners {
   const cx = (corners.tl.x + corners.tr.x + corners.br.x + corners.bl.x) / 4
   const cy = (corners.tl.y + corners.tr.y + corners.br.y + corners.bl.y) / 4
   const pull = (point: Point): Point => ({
