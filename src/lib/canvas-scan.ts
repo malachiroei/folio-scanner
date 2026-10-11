@@ -39,19 +39,18 @@ const MIN_EDGE = 2800
 const MAX_EDGE = 3508
 const MAX_UPSCALE = 3
 
-/** Uniform page scan: illumination flatten → CLAHE → paper roll-off → unsharp. */
+/** Uniform Magic Color: flatten to 255, snap paper white, punch blacks, boost chroma. */
 const LIGHT_GRID = 16
 const LIGHT_PERCENTILE = 0.9
 const LIGHT_BLUR_PASSES = 4
-const FLAT_TARGET = 230
-const CLAHE_TILES = 8
-const CLAHE_BINS = 256
-const CLAHE_CLIP = 2.25
-const PAPER_LUMA = 218
-const PAPER_LUMA_FULL = 236
-const PAPER_SAT = 15
-const SAT_BOOST = 1.35
-const SHARPEN_AMOUNT = 1.2
+const FLAT_TARGET = 255
+const WHITE_SNAP = 195
+const WHITE_SNAP_FULL = 200
+const BLACK_LO = 85
+const BLACK_OUT = 10
+const SAT_KEEP = 0.06
+const SAT_BOOST = 1.7
+const SHARPEN_AMOUNT = 1.35
 const SHARPEN_THRESHOLD = 2
 const BW_THRESHOLD = 148
 const YIELD_MS = 24
@@ -238,7 +237,7 @@ async function warpCanvas(
   return canvas
 }
 
-/* ---------- Uniform mathematical scan: flatten → CLAHE → roll-off → unsharp ---------- */
+/* ---------- Uniform Magic Color: flatten → punch → vivid sat → unsharp ---------- */
 
 async function yieldBusy(clock: { last: number }) {
   if (performance.now() - clock.last < YIELD_MS) return
@@ -256,19 +255,14 @@ function smoothstep(edge0: number, edge1: number, x: number) {
   return t * t * (3 - 2 * t)
 }
 
-function extractLumaSat(data: Uint8ClampedArray, count: number) {
-  const luma = new Float32Array(count)
-  const sat = new Float32Array(count)
-  for (let p = 0, i = 0; p < count; p += 1, i += 4) {
-    const red = data[i] ?? 0
-    const green = data[i + 1] ?? 0
-    const blue = data[i + 2] ?? 0
-    luma[p] = 0.299 * red + 0.587 * green + 0.114 * blue
-    const max = Math.max(red, green, blue)
-    const min = Math.min(red, green, blue)
-    sat[p] = max < 1 ? 0 : ((max - min) / max) * 255
-  }
-  return { luma, sat }
+function pixelLuma(r: number, g: number, b: number) {
+  return 0.299 * r + 0.587 * g + 0.114 * b
+}
+
+function pixelSat(r: number, g: number, b: number) {
+  const max = Math.max(r, g, b)
+  const min = Math.min(r, g, b)
+  return max < 1 ? 0 : (max - min) / max
 }
 
 function histPercentile(hist: Uint32Array, total: number, q: number) {
@@ -342,38 +336,50 @@ function blurGrid3x3(grid: Float32Array, size: number) {
 }
 
 /**
- * Slow illumination surface: 16×16 grid of 90th-percentile luma, then a heavy
- * box filter so page shadows stay and local photo dips do not become holes.
+ * Paper-white field per channel: 16×16 90th-percentile R/G/B, then a heavy box
+ * filter. Dividing each channel by this surface both lifts shadows and removes
+ * the warm gray cast that a luma-only divide leaves on the page.
  */
-function illuminationGrid(luma: Float32Array, width: number, height: number) {
-  const grid = new Float32Array(LIGHT_GRID * LIGHT_GRID)
-  const cellW = width / LIGHT_GRID
-  const cellH = height / LIGHT_GRID
+function illuminationRgb(data: Uint8ClampedArray, width: number, height: number) {
+  const cells = LIGHT_GRID * LIGHT_GRID
+  const hists = [new Uint32Array(cells * 256), new Uint32Array(cells * 256), new Uint32Array(cells * 256)]
+  const counts = new Uint32Array(cells)
 
-  for (let gy = 0; gy < LIGHT_GRID; gy += 1) {
-    for (let gx = 0; gx < LIGHT_GRID; gx += 1) {
-      const x0 = Math.floor(gx * cellW)
-      const y0 = Math.floor(gy * cellH)
-      const x1 = Math.min(width, Math.floor((gx + 1) * cellW))
-      const y1 = Math.min(height, Math.floor((gy + 1) * cellH))
-      const hist = new Uint32Array(256)
-      let count = 0
-      for (let y = y0; y < y1; y += 1) {
-        const row = y * width
-        for (let x = x0; x < x1; x += 1) {
-          hist[Math.min(255, Math.max(0, Math.round(luma[row + x] ?? 0)))] += 1
-          count += 1
-        }
-      }
-      grid[gy * LIGHT_GRID + gx] = Math.max(1, count > 0 ? histPercentile(hist, count, LIGHT_PERCENTILE) : 1)
+  for (let y = 0; y < height; y += 1) {
+    const gy = Math.min(LIGHT_GRID - 1, ((y * LIGHT_GRID) / height) | 0)
+    for (let x = 0; x < width; x += 1) {
+      const gx = Math.min(LIGHT_GRID - 1, ((x * LIGHT_GRID) / width) | 0)
+      const id = gy * LIGHT_GRID + gx
+      const i = (y * width + x) * 4
+      const histR = hists[0]
+      const histG = hists[1]
+      const histB = hists[2]
+      if (!histR || !histG || !histB) continue
+      histR[id * 256 + Math.min(255, Math.max(0, Math.round(data[i] ?? 0)))] += 1
+      histG[id * 256 + Math.min(255, Math.max(0, Math.round(data[i + 1] ?? 0)))] += 1
+      histB[id * 256 + Math.min(255, Math.max(0, Math.round(data[i + 2] ?? 0)))] += 1
+      counts[id] += 1
     }
   }
 
-  let smooth = grid
-  for (let pass = 0; pass < LIGHT_BLUR_PASSES; pass += 1) {
-    smooth = blurGrid3x3(smooth, LIGHT_GRID)
+  const grids = [new Float32Array(cells), new Float32Array(cells), new Float32Array(cells)]
+  for (let id = 0; id < cells; id += 1) {
+    const n = Math.max(1, counts[id] ?? 1)
+    for (let c = 0; c < 3; c += 1) {
+      const hist = hists[c]?.subarray(id * 256, id * 256 + 256)
+      const grid = grids[c]
+      if (!hist || !grid) continue
+      grid[id] = Math.max(1, histPercentile(hist, n, LIGHT_PERCENTILE))
+    }
   }
-  return smooth
+
+  return grids.map((grid) => {
+    let smooth = grid
+    for (let pass = 0; pass < LIGHT_BLUR_PASSES; pass += 1) {
+      smooth = blurGrid3x3(smooth, LIGHT_GRID)
+    }
+    return smooth
+  }) as [Float32Array, Float32Array, Float32Array]
 }
 
 function sampleGrid(grid: Float32Array, x: number, y: number, width: number, height: number) {
@@ -392,156 +398,84 @@ function sampleGrid(grid: Float32Array, x: number, y: number, width: number, hei
   return Math.max(1, (a * (1 - tx) + b * tx) * (1 - ty) + (c * (1 - tx) + d * tx) * ty)
 }
 
-function flattenLuma(luma: Float32Array, grid: Float32Array, width: number, height: number) {
-  const flat = new Float32Array(luma.length)
-  for (let y = 0; y < height; y += 1) {
-    const row = y * width
-    for (let x = 0; x < width; x += 1) {
-      const bgL = sampleGrid(grid, x, y, width, height)
-      flat[row + x] = clamp255(((luma[row + x] ?? 0) / bgL) * FLAT_TARGET)
-    }
-  }
-  return flat
-}
-
-function clipHistogram(hist: Float64Array, clipLimit: number) {
-  for (let pass = 0; pass < 3; pass += 1) {
-    let excess = 0
-    for (let i = 0; i < CLAHE_BINS; i += 1) {
-      const value = hist[i] ?? 0
-      if (value > clipLimit) {
-        excess += value - clipLimit
-        hist[i] = clipLimit
-      }
-    }
-    if (excess < 1e-3) break
-    const raise = excess / CLAHE_BINS
-    for (let i = 0; i < CLAHE_BINS; i += 1) {
-      hist[i] = (hist[i] ?? 0) + raise
-    }
-  }
-}
-
-function claheLuts(luma: Float32Array, width: number, height: number) {
-  const tiles = CLAHE_TILES
-  const hists = Array.from({ length: tiles * tiles }, () => new Float64Array(CLAHE_BINS))
-  const totals = new Float64Array(tiles * tiles)
-
-  for (let y = 0; y < height; y += 1) {
-    const gy = Math.min(tiles - 1, ((y * tiles) / height) | 0)
-    const row = y * width
-    for (let x = 0; x < width; x += 1) {
-      const gx = Math.min(tiles - 1, ((x * tiles) / width) | 0)
-      const id = gy * tiles + gx
-      const bin = Math.min(255, Math.max(0, Math.round(luma[row + x] ?? 0)))
-      const hist = hists[id]
-      if (!hist) continue
-      hist[bin] += 1
-      totals[id] += 1
-    }
-  }
-
-  const luts = new Float32Array(tiles * tiles * CLAHE_BINS)
-  for (let id = 0; id < hists.length; id += 1) {
-    const hist = hists[id]
-    const total = Math.max(1, totals[id] ?? 1)
-    if (!hist) continue
-    clipHistogram(hist, Math.max(1, CLAHE_CLIP * (total / CLAHE_BINS)))
-    let cdf = 0
-    const offset = id * CLAHE_BINS
-    for (let bin = 0; bin < CLAHE_BINS; bin += 1) {
-      cdf += hist[bin] ?? 0
-      luts[offset + bin] = clamp255((cdf / total) * 255)
-    }
-  }
-  return luts
-}
-
-function mapClahe(luts: Float32Array, gx: number, gy: number, bin: number) {
-  const x = Math.min(CLAHE_TILES - 1, Math.max(0, gx))
-  const y = Math.min(CLAHE_TILES - 1, Math.max(0, gy))
-  return luts[(y * CLAHE_TILES + x) * CLAHE_BINS + bin] ?? bin
-}
-
-async function applyCLAHE(
-  luma: Float32Array,
+/** Divide each channel by the paper-white surface: `norm = clamp((C / bgC) * 255)`. */
+async function flattenRgb(
+  data: Uint8ClampedArray,
   width: number,
   height: number,
   clock: { last: number },
 ) {
-  const luts = claheLuts(luma, width, height)
-  const out = new Float32Array(luma.length)
+  const [gridR, gridG, gridB] = illuminationRgb(data, width, height)
+  await yieldBusy(clock)
   for (let y = 0; y < height; y += 1) {
     if (y % 48 === 0) await yieldBusy(clock)
-    const gy = ((y + 0.5) * CLAHE_TILES) / height - 0.5
-    const y0 = Math.floor(gy)
-    const ty = gy - y0
-    const row = y * width
     for (let x = 0; x < width; x += 1) {
-      const gx = ((x + 0.5) * CLAHE_TILES) / width - 0.5
-      const x0 = Math.floor(gx)
-      const tx = gx - x0
-      const bin = Math.min(255, Math.max(0, Math.round(luma[row + x] ?? 0)))
-      const a = mapClahe(luts, x0, y0, bin)
-      const b = mapClahe(luts, x0 + 1, y0, bin)
-      const c = mapClahe(luts, x0, y0 + 1, bin)
-      const d = mapClahe(luts, x0 + 1, y0 + 1, bin)
-      out[row + x] = (a * (1 - tx) + b * tx) * (1 - ty) + (c * (1 - tx) + d * tx) * ty
+      const i = (y * width + x) * 4
+      const bgR = sampleGrid(gridR, x, y, width, height)
+      const bgG = sampleGrid(gridG, x, y, width, height)
+      const bgB = sampleGrid(gridB, x, y, width, height)
+      data[i] = clamp255(((data[i] ?? 0) / bgR) * FLAT_TARGET)
+      data[i + 1] = clamp255(((data[i + 1] ?? 0) / bgG) * FLAT_TARGET)
+      data[i + 2] = clamp255(((data[i + 2] ?? 0) / bgB) * FLAT_TARGET)
+      data[i + 3] = 255
     }
   }
-  return out
+}
+
+/** Blacks below 85 pull to #0a0a0a; low-sat paper above 195 snaps to #FFFFFF. */
+function punchLuma(normL: number, sat: number) {
+  if (normL < BLACK_LO) {
+    const t = normL / BLACK_LO
+    return BLACK_OUT + (BLACK_LO - BLACK_OUT) * t * t
+  }
+  if (sat <= SAT_KEEP && normL > WHITE_SNAP) {
+    return normL + (255 - normL) * smoothstep(WHITE_SNAP, WHITE_SNAP_FULL, normL)
+  }
+  return normL
 }
 
 /**
- * Apply CLAHE luma, keep original hue, boost chroma 1.35×, and roll only
- * high-luma / low-sat paper (flatL > 218 and S < 15) smoothly to #FFFFFF.
+ * After RGB flatten: punch blacks, snap paper to #FFFFFF, boost chroma 1.7×
+ * when HSV S > 0.06 so pink/blue/yellow/red stay vivid.
  */
-async function applyScanColor(
+async function applyPunchAndColor(
   data: Uint8ClampedArray,
-  luma: Float32Array,
-  sat: Float32Array,
-  flatL: Float32Array,
-  claheL: Float32Array,
   width: number,
   height: number,
   clock: { last: number },
 ) {
   for (let y = 0; y < height; y += 1) {
     if (y % 48 === 0) await yieldBusy(clock)
-    let p = y * width
-    let i = p * 4
-    for (let x = 0; x < width; x += 1, p += 1, i += 4) {
-      const srcL = luma[p] ?? 0
-      const nextL = claheL[p] ?? 0
-      let red: number
-      let green: number
-      let blue: number
-      if (srcL > 0.5) {
-        const scale = nextL / srcL
-        red = (data[i] ?? 0) * scale
-        green = (data[i + 1] ?? 0) * scale
-        blue = (data[i + 2] ?? 0) * scale
+    let i = y * width * 4
+    for (let x = 0; x < width; x += 1, i += 4) {
+      let red = data[i] ?? 0
+      let green = data[i + 1] ?? 0
+      let blue = data[i + 2] ?? 0
+      const normL = pixelLuma(red, green, blue)
+      const chroma = pixelSat(red, green, blue)
+      const nextL = punchLuma(normL, chroma)
+      if (normL > 0.5) {
+        const scale = nextL / normL
+        red *= scale
+        green *= scale
+        blue *= scale
       } else {
         red = nextL
         green = nextL
         blue = nextL
       }
 
-      const whiteMix =
-        smoothstep(PAPER_LUMA, PAPER_LUMA_FULL, flatL[p] ?? 0) * (1 - smoothstep(0, PAPER_SAT, sat[p] ?? 0))
-      if (whiteMix < 0.999) {
-        const [hue, chroma, value] = rgbToHsv(red, green, blue)
-        const boosted = Math.min(1, chroma * SAT_BOOST)
-        const mixed = chroma + (boosted - chroma) * (1 - whiteMix)
-        const tone = hsvToRgb(hue, mixed, value)
+      if (chroma > SAT_KEEP) {
+        const [hue, , value] = rgbToHsv(red, green, blue)
+        const tone = hsvToRgb(hue, Math.min(1, chroma * SAT_BOOST), value)
         red = tone[0]
         green = tone[1]
         blue = tone[2]
-      }
-      if (whiteMix > 0) {
-        red += (255 - red) * whiteMix
-        green += (255 - green) * whiteMix
-        blue += (255 - blue) * whiteMix
+      } else if (normL > WHITE_SNAP) {
+        const mix = smoothstep(WHITE_SNAP, WHITE_SNAP_FULL, normL)
+        red += (255 - red) * mix
+        green += (255 - green) * mix
+        blue += (255 - blue) * mix
       }
 
       data[i] = clamp255(red)
@@ -552,7 +486,7 @@ async function applyScanColor(
   }
 }
 
-/** 3×3 unsharp on luminance. Amount 1.2 / threshold 2 for the scan pass; gentler for warp. */
+/** 3×3 unsharp on luminance. Amount 1.35 / threshold 2 for Magic Color; gentler for warp. */
 function sharpen3x3(image: ImageData, amount: number, threshold = 1.2) {
   const { data, width, height } = image
   const gray = new Float32Array(width * height)
@@ -577,34 +511,24 @@ function sharpen3x3(image: ImageData, amount: number, threshold = 1.2) {
   }
 }
 
-function flattenPage(luma: Float32Array, width: number, height: number) {
-  return flattenLuma(luma, illuminationGrid(luma, width, height), width, height)
-}
-
 async function applyMagicColor(image: ImageData) {
   const { data, width, height } = image
   const clock = { last: performance.now() }
-  const { luma, sat } = extractLumaSat(data, width * height)
-  const flatL = flattenPage(luma, width, height)
-  await yieldBusy(clock)
-  const claheL = await applyCLAHE(flatL, width, height, clock)
-  await applyScanColor(data, luma, sat, flatL, claheL, width, height, clock)
+  await flattenRgb(data, width, height, clock)
+  await applyPunchAndColor(data, width, height, clock)
   sharpen3x3(image, SHARPEN_AMOUNT, SHARPEN_THRESHOLD)
 }
 
 async function applyFastBlackWhite(image: ImageData) {
   const { data, width, height } = image
   const clock = { last: performance.now() }
-  const { luma } = extractLumaSat(data, width * height)
-  const flatL = flattenPage(luma, width, height)
-  await yieldBusy(clock)
-  const claheL = await applyCLAHE(flatL, width, height, clock)
+  await flattenRgb(data, width, height, clock)
   for (let y = 0; y < height; y += 1) {
     if (y % 48 === 0) await yieldBusy(clock)
-    let p = y * width
-    let i = p * 4
-    for (let x = 0; x < width; x += 1, p += 1, i += 4) {
-      const ink = (claheL[p] ?? 0) < BW_THRESHOLD ? 0 : 255
+    let i = y * width * 4
+    for (let x = 0; x < width; x += 1, i += 4) {
+      const tone = punchLuma(pixelLuma(data[i] ?? 0, data[i + 1] ?? 0, data[i + 2] ?? 0), 0)
+      const ink = tone < BW_THRESHOLD ? 0 : 255
       data[i] = ink
       data[i + 1] = ink
       data[i + 2] = ink
@@ -677,12 +601,12 @@ async function processPixels(
   return canvas
 }
 
-/** Uniform scan: flattened paper, CLAHE contrast, vivid stamps, photos left intact. */
+/** Magic Color: brilliant paper, punchy ink/photos, 1.7× chroma, razor edges. */
 export async function applyCanvasMagic(source: HTMLCanvasElement): Promise<HTMLCanvasElement> {
   return processPixels(source, applyMagicColor)
 }
 
-/** Adaptive black and white from the same flatten + CLAHE field. */
+/** Adaptive black and white from the same flatten + punch curve. */
 export async function applyCanvasBlackWhite(source: HTMLCanvasElement): Promise<HTMLCanvasElement> {
   return processPixels(source, applyFastBlackWhite)
 }
