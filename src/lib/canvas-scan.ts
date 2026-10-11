@@ -49,7 +49,11 @@ const PHOTO_VAR = 12
 const PAPER_KNEE = 225
 const PHOTO_BLACK = 26
 const PHOTO_WHITE = 240
+const SHADOW_CEIL = 140
+const SHADOW_GAMMA = 1.22
 const SAT_BOOST = 1.6
+const TINT_LUMA = 180
+const TINT_SAT = 8
 
 function sourceSize(image: CanvasImageSource): { width: number; height: number } {
   if (image instanceof HTMLImageElement) {
@@ -512,6 +516,13 @@ function paperKnee(luma: number) {
   return luma + (255 - luma) * s
 }
 
+/** Lift crushed night midtones; leave tire/edge blacks at or below PHOTO_BLACK. */
+function liftPhotoShadows(luma: number) {
+  if (luma <= PHOTO_BLACK || luma >= SHADOW_CEIL) return luma
+  const n = (luma - PHOTO_BLACK) / (SHADOW_CEIL - PHOTO_BLACK)
+  return PHOTO_BLACK + (SHADOW_CEIL - PHOTO_BLACK) * n ** (1 / SHADOW_GAMMA)
+}
+
 function flattenPixel(src: Uint8ClampedArray, bg: Uint8ClampedArray, i: number) {
   const red = Math.min(255, ((src[i] ?? 0) / Math.max(bg[i] ?? 0, 18)) * 255)
   const green = Math.min(255, ((src[i + 1] ?? 0) / Math.max(bg[i + 1] ?? 0, 18)) * 255)
@@ -560,12 +571,14 @@ function magicColor(src: Uint8ClampedArray, bg: Uint8ClampedArray, texture: Uint
     const photo = tex >= PHOTO_VAR
     const flat = tex <= PAPER_FLAT
     const sat = Math.max(red, green, blue) - Math.min(red, green, blue)
+    const tint = sat > 12 || (luma > TINT_LUMA && sat > TINT_SAT)
 
     let next = luma
-    if (!photo && flat && sat < 18 && luma >= PAPER_KNEE) {
+    if (!photo && flat && !tint && luma >= PAPER_KNEE) {
       next = paperKnee(luma)
     } else if (photo) {
       next = PHOTO_BLACK + ((luma - stretch.lo) / stretch.span) * (PHOTO_WHITE - PHOTO_BLACK)
+      next = liftPhotoShadows(next)
       if (next < 8) next = 8
       else if (next > 248) next = 248
     }
@@ -574,7 +587,7 @@ function magicColor(src: Uint8ClampedArray, bg: Uint8ClampedArray, texture: Uint
     let outR = red * scale
     let outG = green * scale
     let outB = blue * scale
-    if (sat > 12) {
+    if (tint) {
       const mid = 0.299 * outR + 0.587 * outG + 0.114 * outB
       outR = mid + (outR - mid) * SAT_BOOST
       outG = mid + (outG - mid) * SAT_BOOST
