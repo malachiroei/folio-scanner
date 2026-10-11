@@ -1,20 +1,33 @@
 import type { Corners, FilterMode, Point } from '../types'
-import { outputSize } from './geometry'
+import { distance, outputSize } from './geometry'
 import { nextFrame } from './image'
 
 /**
- * A page that is roughly paper-shaped (long/short between 1.15 and 1.75) snaps to the exact A4
- * ratio 1:1.414 on its long side, so slightly off corners cannot stretch the text.
- * Other shapes (receipts, cards) keep the measured size.
+ * Strict A4 container (1:1.414). A wider-than-tall quad becomes a landscape page (3000x2121 at
+ * most), anything else a portrait page (2121x3000), so a document is never rotated or squeezed
+ * into the wrong orientation. Very elongated shapes (receipts) keep their measured size.
  */
-function a4Size(size: { width: number; height: number }): { width: number; height: number } {
+function a4Size(
+  size: { width: number; height: number },
+  landscape: boolean,
+): { width: number; height: number } {
   const long = Math.max(size.width, size.height)
   const short = Math.min(size.width, size.height)
   if (short < 1) return size
   const ratio = long / short
-  if (ratio < 1.15 || ratio > 1.75) return size
+  if (ratio > 2.1) return size
   const snapped = Math.round(long / Math.SQRT2)
-  return size.width >= size.height ? { width: long, height: snapped } : { width: snapped, height: long }
+  return landscape ? { width: long, height: snapped } : { width: snapped, height: long }
+}
+
+/**
+ * Landscape when the quad is wider than tall, portrait otherwise. Opposite sides are averaged,
+ * so perspective (a near edge longer than the far one) cannot flip the decision.
+ */
+function isLandscape(corners: Corners): boolean {
+  const width = (distance(corners.tl, corners.tr) + distance(corners.bl, corners.br)) / 2
+  const height = (distance(corners.tl, corners.bl) + distance(corners.tr, corners.br)) / 2
+  return width > height
 }
 
 /** Long edge of the straightened page (about 256 DPI on A4). */
@@ -349,17 +362,20 @@ async function filterMagic(image: ImageData) {
 }
 
 /**
- * Ink curve on the shadow-flattened, sharpened page. A steep gamma darkens antialiased text and
- * thin grid lines toward black; anything within ~20% of the paper level (faint shading, noise, JPEG haze) snaps to pure #FFFFFF.
- * Strongly colored pixels (stamps, logos, signatures) keep their hue.
+ * Tone curve on the shadow-flattened, sharpened page: a smooth S-curve (not a threshold) keeps
+ * antialiased text, pencil and thin grid lines continuous, and paper tones above ~215 blend
+ * softly into pure #FFFFFF. Strongly colored pixels (stamps, logos, signatures) keep their hue.
  */
 async function inkCurve(image: ImageData) {
   const { data, width, height } = image
   const lut = new Uint8ClampedArray(256)
   for (let level = 0; level < 256; level += 1) {
-    const s = Math.min(1, Math.max(0, (level - 24) / (214 - 24)))
-    const toWhite = smoothstep(0.72, 0.88, s)
-    lut[level] = 255 * (s ** 2.6 * (1 - toWhite) + toWhite)
+    // Smooth S-curve on the flattened page: ink and pencil keep their tonal range (no binary
+    // clipping), shadows deepen a little, and paper tones above ~215 blend softly into #FFFFFF.
+    const tone = Math.min(1, Math.max(0, (level - 30) / (225 - 30)))
+    const curved = tone * tone * (3 - 2 * tone)
+    const toWhite = smoothstep(205, 232, level)
+    lut[level] = 255 * (curved ** 1.4 * (1 - toWhite) + toWhite)
   }
   for (let y = 0; y < height; y += 1) {
     if (y % 64 === 0) await nextFrame()
@@ -457,8 +473,11 @@ async function unsharp(image: ImageData, amount: number, radius = 2) {
     }
     for (let y = 0; y < height; y += 1) {
       const p = y * width + x
-      const delta = ((gray[p] ?? 0) - (column[y] ?? 0)) * amount
-      if (Math.abs(delta) < 1.5) continue
+      // Soft threshold: differences under 2 levels (noise, JPEG blocks) get no boost at all and larger
+      // ones fade in, so flat paper stays clean and edges are never kinked.
+      const raw = ((gray[p] ?? 0) - (column[y] ?? 0)) * amount
+      const delta = raw - Math.max(-2, Math.min(2, raw))
+      if (delta === 0) continue
       const i = p * 4
       data[i] = Math.min(255, Math.max(0, (data[i] ?? 0) + delta))
       data[i + 1] = Math.min(255, Math.max(0, (data[i + 1] ?? 0) + delta))
@@ -500,7 +519,7 @@ export async function straightenCanvas(
   corners: Corners,
   deadlineAt = Number.POSITIVE_INFINITY,
 ): Promise<HTMLCanvasElement> {
-  const fitted = a4Size(outputSize(corners))
+  const fitted = a4Size(outputSize(corners), isLandscape(corners))
   const scale = Math.min(1, MAX_EDGE / Math.max(fitted.width, fitted.height, 1))
   const width = Math.max(32, Math.round(fitted.width * scale))
   const height = Math.max(32, Math.round(fitted.height * scale))
@@ -534,8 +553,7 @@ async function processCopy(
 export async function applyCanvasMagic(source: HTMLCanvasElement): Promise<HTMLCanvasElement> {
   return processCopy(source, async (pixels) => {
     await filterMagic(pixels)
-    await unsharp(pixels, 1.1)
-    await unsharp(pixels, 0.7, 1)
+    await unsharp(pixels, 0.7)
     await inkCurve(pixels)
   })
 }

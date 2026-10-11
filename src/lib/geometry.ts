@@ -82,18 +82,20 @@ export function defaultCorners(width: number, height: number, inset = 0.08): Cor
 }
 
 /**
- * A centered, vertical A4-shaped rectangle (1:1.414) with `pad` of empty space on every side.
+ * A centered A4-shaped rectangle (1:1.414), upright in a portrait photo and lying down in a
+ * landscape one, with `pad` of empty space on every side.
  * Used when no page is found, so the pins start near where a page usually is instead of at the
  * very edges of the photo.
  */
 export function inwardPageCorners(width: number, height: number, pad = 0.12): Corners {
   const maxWidth = width * (1 - 2 * pad)
   const maxHeight = height * (1 - 2 * pad)
+  const landscape = width > height * 1.05
   let pageHeight = maxHeight
-  let pageWidth = pageHeight / Math.SQRT2
+  let pageWidth = landscape ? pageHeight * Math.SQRT2 : pageHeight / Math.SQRT2
   if (pageWidth > maxWidth) {
     pageWidth = maxWidth
-    pageHeight = pageWidth * Math.SQRT2
+    pageHeight = landscape ? pageWidth / Math.SQRT2 : pageWidth * Math.SQRT2
   }
   const left = (width - pageWidth) / 2
   const top = (height - pageHeight) / 2

@@ -24,7 +24,7 @@ async function renderWithCanvas(
   return { canvas, width: canvas.width, height: canvas.height }
 }
 
-/** Perspective warp to a strict A4 page (1:1.414) capped at 3000px on the long edge. */
+/** Perspective warp to a strict A4 page, portrait or landscape as the corners dictate, capped at 3000px. */
 export async function straightenDocument(
   image: CanvasImageSource,
   corners: Corners,
