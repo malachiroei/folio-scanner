@@ -508,35 +508,64 @@ async function photoContrast(image: ImageData, photo: LowMap) {
   const { cols, rows } = photo
   const lo = new Float32Array(cols * rows)
   const hi = new Float32Array(cols * rows)
-  const tile = LIGHT_CELL * 3
-  lo.fill(40)
-  hi.fill(220)
-  const ranked: number[] = []
-  for (let row = 0; row < rows; row += 1) {
-    if (row % 16 === 0) await nextFrame()
-    const y0 = Math.max(0, row * LIGHT_CELL - tile + LIGHT_CELL)
-    const y1 = Math.min(height, row * LIGHT_CELL + tile)
-    for (let col = 0; col < cols; col += 1) {
-      if ((photo.values[row * cols + col] ?? 0) < 0.2) continue
-      ranked.length = 0
-      const x0 = Math.max(0, col * LIGHT_CELL - tile + LIGHT_CELL)
-      const x1 = Math.min(width, col * LIGHT_CELL + tile)
+  lo.fill(0)
+  hi.fill(255)
+  const seen = new Uint8Array(photo.values.length)
+  const stack = new Int32Array(photo.values.length)
+  const cells: number[] = []
+
+  for (let start = 0; start < photo.values.length; start += 1) {
+    if ((photo.values[start] ?? 0) < 0.45 || seen[start]) continue
+    let top = 0
+    stack[top] = start
+    top += 1
+    seen[start] = 1
+    cells.length = 0
+    while (top > 0) {
+      top -= 1
+      const i = stack[top] ?? 0
+      cells.push(i)
+      const c = i % cols
+      const r = (i - c) / cols
+      const neighbors = [c > 0 ? i - 1 : -1, c + 1 < cols ? i + 1 : -1, r > 0 ? i - cols : -1, r + 1 < rows ? i + cols : -1]
+      for (const n of neighbors) {
+        if (n < 0 || seen[n] || (photo.values[n] ?? 0) < 0.45) continue
+        seen[n] = 1
+        stack[top] = n
+        top += 1
+      }
+    }
+    if (cells.length < PHOTO_MIN_CELLS) continue
+
+    const samples: number[] = []
+    for (const i of cells) {
+      const col = i % cols
+      const row = (i - col) / cols
+      const x0 = col * LIGHT_CELL
+      const y0 = row * LIGHT_CELL
+      const x1 = Math.min(width, x0 + LIGHT_CELL)
+      const y1 = Math.min(height, y0 + LIGHT_CELL)
       for (let y = y0; y < y1; y += 2) {
         for (let x = x0; x < x1; x += 2) {
-          const i = (y * width + x) * 4
-          ranked.push(0.299 * (data[i] ?? 0) + 0.587 * (data[i + 1] ?? 0) + 0.114 * (data[i + 2] ?? 0))
+          const p = (y * width + x) * 4
+          samples.push(0.299 * (data[p] ?? 0) + 0.587 * (data[p + 1] ?? 0) + 0.114 * (data[p + 2] ?? 0))
         }
       }
-      if (ranked.length < 8) continue
-      ranked.sort((a, b) => a - b)
-      const p10 = ranked[Math.floor(ranked.length * 0.1)] ?? 0
-      const p90 = ranked[Math.min(ranked.length - 1, Math.floor(ranked.length * 0.9))] ?? 255
-      lo[row * cols + col] = p10
-      hi[row * cols + col] = Math.max(p10 + 55, p90)
+    }
+    if (samples.length < 16) continue
+    samples.sort((a, b) => a - b)
+    const black = samples[Math.floor(samples.length * 0.02)] ?? 0
+    const white = samples[Math.min(samples.length - 1, Math.floor(samples.length * 0.98))] ?? 255
+    const floor = black
+    const ceil = Math.max(black + 24, white)
+    for (const i of cells) {
+      lo[i] = floor
+      hi[i] = ceil
     }
   }
-  const lowAt = mapSampler({ values: boxFilter({ values: lo, cols, rows }, 1, 'mean').values, cols, rows }, width, height)
-  const highAt = mapSampler({ values: boxFilter({ values: hi, cols, rows }, 1, 'mean').values, cols, rows }, width, height)
+
+  const lowAt = mapSampler({ values: lo, cols, rows }, width, height)
+  const highAt = mapSampler({ values: hi, cols, rows }, width, height)
   const photoAt = mapSampler(photo, width, height)
   for (let y = 0; y < height; y += 1) {
     if (y % 32 === 0) await nextFrame()
@@ -552,10 +581,10 @@ async function photoContrast(image: ImageData, photo: LowMap) {
       const blue = data[index + 2] ?? 0
       const level = 0.299 * red + 0.587 * green + 0.114 * blue
       const floor = lowAt(x, y)
-      const ceil = Math.max(floor + 55, highAt(x, y))
-      const boosted = 18 + ((level - floor) / (ceil - floor)) * 220
-      const limited = Math.min(level + 72, Math.max(level - 72, boosted))
-      const target = level * 0.4 + limited * 0.6
+      const ceil = Math.max(floor + 24, highAt(x, y))
+      // Full-range stretch of this photo block: darkest detail → ~22, highlights → ~240.
+      const stretched = 22 + ((level - floor) / (ceil - floor)) * 218
+      const target = Math.min(245, Math.max(15, stretched))
       const lift = level > 1 ? target / level : 0
       const mixed = (channel: number) => {
         const photoCh = Math.min(255, Math.max(0, channel * lift))
@@ -664,26 +693,31 @@ async function filterMagic(image: ImageData, light: LowMap) {
   }
 }
 
-const INK_BLACK = 82 // at or below this level a pixel is fully inked
-const INK_FLOOR = 0 // #000000, the darkest ink
+const INK_BLACK = 96 // at or below this level a pixel is fully inked
+const INK_FLOOR = 8 // #080808, deep solid ink (barcodes and small Hebrew)
 const EDGE_MARGIN = 0.06 // width of the perimeter band, as a share of the shorter side
 const EDGE_KNEE = 120 // inside that band, levels from here up fade to pure white at the very edge
-const PAPER_KNEE = 168 // paper haze (brown-gray ~170-200) snaps toward white
-const PAPER_KNEE_OUT = 220 // where the linear stretch ends before the white ramp
+const PAPER_CLAMP = 175 // any non-photo pixel at or above this is forced to #FFFFFF
 
 /**
- * Tone curve for print and paper only. Photographs were already locally stretched; they are left
- * alone here so vehicle paint and plates are not washed to white. Paper haze above ~168 becomes
- * pure #FFFFFF (chroma is discarded so a brown-gray tint cannot linger). Ink goes to #000000.
+ * Tone curve for print and paper only. Photographs were already stretched; they are left alone.
+ * Any non-photo pixel at or above 175 becomes pure #FFFFFF (no gray haze, no brown cast).
+ * Ink and barcode bars below the threshold go to deep solid #080808.
  */
 async function inkCurve(image: ImageData, photo?: LowMap | null) {
   const { data, width, height } = image
   const lut = new Uint8ClampedArray(256)
   for (let level = 0; level < 256; level += 1) {
-    const stretch = INK_FLOOR + ((Math.min(level, PAPER_KNEE) - INK_BLACK) / (PAPER_KNEE - INK_BLACK)) * (PAPER_KNEE_OUT - INK_FLOOR)
-    const ink = level <= INK_BLACK ? INK_FLOOR * (level / INK_BLACK) : stretch
-    const toWhite = smoothstep(PAPER_KNEE, PAPER_KNEE + 18, level)
-    lut[level] = ink * (1 - toWhite) + 255 * toWhite
+    if (level >= PAPER_CLAMP) {
+      lut[level] = 255
+      continue
+    }
+    if (level <= INK_BLACK) {
+      lut[level] = INK_FLOOR + (level / INK_BLACK) * 4
+      continue
+    }
+    const t = (level - INK_BLACK) / (PAPER_CLAMP - INK_BLACK)
+    lut[level] = INK_FLOOR + 4 + t * (255 - INK_FLOOR - 4)
   }
   const photoAt = photo ? mapSampler(photo, width, height) : null
   // Lens vignette and the shadow of the page edge leave the outer margin grayer than the light map
@@ -770,7 +804,14 @@ async function filterBlackWhite(image: ImageData) {
  * Unsharp mask on luminance (box blur of the given radius). Small deltas are ignored so the white
  * background does not pick up noise; edges of text and table lines gain micro-contrast.
  */
-async function unsharp(image: ImageData, amount: number, radius = 2, brighten = 1, photo?: LowMap | null) {
+async function unsharp(
+  image: ImageData,
+  amount: number,
+  radius = 2,
+  brighten = 1,
+  photo?: LowMap | null,
+  region: 'print' | 'photo' = 'print',
+) {
   const { data, width, height } = image
   const photoAt = photo ? mapSampler(photo, width, height) : null
   const gray = new Float32Array(width * height)
@@ -810,8 +851,10 @@ async function unsharp(image: ImageData, amount: number, radius = 2, brighten = 
       // strokes gain the full boost while bright halos beside them stay small.
       // Photographs get a light touch so plate digits stay readable without speckling the grain.
       const photoW = photoAt ? photoAt(x, y) : 0
+      const weight = region === 'photo' ? photoW : 1 - photoW
+      if (weight < 0.15) continue
       const diff = (gray[p] ?? 0) - (column[y] ?? 0)
-      const raw = diff * amount * (diff > 0 ? brighten : 1) * (photoW > 0.35 ? 0.15 : 1)
+      const raw = diff * amount * (diff > 0 ? brighten : 1) * weight
       const delta = raw - Math.max(-2, Math.min(2, raw))
       if (delta === 0) continue
       const i = p * 4
@@ -893,10 +936,13 @@ export async function applyCanvasMagic(source: HTMLCanvasElement): Promise<HTMLC
     const photo = photoWeights(low)
     const light = paperLight(low, photo)
     await filterMagic(pixels, light)
-    if (photo) await photoContrast(pixels, photo)
-    // Stroke-only sharpening: a broad pass then a 1px pass. Photographs stay nearly untouched.
-    await unsharp(pixels, 0.75, 2, 0.45, photo)
-    await unsharp(pixels, 1.45, 1, 0.35, photo)
+    if (photo) {
+      await photoContrast(pixels, photo)
+      await unsharp(pixels, 0.8, 1, 0.55, photo, 'photo')
+    }
+    // Stroke-only sharpening on text and barcodes (photographs use the pass above).
+    await unsharp(pixels, 0.75, 2, 0.45, photo, 'print')
+    await unsharp(pixels, 1.45, 1, 0.35, photo, 'print')
     await inkCurve(pixels, photo)
   })
 }
