@@ -39,15 +39,15 @@ const MIN_EDGE = 2800
 const MAX_EDGE = 3508
 const MAX_UPSCALE = 3
 
-/** Native-scale illumination blur (two box passes ≈ Gaussian). Never downsample the page. */
-const LIGHT_RADIUS = 40
-const LIGHT_PASSES = 2
-const FLAT_EPS = 1
-const PAPER_LO = 215
-const INK_HI = 90
-const INK_BLACK = 10
-const MID_GAMMA = 1.1
-const SAT_BOOST = 1.35
+/** Global paper-white normalization — never a local photo mean. */
+const LIGHT_GRID = 8
+const WHITE_PERCENTILE = 0.95
+const PAPER_FLOOR = 200
+const PAPER_LO = 220
+const INK_HI = 75
+const INK_BLACK = 5
+const MID_GAMMA = 0.95
+const SAT_BOOST = 1.4
 const SHARPEN_AMOUNT = 0.5
 const BW_THRESHOLD = 148
 const YIELD_MS = 24
@@ -234,7 +234,7 @@ async function warpCanvas(
   return canvas
 }
 
-/* ---------- Frequency-separation Magic Color (full native resolution) ---------- */
+/* ---------- Global paper-white Magic Color (CamScanner baseline) ---------- */
 
 function smoothstep(t: number) {
   const x = t < 0 ? 0 : t > 1 ? 1 : t
@@ -242,19 +242,21 @@ function smoothstep(t: number) {
 }
 
 /**
- * Global S-curve after flatten: ink to #0A0A0A, paper rolled to #FFFFFF,
- * midtones (photos, stamps, charts) kept with a gentle gamma 1.1 lift.
+ * After paper stretch: ink to #050505, paper rolled to #FFFFFF,
+ * midtones (photos, stamps, charts) keep a mild S-curve with gamma 0.95.
  */
 function magicCurve(luma: number) {
   if (luma < INK_HI) {
     const t = luma / INK_HI
-    return INK_BLACK + (INK_HI - INK_BLACK) * t ** 1.35
+    return INK_BLACK + (INK_HI - INK_BLACK) * t ** 1.3
   }
   if (luma > PAPER_LO) {
-    return luma + (255 - luma) * smoothstep((luma - PAPER_LO) / 22)
+    return luma + (255 - luma) * smoothstep((luma - PAPER_LO) / 18)
   }
   const n = (luma - INK_HI) / (PAPER_LO - INK_HI)
-  return INK_HI + (PAPER_LO - INK_HI) * n ** (1 / MID_GAMMA)
+  const s = n * n * (3 - 2 * n)
+  const mild = n * 0.7 + s * 0.3
+  return INK_HI + (PAPER_LO - INK_HI) * mild ** MID_GAMMA
 }
 
 function buildMagicLut() {
@@ -279,69 +281,84 @@ function extractLuma(data: Uint8ClampedArray, count: number) {
   return luma
 }
 
-/** Sliding-window separable box blur on a full-resolution luminance plane. */
-async function boxBlurChannel(
-  src: Float32Array,
-  width: number,
-  height: number,
-  radius: number,
-  clock: { last: number },
-): Promise<Float32Array> {
-  const tmp = new Float32Array(src.length)
-  const out = new Float32Array(src.length)
-  const span = radius * 2 + 1
-
-  for (let y = 0; y < height; y += 1) {
-    if (y % 48 === 0) await yieldBusy(clock)
-    const row = y * width
-    let sum = 0
-    for (let k = -radius; k <= radius; k += 1) {
-      sum += src[row + Math.min(width - 1, Math.max(0, k))] ?? 0
-    }
-    for (let x = 0; x < width; x += 1) {
-      tmp[row + x] = sum / span
-      const addX = Math.min(width - 1, x + radius + 1)
-      const remX = Math.max(0, x - radius)
-      sum += (src[row + addX] ?? 0) - (src[row + remX] ?? 0)
-    }
+function histPercentile(hist: Uint32Array, total: number, q: number) {
+  const target = total * q
+  let acc = 0
+  for (let value = 0; value < 256; value += 1) {
+    acc += hist[value] ?? 0
+    if (acc >= target) return value
   }
-
-  for (let x = 0; x < width; x += 1) {
-    if (x % 48 === 0) await yieldBusy(clock)
-    let sum = 0
-    for (let k = -radius; k <= radius; k += 1) {
-      const y = Math.min(height - 1, Math.max(0, k))
-      sum += tmp[y * width + x] ?? 0
-    }
-    for (let y = 0; y < height; y += 1) {
-      out[y * width + x] = sum / span
-      const addY = Math.min(height - 1, y + radius + 1)
-      const remY = Math.max(0, y - radius)
-      sum += (tmp[addY * width + x] ?? 0) - (tmp[remY * width + x] ?? 0)
-    }
-  }
-  return out
+  return 255
 }
 
-/** Low-frequency paper lighting at native resolution — no shrink/stretch. */
-async function illuminationSurface(luma: Float32Array, width: number, height: number, clock: { last: number }) {
-  const radius = Math.max(1, Math.min(LIGHT_RADIUS, Math.floor((Math.min(width, height) - 1) / 2)))
-  let background = luma
-  for (let pass = 0; pass < LIGHT_PASSES; pass += 1) {
-    background = await boxBlurChannel(background, width, height, radius, clock)
+/** 95th-percentile luminance of the whole page — the true paper white. */
+function pageWhitePoint(luma: Float32Array) {
+  const hist = new Uint32Array(256)
+  for (let i = 0; i < luma.length; i += 1) {
+    hist[Math.min(255, Math.max(0, Math.round(luma[i] ?? 0)))] += 1
   }
-  return background
+  return Math.max(PAPER_FLOOR, histPercentile(hist, luma.length, WHITE_PERCENTILE))
 }
 
 /**
- * HighFreq = Source / (Background + ε) * 255, then the Magic Color S-curve.
- * Chrominance ratios (R/L, G/L, B/L) are kept; saturation is lifted 1.35×
- * except on near-white paper, which rolls to #FFFFFF.
+ * Coarse 8×8 paper-white field. Each cell uses its own 95th percentile so corner
+ * shadows can lift, but a cell that is mostly a dark photo is rejected and replaced
+ * with the global paper white — never the car's own pixels.
+ */
+function paperWhiteGrid(luma: Float32Array, width: number, height: number, whitePoint: number) {
+  const grid = new Float32Array(LIGHT_GRID * LIGHT_GRID)
+  const cellW = width / LIGHT_GRID
+  const cellH = height / LIGHT_GRID
+  const floor = Math.max(PAPER_FLOOR, whitePoint * 0.82)
+
+  for (let gy = 0; gy < LIGHT_GRID; gy += 1) {
+    for (let gx = 0; gx < LIGHT_GRID; gx += 1) {
+      const x0 = Math.floor(gx * cellW)
+      const y0 = Math.floor(gy * cellH)
+      const x1 = Math.min(width, Math.floor((gx + 1) * cellW))
+      const y1 = Math.min(height, Math.floor((gy + 1) * cellH))
+      const hist = new Uint32Array(256)
+      let count = 0
+      for (let y = y0; y < y1; y += 1) {
+        const row = y * width
+        for (let x = x0; x < x1; x += 1) {
+          hist[Math.min(255, Math.max(0, Math.round(luma[row + x] ?? 0)))] += 1
+          count += 1
+        }
+      }
+      const local = count > 0 ? histPercentile(hist, count, WHITE_PERCENTILE) : whitePoint
+      grid[gy * LIGHT_GRID + gx] = local < floor ? whitePoint : Math.min(255, Math.max(floor, local))
+    }
+  }
+  return grid
+}
+
+/** Bilinear sample of the 8×8 paper-white field — smooth corner lighting, no local photo mean. */
+function localPaperWhite(grid: Float32Array, x: number, y: number, width: number, height: number) {
+  const fx = ((x + 0.5) / width) * (LIGHT_GRID - 1)
+  const fy = ((y + 0.5) / height) * (LIGHT_GRID - 1)
+  const x0 = fx | 0
+  const y0 = fy | 0
+  const x1 = Math.min(LIGHT_GRID - 1, x0 + 1)
+  const y1 = Math.min(LIGHT_GRID - 1, y0 + 1)
+  const tx = fx - x0
+  const ty = fy - y0
+  const a = grid[y0 * LIGHT_GRID + x0] ?? PAPER_FLOOR
+  const b = grid[y0 * LIGHT_GRID + x1] ?? PAPER_FLOOR
+  const c = grid[y1 * LIGHT_GRID + x0] ?? PAPER_FLOOR
+  const d = grid[y1 * LIGHT_GRID + x1] ?? PAPER_FLOOR
+  return Math.max(PAPER_FLOOR, (a * (1 - tx) + b * tx) * (1 - ty) + (c * (1 - tx) + d * tx) * ty)
+}
+
+/**
+ * Stretch every pixel by the paper white of its page quadrant, then apply the
+ * Magic Color curve. Photos stay at their natural dark values because the
+ * divisor is always paper (~200–255), never a local car/asphalt mean.
  */
 async function applyToneAndColor(
   data: Uint8ClampedArray,
   luma: Float32Array,
-  background: Float32Array,
+  grid: Float32Array,
   width: number,
   height: number,
   clock: { last: number },
@@ -355,8 +372,9 @@ async function applyToneAndColor(
       const green = data[i + 1] ?? 0
       const blue = data[i + 2] ?? 0
       const srcL = luma[p] ?? 0
-      const flat = Math.min(255, (srcL / ((background[p] ?? 0) + FLAT_EPS)) * 255)
-      const next = MAGIC_LUT[flat | 0] ?? flat
+      const paper = localPaperWhite(grid, x, y, width, height)
+      const normL = Math.min(255, Math.max(0, (srcL / paper) * 255))
+      const next = MAGIC_LUT[normL | 0] ?? normL
 
       let outR: number
       let outG: number
@@ -422,8 +440,9 @@ async function applyMagicColor(image: ImageData) {
   const { data, width, height } = image
   const clock = { last: performance.now() }
   const luma = extractLuma(data, width * height)
-  const background = await illuminationSurface(luma, width, height, clock)
-  await applyToneAndColor(data, luma, background, width, height, clock)
+  const whitePoint = pageWhitePoint(luma)
+  const grid = paperWhiteGrid(luma, width, height, whitePoint)
+  await applyToneAndColor(data, luma, grid, width, height, clock)
   sharpen3x3(image, SHARPEN_AMOUNT)
 }
 
@@ -431,14 +450,16 @@ async function applyFastBlackWhite(image: ImageData) {
   const { data, width, height } = image
   const clock = { last: performance.now() }
   const luma = extractLuma(data, width * height)
-  const background = await illuminationSurface(luma, width, height, clock)
+  const whitePoint = pageWhitePoint(luma)
+  const grid = paperWhiteGrid(luma, width, height, whitePoint)
   for (let y = 0; y < height; y += 1) {
     if (y % 48 === 0) await yieldBusy(clock)
     let p = y * width
     let i = p * 4
     for (let x = 0; x < width; x += 1, p += 1, i += 4) {
-      const flat = Math.min(255, ((luma[p] ?? 0) / ((background[p] ?? 0) + FLAT_EPS)) * 255)
-      const ink = flat < BW_THRESHOLD ? 0 : 255
+      const paper = localPaperWhite(grid, x, y, width, height)
+      const normL = Math.min(255, Math.max(0, ((luma[p] ?? 0) / paper) * 255))
+      const ink = normL < BW_THRESHOLD ? 0 : 255
       data[i] = ink
       data[i + 1] = ink
       data[i + 2] = ink
@@ -516,7 +537,7 @@ export async function applyCanvasMagic(source: HTMLCanvasElement): Promise<HTMLC
   return processPixels(source, applyMagicColor)
 }
 
-/** Fast adaptive black and white from the same native-resolution illumination map. */
+/** Adaptive black and white from the same global paper-white field. */
 export async function applyCanvasBlackWhite(source: HTMLCanvasElement): Promise<HTMLCanvasElement> {
   return processPixels(source, applyFastBlackWhite)
 }
