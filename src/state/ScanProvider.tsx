@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { detectDocumentCorners } from '../lib/detect'
+import { detectDocumentCorners, refineToPaper } from '../lib/detect'
 import { cornersValid, defaultCorners, inwardPageCorners, mapLiveCorners } from '../lib/geometry'
 import { isOpenCvReady, loadOpenCv } from '../lib/opencv'
 import {
@@ -198,12 +198,12 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     setDraft((current) => (current ? { ...current, detecting: false } : current))
   }
 
-  function scheduleLocate(sourceUrl: string, width: number, height: number) {
+  function scheduleLocate(sourceUrl: string, width: number, height: number, seed?: Corners) {
     const gen = ++detectGen.current
 
     window.setTimeout(() => {
       const start = () => {
-        void locatePage(sourceUrl, width, height, gen)
+        void locatePage(sourceUrl, width, height, gen, seed)
       }
       const idle = window.requestIdleCallback
       if (typeof idle === 'function') idle(start, { timeout: 80 })
@@ -211,7 +211,11 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     }, 50)
   }
 
-  async function locatePage(sourceUrl: string, width: number, height: number, gen: number) {
+  /**
+   * Without a seed: full page detection. With a seed (the outline tracked live): only snap its sides
+   * to the white sheet in the full photo, so the page never jumps somewhere else.
+   */
+  async function locatePage(sourceUrl: string, width: number, height: number, gen: number, seed?: Corners) {
     const cancelled = () => gen !== detectGen.current || userAdjustedRef.current
     if (cancelled()) {
       stopDetecting()
@@ -229,7 +233,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
         stopDetecting()
         return
       }
-      const found = detectDocumentCorners(image, width, height)
+      const found = seed ? { corners: refineToPaper(image, width, height, seed), detected: true } : detectDocumentCorners(image, width, height)
       if (cancelled() || !found.detected) {
         stopDetecting()
         return
@@ -270,7 +274,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
       setDraft(next)
       setBusy(null)
       setScreen('corners')
-      if (!live) scheduleLocate(normalized.url, normalized.width, normalized.height)
+      scheduleLocate(normalized.url, normalized.width, normalized.height, live ?? undefined)
     } catch (error) {
       if (normalized) URL.revokeObjectURL(normalized.url)
       setToast(errorMessage(error))

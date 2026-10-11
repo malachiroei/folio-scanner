@@ -493,6 +493,62 @@ function pushOut(points: Point[], amount: number): Point[] {
   })
 }
 
+function insideQuad(points: Point[], x: number, y: number, slack = 0): boolean {
+  let sign = 0
+  for (let i = 0; i < points.length; i += 1) {
+    const a = points[i]
+    const b = points[(i + 1) % points.length]
+    if (!a || !b) return false
+    const cross = (b.x - a.x) * (y - a.y) - (b.y - a.y) * (x - a.x)
+    const length = Math.hypot(b.x - a.x, b.y - a.y) || 1
+    if (Math.abs(cross / length) <= slack) continue
+    const current = cross > 0 ? 1 : -1
+    if (sign === 0) sign = current
+    else if (sign !== current) return false
+  }
+  return true
+}
+
+/**
+ * A white sheet on a darker board is a bright child inside a darker parent. When a strong
+ * candidate sits inside the chosen one and the ring between them is not paper (red board, tray
+ * rim, wall), the inner sheet is the page.
+ */
+function preferNested(sample: Sample, outer: Candidate, others: Candidate[]): Candidate {
+  const outerArea = polygonArea(outer.points)
+  const { data, width, height } = sample
+  let chosen = outer
+  let chosenArea = outerArea
+  for (const inner of others) {
+    if (inner === outer) continue
+    const area = polygonArea(inner.points)
+    if (area < outerArea * 0.4 || area >= outerArea * 0.97 || area <= chosenArea * 0.4) continue
+    if (inner.score < outer.score * 0.7) continue
+    const slack = Math.max(2, Math.min(width, height) * 0.01)
+    if (!inner.points.every((point) => insideQuad(outer.points, point.x, point.y, slack))) continue
+    let ring = 0
+    let paper = 0
+    const stride = Math.max(1, Math.round(Math.max(width, height) / 120))
+    for (let y = 0; y < height; y += stride) {
+      for (let x = 0; x < width; x += stride) {
+        if (!insideQuad(outer.points, x, y) || insideQuad(inner.points, x, y)) continue
+        const index = (y * width + x) * 4
+        const r = data[index] ?? 0
+        const g = data[index + 1] ?? 0
+        const b = data[index + 2] ?? 0
+        const max = Math.max(r, g, b)
+        ring += 1
+        if (max > 150 && (max - Math.min(r, g, b)) / Math.max(max, 1) < 0.2) paper += 1
+      }
+    }
+    if (ring < 12 || paper / ring > 0.35) continue
+    if (chosen === outer || area > chosenArea) {
+      chosen = inner
+      chosenArea = area
+    }
+  }
+  return chosen
+}
 function intersect(a: Point, da: Point, b: Point, db: Point): Point | null {
   const denominator = da.x * db.y - da.y * db.x
   if (Math.abs(denominator) < 1e-6) return null
@@ -527,6 +583,7 @@ function tightenQuad(sample: Sample, points: Point[]): Point[] {
   }
 
   let reference = 0
+  let referenceSaturation = 0
   let samples = 0
   for (const u of [0.3, 0.5, 0.7]) {
     for (const v of [0.3, 0.5, 0.7]) {
@@ -535,18 +592,44 @@ function tightenQuad(sample: Sample, points: Point[]): Point[] {
       const pixel = read(top.x + (bottom.x - top.x) * v, top.y + (bottom.y - top.y) * v)
       if (pixel) {
         reference += pixel.max
+        referenceSaturation += pixel.saturation
         samples += 1
       }
     }
   }
   if (samples === 0) return points
   reference /= samples
+  referenceSaturation /= samples
   const isPaper = (x: number, y: number) => {
     const pixel = read(x, y)
     return Boolean(pixel && pixel.max > reference * 0.62 && pixel.saturation < 0.35)
   }
 
+  // A clip, tab or sticker sitting on the sheet is a mid-bright, more colored patch than the paper
+  // (black print is dark, so text and table lines never count). A run of such pixels along a band
+  // means the side still touches an obstruction, so the side moves past it.
+  const isClean = (x: number, y: number) => {
+    const pixel = read(x, y)
+    if (!pixel) return false
+    return pixel.max <= reference * 0.6 || pixel.saturation < referenceSaturation + 0.07
+  }
+  const obstructed = (ax: number, ay: number, dx: number, dy: number, nx: number, ny: number, depth: number) => {
+    const steps = 48
+    let run = 0
+    let longest = 0
+    for (let step = 0; step <= steps; step += 1) {
+      const t = 0.04 + (0.92 * step) / steps
+      if (isClean(ax + dx * t + nx * depth, ay + dy * t + ny * depth)) run = 0
+      else {
+        run += 1
+        longest = Math.max(longest, run)
+      }
+    }
+    return longest / steps >= 0.14
+  }
+
   const maxShift = Math.max(2, Math.round(Math.min(width, height) * 0.08))
+  const maxClip = Math.max(3, Math.round(Math.min(width, height) * 0.12))
   const origins: Point[] = []
   const directions: Point[] = []
   for (let i = 0; i < 4; i += 1) {
@@ -580,6 +663,14 @@ function tightenQuad(sample: Sample, points: Point[]): Point[] {
       }
     }
     if (!found) shift = 0
+    else if (obstructed(a.x, a.y, dx, dy, nx, ny, shift + 1.5)) {
+      for (let s = shift + 1; s <= shift + maxClip; s += 1) {
+        if (!obstructed(a.x, a.y, dx, dy, nx, ny, s + 1.5)) {
+          shift = s
+          break
+        }
+      }
+    }
     origins.push({ x: a.x + nx * shift, y: a.y + ny * shift })
     directions.push({ x: dx, y: dy })
   }
@@ -635,6 +726,7 @@ export function detectDocumentCorners(
     const passes = options.live ? masks.slice(0, 3) : masks
     let fallback: Candidate | null = null
     let best: Candidate | null = null
+    const inside: Candidate[] = []
     for (const build of passes) {
       const blobs = rankBlobs(close(build(), sample.width, sample.height, scale), sample.width, sample.height)
       for (const blob of blobs) {
@@ -642,16 +734,18 @@ export function detectDocumentCorners(
           if (!fallback || blob.score > fallback.score) fallback = blob
           continue
         }
+        inside.push(blob)
         if (!best || blob.score > best.score) best = blob
       }
     }
+    if (best) best = preferNested(sample, best, inside)
     let points: Point[] | null = best ? best.points : null
     if (!points) {
       // White sheet on a white desk: the brightness passes see one big blob touching the frame.
       // Look for the sheet's own boundary instead, and ignore regions that run off the photo.
       const regions = rankBlobs(edgeRegions(sample, scale), sample.width, sample.height)
-      const inside = regions.find((blob) => blob.touching < 2)
-      if (inside) points = pushOut(inside.points, 2 * scale + 1)
+      const region = regions.find((blob) => blob.touching < 2)
+      if (region) points = pushOut(region.points, 2 * scale + 1)
     }
     if (!points && fallback) points = fallback.points
     if (points) {
@@ -663,5 +757,29 @@ export function detectDocumentCorners(
   } catch (error) {
     console.error(error)
     return missed
+  }
+}
+
+/**
+ * Snaps approximate corners (for example the outline tracked on the live camera, which may sit
+ * on a colored board or on a clip) to the white sheet itself in the full photo. Only moves
+ * sides inward; falls back to the given corners when the result would be implausible.
+ */
+export function refineToPaper(image: CanvasImageSource, width: number, height: number, seed: Corners): Corners {
+  try {
+    const sample = takeSample(image, DETECT_MAX)
+    if (!sample) return seed
+    const points = [seed.tl, seed.tr, seed.br, seed.bl].map((point) =>
+      scaleUp(point, width, height, sample.width, sample.height),
+    )
+    const refined = tightenQuad(sample, points)
+    const corners = orderCorners(refined.map((point) => scaleUp(point, sample.width, sample.height, width, height)))
+    const before = polygonArea([seed.tl, seed.tr, seed.br, seed.bl])
+    const after = polygonArea([corners.tl, corners.tr, corners.br, corners.bl])
+    if (!cornersValid(corners, width, height) || after < before * 0.6) return seed
+    return corners
+  } catch (error) {
+    console.error(error)
+    return seed
   }
 }

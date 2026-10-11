@@ -350,7 +350,7 @@ async function filterMagic(image: ImageData) {
 
 /**
  * Ink curve on the shadow-flattened, sharpened page. A steep gamma darkens antialiased text and
- * thin grid lines toward black; anything within ~8% of the paper level snaps to pure #FFFFFF.
+ * thin grid lines toward black; anything within ~20% of the paper level (faint shading, noise, JPEG haze) snaps to pure #FFFFFF.
  * Strongly colored pixels (stamps, logos, signatures) keep their hue.
  */
 async function inkCurve(image: ImageData) {
@@ -358,8 +358,8 @@ async function inkCurve(image: ImageData) {
   const lut = new Uint8ClampedArray(256)
   for (let level = 0; level < 256; level += 1) {
     const s = Math.min(1, Math.max(0, (level - 24) / (214 - 24)))
-    const toWhite = smoothstep(0.84, 0.96, s)
-    lut[level] = 255 * (s ** 2.3 * (1 - toWhite) + toWhite)
+    const toWhite = smoothstep(0.72, 0.88, s)
+    lut[level] = 255 * (s ** 2.6 * (1 - toWhite) + toWhite)
   }
   for (let y = 0; y < height; y += 1) {
     if (y % 64 === 0) await nextFrame()
@@ -484,6 +484,17 @@ export function desaturateCanvas(canvas: HTMLCanvasElement): HTMLCanvasElement {
   return canvas
 }
 
+/**
+ * Pulls the corners a hair toward the center (0.4% per side) so a sliver of board, clip shadow or
+ * table that the corner snap could not remove never reaches the edge of the A4 output.
+ */
+function insetCorners(corners: Corners, amount = 0.004): Corners {
+  const cx = (corners.tl.x + corners.tr.x + corners.br.x + corners.bl.x) / 4
+  const cy = (corners.tl.y + corners.tr.y + corners.br.y + corners.bl.y) / 4
+  const pull = (point: Point): Point => ({ x: point.x + (cx - point.x) * amount * 2, y: point.y + (cy - point.y) * amount * 2 })
+  return { tl: pull(corners.tl), tr: pull(corners.tr), br: pull(corners.br), bl: pull(corners.bl) }
+}
+
 export async function straightenCanvas(
   image: CanvasImageSource,
   corners: Corners,
@@ -495,7 +506,7 @@ export async function straightenCanvas(
   const height = Math.max(32, Math.round(fitted.height * scale))
   const copy = drawSource(image)
   try {
-    return await warpCanvas(copy, corners, width, height, deadlineAt)
+    return await warpCanvas(copy, insetCorners(corners), width, height, deadlineAt)
   } finally {
     // Release the full-size working copy right away so phones do not hold ~30MB until GC.
     copy.width = 0
