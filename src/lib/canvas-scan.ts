@@ -39,18 +39,26 @@ const MIN_EDGE = 2800
 const MAX_EDGE = 3508
 const MAX_UPSCALE = 3
 
-/** Global paper-white + black-point levels — never a local photo mean. */
+/** Paper white stays global; photo contrast is per-component, never page-wide. */
 const LIGHT_GRID = 8
 const WHITE_PERCENTILE = 0.95
-const BLACK_PERCENTILE = 0.05
 const PAPER_FLOOR = 200
-const PAPER_LO = 220
-const BLACK_POINT = 35
-const BLACK_MIN = 28
-const BLACK_MAX = 42
-const SAT_BOOST = 1.35
-const GREY_CHROMA = 8
-const SHARPEN_AMOUNT = 1.25
+const PHOTO_RANGE = 32
+const PHOTO_SEED_MEAN = 195
+const PHOTO_SEED_MIN = 150
+const PHOTO_FILL_MEAN = 185
+const PHOTO_FILL_DARK = 130
+const PHOTO_DILATE = 3
+const PHOTO_P_LO = 0.02
+const PHOTO_P_HI = 0.98
+const PHOTO_MIN_SPAN = 24
+const PHOTO_MIN_PIXELS = 2500
+const SAT_BOOST = 1.5
+const SAT_KEEP = 0.05
+const SAT_WHITE = 0.04
+const L_TINT = 0.7
+const L_WHITE = 0.82
+const SHARPEN_AMOUNT = 1.4
 const SHARPEN_THRESHOLD = 3
 const BW_THRESHOLD = 148
 const YIELD_MS = 24
@@ -237,34 +245,7 @@ async function warpCanvas(
   return canvas
 }
 
-/* ---------- Global paper-white Magic Color (CamScanner baseline) ---------- */
-
-function smoothstep(t: number) {
-  const x = t < 0 ? 0 : t > 1 ? 1 : t
-  return x * x * (3 - 2 * x)
-}
-
-/**
- * After two-point levels: midtone S-curve for photo punch, then paper
- * above 220 rolls to #FFFFFF. Blacks are already at the floor from levels.
- */
-function magicCurve(luma: number) {
-  const n = luma / 255
-  const s = n < 0.5 ? 2 * n * n : 1 - 2 * (1 - n) * (1 - n)
-  const contrasted = (n * 0.45 + s * 0.55) * 255
-  if (contrasted > PAPER_LO) {
-    return contrasted + (255 - contrasted) * smoothstep((contrasted - PAPER_LO) / 18)
-  }
-  return contrasted
-}
-
-function buildMagicLut() {
-  const lut = new Float32Array(256)
-  for (let i = 0; i < 256; i += 1) lut[i] = magicCurve(i)
-  return lut
-}
-
-const MAGIC_LUT = buildMagicLut()
+/* ---------- Deterministic Magic Color: paper white + per-photo min/max ---------- */
 
 async function yieldBusy(clock: { last: number }) {
   if (performance.now() - clock.last < YIELD_MS) return
@@ -290,6 +271,43 @@ function histPercentile(hist: Uint32Array, total: number, q: number) {
   return 255
 }
 
+function rgbToHsl(r: number, g: number, b: number): [number, number, number] {
+  const red = r / 255
+  const green = g / 255
+  const blue = b / 255
+  const max = Math.max(red, green, blue)
+  const min = Math.min(red, green, blue)
+  const light = (max + min) / 2
+  if (max - min < 1e-6) return [0, 0, light]
+  const delta = max - min
+  const sat = light > 0.5 ? delta / (2 - max - min) : delta / (max + min)
+  let hue = 0
+  if (max === red) hue = ((green - blue) / delta + (green < blue ? 6 : 0)) / 6
+  else if (max === green) hue = ((blue - red) / delta + 2) / 6
+  else hue = ((red - green) / delta + 4) / 6
+  return [hue, sat, light]
+}
+
+function hueToRgb(p: number, q: number, t: number) {
+  let tone = t
+  if (tone < 0) tone += 1
+  if (tone > 1) tone -= 1
+  if (tone < 1 / 6) return p + (q - p) * 6 * tone
+  if (tone < 1 / 2) return q
+  if (tone < 2 / 3) return p + (q - p) * (2 / 3 - tone) * 6
+  return p
+}
+
+function hslToRgb(h: number, s: number, l: number): [number, number, number] {
+  if (s <= 1e-6) {
+    const tone = l * 255
+    return [tone, tone, tone]
+  }
+  const q = l < 0.5 ? l * (1 + s) : l + s - l * s
+  const p = 2 * l - q
+  return [hueToRgb(p, q, h + 1 / 3) * 255, hueToRgb(p, q, h) * 255, hueToRgb(p, q, h - 1 / 3) * 255]
+}
+
 /** 95th-percentile luminance of the whole page — the true paper white. */
 function pageWhitePoint(luma: Float32Array) {
   const hist = new Uint32Array(256)
@@ -297,31 +315,6 @@ function pageWhitePoint(luma: Float32Array) {
     hist[Math.min(255, Math.max(0, Math.round(luma[i] ?? 0)))] += 1
   }
   return Math.max(PAPER_FLOOR, histPercentile(hist, luma.length, WHITE_PERCENTILE))
-}
-
-/**
- * Black floor after white-normalization. Uses the 5th percentile when it
- * looks like ink/shadow (~28–42), otherwise the CamScanner-style floor of 35
- * so haze at 50–60 drops to a real black without crushing midtones.
- */
-function pageBlackPoint(luma: Float32Array, grid: Float32Array, width: number, height: number) {
-  const hist = new Uint32Array(256)
-  for (let y = 0; y < height; y += 1) {
-    const row = y * width
-    for (let x = 0; x < width; x += 1) {
-      const paper = localPaperWhite(grid, x, y, width, height)
-      const norm = Math.min(255, Math.max(0, ((luma[row + x] ?? 0) / paper) * 255))
-      hist[norm | 0] += 1
-    }
-  }
-  const measured = histPercentile(hist, luma.length, BLACK_PERCENTILE)
-  if (measured < 12 || measured > 48) return BLACK_POINT
-  return Math.min(BLACK_MAX, Math.max(BLACK_MIN, measured))
-}
-
-function stretchLevels(normL: number, blackPoint: number) {
-  const span = Math.max(1, 255 - blackPoint)
-  return Math.min(255, Math.max(0, ((normL - blackPoint) / span) * 255))
 }
 
 /**
@@ -374,20 +367,162 @@ function localPaperWhite(grid: Float32Array, x: number, y: number, width: number
   return Math.max(PAPER_FLOOR, (a * (1 - tx) + b * tx) * (1 - ty) + (c * (1 - tx) + d * tx) * ty)
 }
 
+function photoCellIndex(x: number, y: number, width: number, height: number, cols: number, rows: number) {
+  const gx = Math.min(cols - 1, ((x * cols) / width) | 0)
+  const gy = Math.min(rows - 1, ((y * rows) / height) | 0)
+  return gy * cols + gx
+}
+
+function dilatePhotoMask(mask: Uint8Array, fill: Uint8Array, cols: number, rows: number) {
+  let current = mask
+  for (let pass = 0; pass < PHOTO_DILATE; pass += 1) {
+    const next = new Uint8Array(current)
+    for (let y = 0; y < rows; y += 1) {
+      for (let x = 0; x < cols; x += 1) {
+        const i = y * cols + x
+        if (current[i] || !fill[i]) continue
+        if (
+          (x > 0 && current[i - 1]) ||
+          (x + 1 < cols && current[i + 1]) ||
+          (y > 0 && current[i - cols]) ||
+          (y + 1 < rows && current[i + cols])
+        ) {
+          next[i] = 1
+        }
+      }
+    }
+    current = next
+  }
+  return current
+}
+
+function labelPhotoCells(mask: Uint8Array, cols: number, rows: number) {
+  const labels = new Int32Array(mask.length)
+  const stack = new Int32Array(mask.length)
+  let count = 0
+  for (let start = 0; start < mask.length; start += 1) {
+    if (!mask[start] || labels[start]) continue
+    count += 1
+    let top = 0
+    stack[top++] = start
+    labels[start] = count
+    while (top > 0) {
+      const i = stack[--top] ?? 0
+      const x = i % cols
+      const y = (i / cols) | 0
+      const neighbors = [
+        x > 0 ? i - 1 : -1,
+        x + 1 < cols ? i + 1 : -1,
+        y > 0 ? i - cols : -1,
+        y + 1 < rows ? i + cols : -1,
+      ]
+      for (const next of neighbors) {
+        if (next < 0 || !mask[next] || labels[next]) continue
+        labels[next] = count
+        stack[top++] = next
+      }
+    }
+  }
+  return { labels, count }
+}
+
 /**
- * White-normalize against paper, then stretch black→white so tires/ink drop
- * to punchy darks. Midtone S-curve and 1.35× vibrance restore photo color
- * without touching near-greys or the cleaned paper.
+ * Photo components from textured cells (not white paper). Each component
+ * gets its own 2nd/98th luminance bounds so night cars stretch to real
+ * black/white instead of inheriting the page-wide paper percentile.
+ */
+function photoLevels(norm: Float32Array, width: number, height: number) {
+  const cols = Math.max(8, Math.round(width / Math.max(32, Math.round(Math.min(width, height) / 64))))
+  const rows = Math.max(8, Math.round(height / Math.max(32, Math.round(Math.min(width, height) / 64))))
+  const cells = cols * rows
+  const mins = new Float32Array(cells).fill(255)
+  const maxs = new Float32Array(cells)
+  const sums = new Float32Array(cells)
+  const counts = new Uint32Array(cells)
+
+  for (let y = 0; y < height; y += 1) {
+    const row = y * width
+    for (let x = 0; x < width; x += 1) {
+      const i = photoCellIndex(x, y, width, height, cols, rows)
+      const value = norm[row + x] ?? 0
+      if (value < (mins[i] ?? 255)) mins[i] = value
+      if (value > (maxs[i] ?? 0)) maxs[i] = value
+      sums[i] = (sums[i] ?? 0) + value
+      counts[i] = (counts[i] ?? 0) + 1
+    }
+  }
+
+  const seed = new Uint8Array(cells)
+  const fill = new Uint8Array(cells)
+  for (let i = 0; i < cells; i += 1) {
+    const n = counts[i] ?? 0
+    if (n < 1) continue
+    const mean = (sums[i] ?? 0) / n
+    const range = (maxs[i] ?? 0) - (mins[i] ?? 255)
+    if (range >= PHOTO_RANGE && mean < PHOTO_SEED_MEAN && (mins[i] ?? 255) < PHOTO_SEED_MIN) seed[i] = 1
+    if (mean < PHOTO_FILL_MEAN || ((mins[i] ?? 255) < PHOTO_FILL_DARK && mean < 200)) fill[i] = 1
+  }
+
+  const { labels, count } = labelPhotoCells(dilatePhotoMask(seed, fill, cols, rows), cols, rows)
+  const hists = Array.from({ length: count + 1 }, () => new Uint32Array(256))
+  const totals = new Uint32Array(count + 1)
+  for (let y = 0; y < height; y += 1) {
+    const row = y * width
+    for (let x = 0; x < width; x += 1) {
+      const id = labels[photoCellIndex(x, y, width, height, cols, rows)] ?? 0
+      if (id < 1) continue
+      hists[id][Math.min(255, Math.max(0, (norm[row + x] ?? 0) | 0))] += 1
+      totals[id] += 1
+    }
+  }
+
+  const lo = new Float32Array(count + 1)
+  const hi = new Float32Array(count + 1)
+  for (let id = 1; id <= count; id += 1) {
+    const total = totals[id] ?? 0
+    const hist = hists[id]
+    if (!hist || total < PHOTO_MIN_PIXELS) {
+      lo[id] = 0
+      hi[id] = 255
+      continue
+    }
+    const low = histPercentile(hist, total, PHOTO_P_LO)
+    const high = histPercentile(hist, total, PHOTO_P_HI)
+    if (high - low < PHOTO_MIN_SPAN) {
+      lo[id] = 0
+      hi[id] = 255
+      continue
+    }
+    lo[id] = low
+    hi[id] = high
+  }
+
+  return { labels, cols, rows, lo, hi }
+}
+
+function stretchPhotoLuma(normL: number, id: number, lo: Float32Array, hi: Float32Array) {
+  if (id < 1) return normL
+  const min = lo[id] ?? 0
+  const max = hi[id] ?? 255
+  const span = Math.max(1, max - min)
+  return Math.min(255, Math.max(0, ((normL - min) / span) * 255))
+}
+
+/**
+ * Paper: white-normalize only. Photos: min/max stretch inside the component.
+ * Then HSL — tinted highlights keep hue (sat ×1.5); only near-grey paper
+ * with L > 0.82 becomes #FFFFFF.
  */
 async function applyToneAndColor(
   data: Uint8ClampedArray,
   luma: Float32Array,
   grid: Float32Array,
-  blackPoint: number,
+  photos: ReturnType<typeof photoLevels>,
   width: number,
   height: number,
   clock: { last: number },
 ) {
+  const { labels, cols, rows, lo, hi } = photos
   for (let y = 0; y < height; y += 1) {
     if (y % 48 === 0) await yieldBusy(clock)
     let p = y * width
@@ -399,8 +534,8 @@ async function applyToneAndColor(
       const srcL = luma[p] ?? 0
       const paper = localPaperWhite(grid, x, y, width, height)
       const normL = Math.min(255, Math.max(0, (srcL / paper) * 255))
-      const stretched = stretchLevels(normL, blackPoint)
-      const next = MAGIC_LUT[stretched | 0] ?? stretched
+      const id = labels[photoCellIndex(x, y, width, height, cols, rows)] ?? 0
+      const next = stretchPhotoLuma(normL, id, lo, hi)
 
       let outR: number
       let outG: number
@@ -416,26 +551,34 @@ async function applyToneAndColor(
         outB = next
       }
 
-      const paperMix = next > PAPER_LO ? smoothstep((next - PAPER_LO) / (255 - PAPER_LO)) : 0
-      if (paperMix > 0) {
-        const keep = 1 - paperMix
-        outR = next + (outR - next) * keep
-        outG = next + (outG - next) * keep
-        outB = next + (outB - next) * keep
+      const [hue, sat, light] = rgbToHsl(outR, outG, outB)
+      if (sat > SAT_KEEP && light > L_TINT) {
+        const [toneR, toneG, toneB] = hslToRgb(hue, Math.min(1, sat * SAT_BOOST), light)
+        data[i] = Math.min(255, Math.max(0, toneR))
+        data[i + 1] = Math.min(255, Math.max(0, toneG))
+        data[i + 2] = Math.min(255, Math.max(0, toneB))
+        data[i + 3] = 255
+        continue
+      }
+      if (sat < SAT_WHITE && light > L_WHITE) {
+        data[i] = 255
+        data[i + 1] = 255
+        data[i + 2] = 255
+        data[i + 3] = 255
+        continue
       }
 
-      const chroma = Math.max(outR, outG, outB) - Math.min(outR, outG, outB)
-      const sat = chroma < GREY_CHROMA ? 1 : 1 + (SAT_BOOST - 1) * (1 - paperMix)
-      const mid = 0.299 * outR + 0.587 * outG + 0.114 * outB
-      data[i] = Math.min(255, Math.max(0, mid + (outR - mid) * sat))
-      data[i + 1] = Math.min(255, Math.max(0, mid + (outG - mid) * sat))
-      data[i + 2] = Math.min(255, Math.max(0, mid + (outB - mid) * sat))
+      const keepSat = sat > SAT_KEEP ? Math.min(1, sat * SAT_BOOST) : sat
+      const [toneR, toneG, toneB] = hslToRgb(hue, keepSat, light)
+      data[i] = Math.min(255, Math.max(0, toneR))
+      data[i + 1] = Math.min(255, Math.max(0, toneG))
+      data[i + 2] = Math.min(255, Math.max(0, toneB))
       data[i + 3] = 255
     }
   }
 }
 
-/** 3×3 unsharp on luminance. Amount 1.25 / threshold 3 for Magic Color; gentler for warp. */
+/** 3×3 unsharp on luminance. Amount 1.4 / threshold 3 for Magic Color; gentler for warp. */
 function sharpen3x3(image: ImageData, amount: number, threshold = 1.2) {
   const { data, width, height } = image
   const gray = new Float32Array(width * height)
@@ -460,14 +603,27 @@ function sharpen3x3(image: ImageData, amount: number, threshold = 1.2) {
   }
 }
 
+function normalizePage(luma: Float32Array, grid: Float32Array, width: number, height: number) {
+  const norm = new Float32Array(luma.length)
+  for (let y = 0; y < height; y += 1) {
+    const row = y * width
+    for (let x = 0; x < width; x += 1) {
+      const paper = localPaperWhite(grid, x, y, width, height)
+      norm[row + x] = Math.min(255, Math.max(0, ((luma[row + x] ?? 0) / paper) * 255))
+    }
+  }
+  return norm
+}
+
 async function applyMagicColor(image: ImageData) {
   const { data, width, height } = image
   const clock = { last: performance.now() }
   const luma = extractLuma(data, width * height)
   const whitePoint = pageWhitePoint(luma)
   const grid = paperWhiteGrid(luma, width, height, whitePoint)
-  const blackPoint = pageBlackPoint(luma, grid, width, height)
-  await applyToneAndColor(data, luma, grid, blackPoint, width, height, clock)
+  const norm = normalizePage(luma, grid, width, height)
+  const photos = photoLevels(norm, width, height)
+  await applyToneAndColor(data, luma, grid, photos, width, height, clock)
   sharpen3x3(image, SHARPEN_AMOUNT, SHARPEN_THRESHOLD)
 }
 
@@ -477,15 +633,15 @@ async function applyFastBlackWhite(image: ImageData) {
   const luma = extractLuma(data, width * height)
   const whitePoint = pageWhitePoint(luma)
   const grid = paperWhiteGrid(luma, width, height, whitePoint)
-  const blackPoint = pageBlackPoint(luma, grid, width, height)
+  const norm = normalizePage(luma, grid, width, height)
+  const photos = photoLevels(norm, width, height)
   for (let y = 0; y < height; y += 1) {
     if (y % 48 === 0) await yieldBusy(clock)
     let p = y * width
     let i = p * 4
     for (let x = 0; x < width; x += 1, p += 1, i += 4) {
-      const paper = localPaperWhite(grid, x, y, width, height)
-      const normL = Math.min(255, Math.max(0, ((luma[p] ?? 0) / paper) * 255))
-      const stretched = stretchLevels(normL, blackPoint)
+      const id = photos.labels[photoCellIndex(x, y, width, height, photos.cols, photos.rows)] ?? 0
+      const stretched = stretchPhotoLuma(norm[p] ?? 0, id, photos.lo, photos.hi)
       const ink = stretched < BW_THRESHOLD ? 0 : 255
       data[i] = ink
       data[i + 1] = ink
