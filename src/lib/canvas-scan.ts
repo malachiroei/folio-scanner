@@ -39,21 +39,18 @@ const MIN_EDGE = 2800
 const MAX_EDGE = 3508
 const MAX_UPSCALE = 3
 
-/** Illumination on a tiny copy so a max-filter can jump across dark photo blocks. */
-const LIGHT_WIDTH = 96
-const LIGHT_MAX = 22
-const LIGHT_BLUR = 6
-const TEX_WIDTH = 280
-const PAPER_FLAT = 9
-const PHOTO_VAR = 12
-const PAPER_KNEE = 225
-const PHOTO_BLACK = 26
-const PHOTO_WHITE = 240
-const SHADOW_CEIL = 140
-const SHADOW_GAMMA = 1.22
-const SAT_BOOST = 1.6
-const TINT_LUMA = 180
-const TINT_SAT = 8
+/** Native-scale illumination blur (two box passes ≈ Gaussian). Never downsample the page. */
+const LIGHT_RADIUS = 40
+const LIGHT_PASSES = 2
+const FLAT_EPS = 1
+const PAPER_LO = 215
+const INK_HI = 90
+const INK_BLACK = 10
+const MID_GAMMA = 1.1
+const SAT_BOOST = 1.35
+const SHARPEN_AMOUNT = 0.5
+const BW_THRESHOLD = 148
+const YIELD_MS = 24
 
 function sourceSize(image: CanvasImageSource): { width: number; height: number } {
   if (image instanceof HTMLImageElement) {
@@ -237,370 +234,163 @@ async function warpCanvas(
   return canvas
 }
 
-/* ---------- CamScanner Magic Color (max-filter paper light + variance gate) ---------- */
+/* ---------- Frequency-separation Magic Color (full native resolution) ---------- */
 
-function downsample(source: HTMLCanvasElement, width: number, height: number): HTMLCanvasElement {
-  const canvas = document.createElement('canvas')
-  canvas.width = width
-  canvas.height = height
-  const context = canvas.getContext('2d', { willReadFrequently: true })
-  if (!context) return canvas
-  context.imageSmoothingEnabled = true
-  context.imageSmoothingQuality = 'medium'
-  context.drawImage(source, 0, 0, width, height)
-  return canvas
+function smoothstep(t: number) {
+  const x = t < 0 ? 0 : t > 1 ? 1 : t
+  return x * x * (3 - 2 * x)
 }
 
-function upsample(source: HTMLCanvasElement, width: number, height: number): ImageData {
-  const canvas = document.createElement('canvas')
-  canvas.width = width
-  canvas.height = height
-  const context = canvas.getContext('2d', { willReadFrequently: true })
-  if (!context) return new ImageData(width, height)
-  context.imageSmoothingEnabled = true
-  context.imageSmoothingQuality = 'high'
-  context.drawImage(source, 0, 0, width, height)
-  return context.getImageData(0, 0, width, height)
-}
-
-/** Separable max (dilation). Dark text / photo blocks do not pull the paper estimate down. */
-function maxFilterRgba(image: ImageData, radius: number) {
-  const { data, width, height } = image
-  const tmp = new Uint8ClampedArray(data.length)
-  for (let y = 0; y < height; y += 1) {
-    const row = y * width * 4
-    for (let x = 0; x < width; x += 1) {
-      let mr = 0
-      let mg = 0
-      let mb = 0
-      const x0 = Math.max(0, x - radius)
-      const x1 = Math.min(width - 1, x + radius)
-      for (let k = x0; k <= x1; k += 1) {
-        const i = row + k * 4
-        const r = data[i] ?? 0
-        const g = data[i + 1] ?? 0
-        const b = data[i + 2] ?? 0
-        if (r > mr) mr = r
-        if (g > mg) mg = g
-        if (b > mb) mb = b
-      }
-      const o = row + x * 4
-      tmp[o] = mr
-      tmp[o + 1] = mg
-      tmp[o + 2] = mb
-      tmp[o + 3] = 255
-    }
+/**
+ * Global S-curve after flatten: ink to #0A0A0A, paper rolled to #FFFFFF,
+ * midtones (photos, stamps, charts) kept with a gentle gamma 1.1 lift.
+ */
+function magicCurve(luma: number) {
+  if (luma < INK_HI) {
+    const t = luma / INK_HI
+    return INK_BLACK + (INK_HI - INK_BLACK) * t ** 1.35
   }
-  for (let x = 0; x < width; x += 1) {
-    for (let y = 0; y < height; y += 1) {
-      let mr = 0
-      let mg = 0
-      let mb = 0
-      const y0 = Math.max(0, y - radius)
-      const y1 = Math.min(height - 1, y + radius)
-      for (let k = y0; k <= y1; k += 1) {
-        const i = (k * width + x) * 4
-        const r = tmp[i] ?? 0
-        const g = tmp[i + 1] ?? 0
-        const b = tmp[i + 2] ?? 0
-        if (r > mr) mr = r
-        if (g > mg) mg = g
-        if (b > mb) mb = b
-      }
-      const o = (y * width + x) * 4
-      data[o] = mr
-      data[o + 1] = mg
-      data[o + 2] = mb
-      data[o + 3] = 255
-    }
+  if (luma > PAPER_LO) {
+    return luma + (255 - luma) * smoothstep((luma - PAPER_LO) / 22)
   }
+  const n = (luma - INK_HI) / (PAPER_LO - INK_HI)
+  return INK_HI + (PAPER_LO - INK_HI) * n ** (1 / MID_GAMMA)
 }
 
-/** Two-pass sliding-window box blur on a small RGBA buffer. */
-function boxBlurRgba(image: ImageData, radius: number) {
-  const { data, width, height } = image
-  const tmp = new Uint8ClampedArray(data.length)
+function buildMagicLut() {
+  const lut = new Float32Array(256)
+  for (let i = 0; i < 256; i += 1) lut[i] = magicCurve(i)
+  return lut
+}
+
+const MAGIC_LUT = buildMagicLut()
+
+async function yieldBusy(clock: { last: number }) {
+  if (performance.now() - clock.last < YIELD_MS) return
+  await nextFrame()
+  clock.last = performance.now()
+}
+
+function extractLuma(data: Uint8ClampedArray, count: number) {
+  const luma = new Float32Array(count)
+  for (let p = 0, i = 0; p < count; p += 1, i += 4) {
+    luma[p] = 0.299 * (data[i] ?? 0) + 0.587 * (data[i + 1] ?? 0) + 0.114 * (data[i + 2] ?? 0)
+  }
+  return luma
+}
+
+/** Sliding-window separable box blur on a full-resolution luminance plane. */
+async function boxBlurChannel(
+  src: Float32Array,
+  width: number,
+  height: number,
+  radius: number,
+  clock: { last: number },
+): Promise<Float32Array> {
+  const tmp = new Float32Array(src.length)
+  const out = new Float32Array(src.length)
   const span = radius * 2 + 1
+
   for (let y = 0; y < height; y += 1) {
-    const row = y * width * 4
-    let sr = 0
-    let sg = 0
-    let sb = 0
+    if (y % 48 === 0) await yieldBusy(clock)
+    const row = y * width
+    let sum = 0
     for (let k = -radius; k <= radius; k += 1) {
-      const x = Math.min(width - 1, Math.max(0, k)) * 4
-      sr += data[row + x] ?? 0
-      sg += data[row + x + 1] ?? 0
-      sb += data[row + x + 2] ?? 0
+      sum += src[row + Math.min(width - 1, Math.max(0, k))] ?? 0
     }
     for (let x = 0; x < width; x += 1) {
-      const i = row + x * 4
-      tmp[i] = sr / span
-      tmp[i + 1] = sg / span
-      tmp[i + 2] = sb / span
-      tmp[i + 3] = 255
-      const add = Math.min(width - 1, x + radius + 1) * 4
-      const rem = Math.max(0, x - radius) * 4
-      sr += (data[row + add] ?? 0) - (data[row + rem] ?? 0)
-      sg += (data[row + add + 1] ?? 0) - (data[row + rem + 1] ?? 0)
-      sb += (data[row + add + 2] ?? 0) - (data[row + rem + 2] ?? 0)
+      tmp[row + x] = sum / span
+      const addX = Math.min(width - 1, x + radius + 1)
+      const remX = Math.max(0, x - radius)
+      sum += (src[row + addX] ?? 0) - (src[row + remX] ?? 0)
     }
   }
+
   for (let x = 0; x < width; x += 1) {
-    let sr = 0
-    let sg = 0
-    let sb = 0
+    if (x % 48 === 0) await yieldBusy(clock)
+    let sum = 0
     for (let k = -radius; k <= radius; k += 1) {
       const y = Math.min(height - 1, Math.max(0, k))
-      const i = (y * width + x) * 4
-      sr += tmp[i] ?? 0
-      sg += tmp[i + 1] ?? 0
-      sb += tmp[i + 2] ?? 0
+      sum += tmp[y * width + x] ?? 0
     }
     for (let y = 0; y < height; y += 1) {
-      const i = (y * width + x) * 4
-      data[i] = sr / span
-      data[i + 1] = sg / span
-      data[i + 2] = sb / span
-      data[i + 3] = 255
+      out[y * width + x] = sum / span
       const addY = Math.min(height - 1, y + radius + 1)
       const remY = Math.max(0, y - radius)
-      sr += (tmp[(addY * width + x) * 4] ?? 0) - (tmp[(remY * width + x) * 4] ?? 0)
-      sg += (tmp[(addY * width + x) * 4 + 1] ?? 0) - (tmp[(remY * width + x) * 4 + 1] ?? 0)
-      sb += (tmp[(addY * width + x) * 4 + 2] ?? 0) - (tmp[(remY * width + x) * 4 + 2] ?? 0)
-    }
-  }
-}
-
-function morphChannel(values: Uint8Array, width: number, height: number, radius: number, dilate: boolean): Uint8Array {
-  const tmp = new Uint8Array(values.length)
-  const out = new Uint8Array(values.length)
-  for (let y = 0; y < height; y += 1) {
-    const row = y * width
-    for (let x = 0; x < width; x += 1) {
-      let best = dilate ? 0 : 255
-      const x0 = Math.max(0, x - radius)
-      const x1 = Math.min(width - 1, x + radius)
-      for (let k = x0; k <= x1; k += 1) {
-        const value = values[row + k] ?? 0
-        if (dilate ? value > best : value < best) best = value
-      }
-      tmp[row + x] = best
-    }
-  }
-  for (let x = 0; x < width; x += 1) {
-    for (let y = 0; y < height; y += 1) {
-      let best = dilate ? 0 : 255
-      const y0 = Math.max(0, y - radius)
-      const y1 = Math.min(height - 1, y + radius)
-      for (let k = y0; k <= y1; k += 1) {
-        const value = tmp[k * width + x] ?? 0
-        if (dilate ? value > best : value < best) best = value
-      }
-      out[y * width + x] = best
+      sum += (tmp[addY * width + x] ?? 0) - (tmp[remY * width + x] ?? 0)
     }
   }
   return out
 }
 
-/** 5×5 luminance range — paper is flat, photos keep a midtone spread, ink is a thin spike. */
-function localRange(image: ImageData): Uint8Array {
-  const { data, width, height } = image
-  const gray = new Uint8Array(width * height)
-  for (let i = 0, p = 0; p < gray.length; p += 1, i += 4) {
-    gray[p] = 0.299 * (data[i] ?? 0) + 0.587 * (data[i + 1] ?? 0) + 0.114 * (data[i + 2] ?? 0)
+/** Low-frequency paper lighting at native resolution — no shrink/stretch. */
+async function illuminationSurface(luma: Float32Array, width: number, height: number, clock: { last: number }) {
+  const radius = Math.max(1, Math.min(LIGHT_RADIUS, Math.floor((Math.min(width, height) - 1) / 2)))
+  let background = luma
+  for (let pass = 0; pass < LIGHT_PASSES; pass += 1) {
+    background = await boxBlurChannel(background, width, height, radius, clock)
   }
-  const range = new Uint8Array(width * height)
-  for (let y = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) {
-      let lo = 255
-      let hi = 0
-      for (let dy = -2; dy <= 2; dy += 1) {
-        const yy = Math.min(height - 1, Math.max(0, y + dy))
-        for (let dx = -2; dx <= 2; dx += 1) {
-          const xx = Math.min(width - 1, Math.max(0, x + dx))
-          const value = gray[yy * width + xx] ?? 0
-          if (value < lo) lo = value
-          if (value > hi) hi = value
-        }
-      }
-      range[y * width + x] = hi - lo
-    }
-  }
-  return range
-}
-
-function paintChannel(values: Uint8Array, width: number, height: number): HTMLCanvasElement {
-  const canvas = document.createElement('canvas')
-  canvas.width = width
-  canvas.height = height
-  const context = canvas.getContext('2d', { willReadFrequently: true })
-  if (!context) return canvas
-  const image = context.createImageData(width, height)
-  const data = image.data
-  for (let p = 0, i = 0; p < values.length; p += 1, i += 4) {
-    const value = values[p] ?? 0
-    data[i] = value
-    data[i + 1] = value
-    data[i + 2] = value
-    data[i + 3] = 255
-  }
-  context.putImageData(image, 0, 0)
-  return canvas
-}
-
-/** 80th-percentile of each channel — the actual paper white, ignoring dark blocks. */
-function paperPercentile(image: ImageData): [number, number, number] {
-  const { data } = image
-  const histR = new Uint32Array(256)
-  const histG = new Uint32Array(256)
-  const histB = new Uint32Array(256)
-  const pixels = data.length / 4
-  for (let i = 0; i < data.length; i += 4) {
-    histR[data[i] ?? 0] += 1
-    histG[data[i + 1] ?? 0] += 1
-    histB[data[i + 2] ?? 0] += 1
-  }
-  const pick = (hist: Uint32Array) => {
-    const target = pixels * 0.8
-    let acc = 0
-    for (let value = 0; value < 256; value += 1) {
-      acc += hist[value] ?? 0
-      if (acc >= target) return value
-    }
-    return 255
-  }
-  return [pick(histR), pick(histG), pick(histB)]
-}
-
-function lightingMaps(source: HTMLCanvasElement, width: number, height: number): { bg: ImageData; texture: Uint8Array } {
-  const empty = { bg: new ImageData(width, height), texture: new Uint8Array(width * height) }
-  const tw = Math.min(TEX_WIDTH, width)
-  const th = Math.max(1, Math.round((height * tw) / Math.max(width, 1)))
-  const texCanvas = downsample(source, tw, th)
-  const texContext = texCanvas.getContext('2d', { willReadFrequently: true })
-  if (!texContext) return empty
-  const texPreview = texContext.getImageData(0, 0, tw, th)
-  const range = localRange(texPreview)
-  const photo = morphChannel(morphChannel(range, tw, th, 1, false), tw, th, Math.max(6, Math.round(tw * 0.045)), true)
-
-  const lw = Math.min(LIGHT_WIDTH, width)
-  const lh = Math.max(1, Math.round((height * lw) / Math.max(width, 1)))
-  const lightCanvas = downsample(source, lw, lh)
-  const lightContext = lightCanvas.getContext('2d', { willReadFrequently: true })
-  if (!lightContext) return empty
-  const preview = lightContext.getImageData(0, 0, lw, lh)
-  maxFilterRgba(preview, Math.max(LIGHT_MAX, Math.round(lw * 0.24)))
-  const [floorR, floorG, floorB] = paperPercentile(preview)
-  const liftR = floorR * 0.92
-  const liftG = floorG * 0.92
-  const liftB = floorB * 0.92
-  const light = preview.data
-  for (let i = 0; i < light.length; i += 4) {
-    if ((light[i] ?? 0) < liftR) light[i] = liftR
-    if ((light[i + 1] ?? 0) < liftG) light[i + 1] = liftG
-    if ((light[i + 2] ?? 0) < liftB) light[i + 2] = liftB
-  }
-  boxBlurRgba(preview, LIGHT_BLUR)
-  lightContext.putImageData(preview, 0, 0)
-  const bg = upsample(lightCanvas, width, height)
-  const texture = upsample(paintChannel(photo, tw, th), width, height)
-  const channel = new Uint8Array(width * height)
-  for (let p = 0, i = 0; p < channel.length; p += 1, i += 4) channel[p] = texture.data[i] ?? 0
-  return { bg, texture: channel }
-}
-
-function paperKnee(luma: number) {
-  if (luma >= 248) return 255
-  const t = Math.min(1, Math.max(0, (luma - PAPER_KNEE) / 23))
-  const s = t * t * (3 - 2 * t)
-  return luma + (255 - luma) * s
-}
-
-/** Lift crushed night midtones; leave tire/edge blacks at or below PHOTO_BLACK. */
-function liftPhotoShadows(luma: number) {
-  if (luma <= PHOTO_BLACK || luma >= SHADOW_CEIL) return luma
-  const n = (luma - PHOTO_BLACK) / (SHADOW_CEIL - PHOTO_BLACK)
-  return PHOTO_BLACK + (SHADOW_CEIL - PHOTO_BLACK) * n ** (1 / SHADOW_GAMMA)
-}
-
-function flattenPixel(src: Uint8ClampedArray, bg: Uint8ClampedArray, i: number) {
-  const red = Math.min(255, ((src[i] ?? 0) / Math.max(bg[i] ?? 0, 18)) * 255)
-  const green = Math.min(255, ((src[i + 1] ?? 0) / Math.max(bg[i + 1] ?? 0, 18)) * 255)
-  const blue = Math.min(255, ((src[i + 2] ?? 0) / Math.max(bg[i + 2] ?? 0, 18)) * 255)
-  return { red, green, blue, luma: 0.299 * red + 0.587 * green + 0.114 * blue }
-}
-
-function histPercentile(hist: Uint32Array, total: number, q: number) {
-  const target = total * q
-  let acc = 0
-  for (let value = 0; value < 256; value += 1) {
-    acc += hist[value] ?? 0
-    if (acc >= target) return value
-  }
-  return q < 0.5 ? 0 : 255
-}
-
-/** 5th–95th luminance of textured photo pixels after paper flatten. */
-function photoStretch(src: Uint8ClampedArray, bg: Uint8ClampedArray, texture: Uint8Array) {
-  const hist = new Uint32Array(256)
-  let count = 0
-  const pixels = src.length / 4
-  for (let p = 0, i = 0; p < pixels; p += 1, i += 4) {
-    if ((texture[p] ?? 0) < PHOTO_VAR) continue
-    const bin = Math.min(255, Math.max(0, Math.round(flattenPixel(src, bg, i).luma)))
-    hist[bin] += 1
-    count += 1
-  }
-  if (count < 64) return { lo: 48, hi: 210, span: 162 }
-  const lo = histPercentile(hist, count, 0.05)
-  const hi = histPercentile(hist, count, 0.95)
-  const span = Math.max(hi - lo, 48)
-  return { lo, hi: lo + span, span }
+  return background
 }
 
 /**
- * Magic Color: white paper, vivid stamps/vouchers, photos with a real black point.
- * Paper vs photo is local variance — never saturation (cars and asphalt are monochrome).
+ * HighFreq = Source / (Background + ε) * 255, then the Magic Color S-curve.
+ * Chrominance ratios (R/L, G/L, B/L) are kept; saturation is lifted 1.35×
+ * except on near-white paper, which rolls to #FFFFFF.
  */
-function magicColor(src: Uint8ClampedArray, bg: Uint8ClampedArray, texture: Uint8Array) {
-  const stretch = photoStretch(src, bg, texture)
-  const pixels = src.length / 4
-  for (let p = 0, i = 0; p < pixels; p += 1, i += 4) {
-    const { red, green, blue, luma } = flattenPixel(src, bg, i)
-    const tex = texture[p] ?? 0
-    const photo = tex >= PHOTO_VAR
-    const flat = tex <= PAPER_FLAT
-    const sat = Math.max(red, green, blue) - Math.min(red, green, blue)
-    const tint = sat > 12 || (luma > TINT_LUMA && sat > TINT_SAT)
+async function applyToneAndColor(
+  data: Uint8ClampedArray,
+  luma: Float32Array,
+  background: Float32Array,
+  width: number,
+  height: number,
+  clock: { last: number },
+) {
+  for (let y = 0; y < height; y += 1) {
+    if (y % 48 === 0) await yieldBusy(clock)
+    let p = y * width
+    let i = p * 4
+    for (let x = 0; x < width; x += 1, p += 1, i += 4) {
+      const red = data[i] ?? 0
+      const green = data[i + 1] ?? 0
+      const blue = data[i + 2] ?? 0
+      const srcL = luma[p] ?? 0
+      const flat = Math.min(255, (srcL / ((background[p] ?? 0) + FLAT_EPS)) * 255)
+      const next = MAGIC_LUT[flat | 0] ?? flat
 
-    let next = luma
-    if (!photo && flat && !tint && luma >= PAPER_KNEE) {
-      next = paperKnee(luma)
-    } else if (photo) {
-      next = PHOTO_BLACK + ((luma - stretch.lo) / stretch.span) * (PHOTO_WHITE - PHOTO_BLACK)
-      next = liftPhotoShadows(next)
-      if (next < 8) next = 8
-      else if (next > 248) next = 248
-    }
+      let outR: number
+      let outG: number
+      let outB: number
+      if (srcL > 0.5) {
+        const scale = next / srcL
+        outR = red * scale
+        outG = green * scale
+        outB = blue * scale
+      } else {
+        outR = next
+        outG = next
+        outB = next
+      }
 
-    const scale = luma > 1 ? next / luma : 0
-    let outR = red * scale
-    let outG = green * scale
-    let outB = blue * scale
-    if (tint) {
+      const paperMix = next > PAPER_LO ? smoothstep((next - PAPER_LO) / (255 - PAPER_LO)) : 0
+      if (paperMix > 0) {
+        const keep = 1 - paperMix
+        outR = next + (outR - next) * keep
+        outG = next + (outG - next) * keep
+        outB = next + (outB - next) * keep
+      }
+
+      const sat = 1 + (SAT_BOOST - 1) * (1 - paperMix)
       const mid = 0.299 * outR + 0.587 * outG + 0.114 * outB
-      outR = mid + (outR - mid) * SAT_BOOST
-      outG = mid + (outG - mid) * SAT_BOOST
-      outB = mid + (outB - mid) * SAT_BOOST
+      data[i] = Math.min(255, Math.max(0, mid + (outR - mid) * sat))
+      data[i + 1] = Math.min(255, Math.max(0, mid + (outG - mid) * sat))
+      data[i + 2] = Math.min(255, Math.max(0, mid + (outB - mid) * sat))
+      data[i + 3] = 255
     }
-    src[i] = Math.min(255, Math.max(0, outR))
-    src[i + 1] = Math.min(255, Math.max(0, outG))
-    src[i + 2] = Math.min(255, Math.max(0, outB))
-    src[i + 3] = 255
   }
 }
 
-/** Lightweight 3×3 Laplacian sharpen on luminance. */
+/** 3×3 unsharp mask on luminance so text, tables, and barcodes stay razor-sharp. */
 function sharpen3x3(image: ImageData, amount: number) {
   const { data, width, height } = image
   const gray = new Float32Array(width * height)
@@ -628,29 +418,32 @@ function sharpen3x3(image: ImageData, amount: number) {
   }
 }
 
-function applyMagicColor(image: ImageData, source: HTMLCanvasElement) {
-  const { bg, texture } = lightingMaps(source, image.width, image.height)
-  magicColor(image.data, bg.data, texture)
-  sharpen3x3(image, 0.55)
+async function applyMagicColor(image: ImageData) {
+  const { data, width, height } = image
+  const clock = { last: performance.now() }
+  const luma = extractLuma(data, width * height)
+  const background = await illuminationSurface(luma, width, height, clock)
+  await applyToneAndColor(data, luma, background, width, height, clock)
+  sharpen3x3(image, SHARPEN_AMOUNT)
 }
 
-function applyFastBlackWhite(image: ImageData, source: HTMLCanvasElement) {
-  const { bg } = lightingMaps(source, image.width, image.height)
-  const { data } = image
-  const light = bg.data
-  for (let i = 0; i < data.length; i += 4) {
-    const br = Math.max(light[i] ?? 0, 12)
-    const bg_ = Math.max(light[i + 1] ?? 0, 12)
-    const bb = Math.max(light[i + 2] ?? 0, 12)
-    const red = ((data[i] ?? 0) / br) * 255
-    const green = ((data[i + 1] ?? 0) / bg_) * 255
-    const blue = ((data[i + 2] ?? 0) / bb) * 255
-    const luma = 0.299 * red + 0.587 * green + 0.114 * blue
-    const ink = luma < 148 ? 0 : 255
-    data[i] = ink
-    data[i + 1] = ink
-    data[i + 2] = ink
-    data[i + 3] = 255
+async function applyFastBlackWhite(image: ImageData) {
+  const { data, width, height } = image
+  const clock = { last: performance.now() }
+  const luma = extractLuma(data, width * height)
+  const background = await illuminationSurface(luma, width, height, clock)
+  for (let y = 0; y < height; y += 1) {
+    if (y % 48 === 0) await yieldBusy(clock)
+    let p = y * width
+    let i = p * 4
+    for (let x = 0; x < width; x += 1, p += 1, i += 4) {
+      const flat = Math.min(255, ((luma[p] ?? 0) / ((background[p] ?? 0) + FLAT_EPS)) * 255)
+      const ink = flat < BW_THRESHOLD ? 0 : 255
+      data[i] = ink
+      data[i + 1] = ink
+      data[i + 2] = ink
+      data[i + 3] = 255
+    }
   }
 }
 
@@ -702,7 +495,10 @@ export async function straightenCanvas(
   }
 }
 
-function processPixels(source: HTMLCanvasElement, run: (pixels: ImageData, canvas: HTMLCanvasElement) => void): HTMLCanvasElement {
+async function processPixels(
+  source: HTMLCanvasElement,
+  run: (pixels: ImageData) => void | Promise<void>,
+): Promise<HTMLCanvasElement> {
   const canvas = document.createElement('canvas')
   canvas.width = source.width
   canvas.height = source.height
@@ -710,17 +506,17 @@ function processPixels(source: HTMLCanvasElement, run: (pixels: ImageData, canva
   if (!context) return source
   context.drawImage(source, 0, 0)
   const pixels = context.getImageData(0, 0, canvas.width, canvas.height)
-  run(pixels, canvas)
+  await run(pixels)
   context.putImageData(pixels, 0, 0)
   return canvas
 }
 
-/** CamScanner Magic Color: white paper, vivid stamps, photos preserved. Sync, one pass. */
+/** CamScanner Magic Color: white paper, vivid stamps, photos preserved. Full-res, one pass. */
 export async function applyCanvasMagic(source: HTMLCanvasElement): Promise<HTMLCanvasElement> {
   return processPixels(source, applyMagicColor)
 }
 
-/** Fast adaptive black and white from the same illumination map. */
+/** Fast adaptive black and white from the same native-resolution illumination map. */
 export async function applyCanvasBlackWhite(source: HTMLCanvasElement): Promise<HTMLCanvasElement> {
   return processPixels(source, applyFastBlackWhite)
 }
