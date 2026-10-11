@@ -5,15 +5,28 @@ import { DocumentViewer } from './components/DocumentViewer'
 import { HomeScreen } from './components/HomeScreen'
 import { PreviewScreen } from './components/PreviewScreen'
 import { ProcessingScreen } from './components/ProcessingScreen'
+import { Spinner } from './components/Spinner'
 import { Toast } from './components/Toast'
 import { useScan } from './state/scan-context'
 import { ScanProvider } from './state/ScanProvider'
 
 function AppFrame() {
-  const { screen, busy, toast, dismissToast } = useScan()
+  const { screen, busy, working, toast, dismissToast } = useScan()
 
   return (
     <>
+      {working && screen !== 'prepare' && (
+        <div
+          className="pointer-events-none fixed inset-x-0 top-[max(0.75rem,env(safe-area-inset-top))] z-[85] flex justify-center"
+          role="status"
+          aria-live="polite"
+        >
+          <span className="flex items-center gap-2 rounded-full bg-night/85 px-4 py-2 text-sm font-semibold text-paper shadow-lg">
+            <Spinner className="size-4" />
+            {working}
+          </span>
+        </div>
+      )}
       {screen === 'home' && <HomeScreen />}
       {screen === 'camera' && <CameraCapture />}
       {screen === 'prepare' && <ProcessingScreen label={busy ?? 'מכין את התמונה…'} />}

@@ -45,7 +45,8 @@ export function PreviewScreen() {
         src: filteredSource(
           draft?.filter ?? 'original',
           preview.warpUrl,
-          preview.magicUrl ?? (preview.url === preview.warpUrl ? null : preview.url),
+          preview.magicUrl,
+          preview.bwUrl,
         ),
         css: draft ? filterCss(draft.filter) : undefined,
       }

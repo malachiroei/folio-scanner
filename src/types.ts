@@ -40,6 +40,7 @@ export type PreviewImage = {
   url: string
   warpUrl: string
   magicUrl: string | null
+  bwUrl: string | null
   width: number
   height: number
 }

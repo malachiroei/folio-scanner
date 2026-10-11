@@ -3,7 +3,7 @@ import { outputSize } from './geometry'
 import { nextFrame } from './image'
 
 /**
- * A page that is roughly paper-shaped (long/short between 1.25 and 1.6) snaps to the exact A4
+ * A page that is roughly paper-shaped (long/short between 1.15 and 1.75) snaps to the exact A4
  * ratio 1:1.414 on its long side, so slightly off corners cannot stretch the text.
  * Other shapes (receipts, cards) keep the measured size.
  */
@@ -12,13 +12,16 @@ function a4Size(size: { width: number; height: number }): { width: number; heigh
   const short = Math.min(size.width, size.height)
   if (short < 1) return size
   const ratio = long / short
-  if (ratio < 1.25 || ratio > 1.6) return size
+  if (ratio < 1.15 || ratio > 1.75) return size
   const snapped = Math.round(long / Math.SQRT2)
   return size.width >= size.height ? { width: long, height: snapped } : { width: snapped, height: long }
 }
 
-/** Long edge of the straightened page. Text in a dense table needs this much to stay sharp. */
+/** Long edge of the straightened page (about 256 DPI on A4). */
 const MAX_EDGE = 3000
+
+/** Cells of the low-resolution lighting map are this many pixels wide. */
+const LIGHT_CELL = 8
 
 function sourceSize(image: CanvasImageSource): { width: number; height: number } {
   if (image instanceof HTMLImageElement) {
@@ -39,7 +42,7 @@ function drawSource(image: CanvasImageSource): HTMLCanvasElement {
   canvas.width = Math.max(1, width)
   canvas.height = Math.max(1, height)
   const context = canvas.getContext('2d', { willReadFrequently: true })
-  if (!context) throw new Error('׳׳ ׳ ׳™׳×׳ ׳׳”׳›׳™׳ ׳׳× ׳”׳×׳׳•׳ ׳”.')
+  if (!context) throw new Error('לא ניתן להכין את התמונה.')
   context.drawImage(image, 0, 0, canvas.width, canvas.height)
   return canvas
 }
@@ -129,7 +132,7 @@ async function warpCanvas(
 ): Promise<HTMLCanvasElement> {
   if (performance.now() > deadlineAt) return paintScaled(source, width, height, corners)
   const context = source.getContext('2d', { willReadFrequently: true })
-  if (!context) throw new Error('׳׳ ׳ ׳™׳×׳ ׳׳§׳¨׳•׳ ׳׳× ׳”׳×׳׳•׳ ׳”.')
+  if (!context) throw new Error('לא ניתן לקרוא את התמונה.')
   const pixels = context.getImageData(0, 0, source.width, source.height)
   const from = [
     { x: 0, y: 0 },
@@ -143,7 +146,7 @@ async function warpCanvas(
   canvas.width = width
   canvas.height = height
   const output = canvas.getContext('2d', { willReadFrequently: true })
-  if (!output) throw new Error('׳׳ ׳ ׳™׳×׳ ׳׳™׳™׳©׳¨ ׳׳× ׳”׳¢׳׳•׳“.')
+  if (!output) throw new Error('לא ניתן ליישר את העמוד.')
   if (!map) {
     output.drawImage(source, 0, 0, width, height)
     return canvas
@@ -197,51 +200,254 @@ async function warpCanvas(
       out += 4
     }
   }
+  await unsharp(dest, 0.35)
   output.putImageData(dest, 0, 0)
   return canvas
 }
 
-function luminance(data: Uint8ClampedArray, index: number) {
-  return (
-    0.299 * (data[index] ?? 0) + 0.587 * (data[index + 1] ?? 0) + 0.114 * (data[index + 2] ?? 0)
-  )
-}
+/* ---------- lighting map: shadows and uneven illumination ---------- */
 
-function integralImage(gray: Float32Array, width: number, height: number) {
-  const stride = width + 1
-  const table = new Float64Array(stride * (height + 1))
-  for (let y = 0; y < height; y += 1) {
-    let row = 0
-    for (let x = 0; x < width; x += 1) {
-      row += gray[y * width + x] ?? 0
-      table[(y + 1) * stride + (x + 1)] = row + (table[y * stride + (x + 1)] ?? 0)
+type LowMap = { values: Float32Array; cols: number; rows: number }
+
+/** Average luminance per LIGHT_CELL block (sampled every 2px), so the pass stays cheap. */
+async function lowLuminance(image: ImageData): Promise<LowMap> {
+  const { data, width, height } = image
+  const cols = Math.ceil(width / LIGHT_CELL)
+  const rows = Math.ceil(height / LIGHT_CELL)
+  const values = new Float32Array(cols * rows)
+  for (let row = 0; row < rows; row += 1) {
+    if (row % 24 === 0) await nextFrame()
+    const y0 = row * LIGHT_CELL
+    const y1 = Math.min(height, y0 + LIGHT_CELL)
+    for (let col = 0; col < cols; col += 1) {
+      const x0 = col * LIGHT_CELL
+      const x1 = Math.min(width, x0 + LIGHT_CELL)
+      let sum = 0
+      let count = 0
+      for (let y = y0; y < y1; y += 2) {
+        for (let x = x0; x < x1; x += 2) {
+          const index = (y * width + x) * 4
+          sum += 0.299 * (data[index] ?? 0) + 0.587 * (data[index + 1] ?? 0) + 0.114 * (data[index + 2] ?? 0)
+          count += 1
+        }
+      }
+      values[row * cols + col] = count ? sum / count : 255
     }
   }
-  return table
+  return { values, cols, rows }
 }
 
-function areaSum(table: Float64Array, width: number, x0: number, y0: number, x1: number, y1: number) {
-  const stride = width + 1
-  return (
-    (table[y1 * stride + x1] ?? 0) -
-    (table[y0 * stride + x1] ?? 0) -
-    (table[y1 * stride + x0] ?? 0) +
-    (table[y0 * stride + x0] ?? 0)
-  )
-}
-
-function magicCurve(value: number) {
-  const x = Math.min(1, Math.max(0, value / 255))
-  let y: number
-  if (x < 0.5) y = (x / 0.5) ** 1.08 * 0.48
-  else if (x < 0.72) y = 0.48 + ((x - 0.5) / 0.22) * 0.22
-  else {
-    const t = (x - 0.72) / 0.28
-    const smooth = t * t * (3 - 2 * t)
-    const base = 0.7 + (x - 0.72) * 0.35
-    y = base + (1 - base) * smooth * 0.95
+/** Separable box max (dilation) or mean over a small window of cells. */
+function boxFilter(map: LowMap, radius: number, mode: 'max' | 'mean'): LowMap {
+  const { cols, rows } = map
+  const horizontal = new Float32Array(map.values.length)
+  const output = new Float32Array(map.values.length)
+  for (let row = 0; row < rows; row += 1) {
+    for (let col = 0; col < cols; col += 1) {
+      let best = 0
+      let sum = 0
+      let count = 0
+      for (let k = -radius; k <= radius; k += 1) {
+        const c = Math.min(cols - 1, Math.max(0, col + k))
+        const value = map.values[row * cols + c] ?? 0
+        if (value > best) best = value
+        sum += value
+        count += 1
+      }
+      horizontal[row * cols + col] = mode === 'max' ? best : sum / count
+    }
   }
-  return Math.max(0, Math.min(255, Math.round(y * 255)))
+  for (let col = 0; col < cols; col += 1) {
+    for (let row = 0; row < rows; row += 1) {
+      let best = 0
+      let sum = 0
+      let count = 0
+      for (let k = -radius; k <= radius; k += 1) {
+        const r = Math.min(rows - 1, Math.max(0, row + k))
+        const value = horizontal[r * cols + col] ?? 0
+        if (value > best) best = value
+        sum += value
+        count += 1
+      }
+      output[row * cols + col] = mode === 'max' ? best : sum / count
+    }
+  }
+  return { values: output, cols, rows }
+}
+
+/**
+ * Paper brightness under the print. A large grayscale closing (max filter, ~90px) removes text
+ * and thin lines, then blurring smooths the result. Dividing by it flattens shadows.
+ */
+function paperLight(low: LowMap): LowMap {
+  let map = boxFilter(low, 5, 'max')
+  map = boxFilter(map, 3, 'mean')
+  return boxFilter(map, 3, 'mean')
+}
+
+/** Local mean brightness (~70px window), used by the adaptive black-and-white threshold. */
+function localMean(low: LowMap): LowMap {
+  return boxFilter(boxFilter(low, 4, 'mean'), 4, 'mean')
+}
+
+/** Column and row weights so every pixel samples the low map bilinearly without recomputing. */
+function columnSampler(width: number, cols: number) {
+  const left = new Int32Array(width)
+  const right = new Int32Array(width)
+  const weight = new Float32Array(width)
+  for (let x = 0; x < width; x += 1) {
+    const position = Math.min(cols - 1, Math.max(0, (x + 0.5) / LIGHT_CELL - 0.5))
+    const base = Math.floor(position)
+    left[x] = base
+    right[x] = Math.min(cols - 1, base + 1)
+    weight[x] = position - base
+  }
+  return { left, right, weight }
+}
+
+function sampleRow(map: LowMap, y: number): { top: number; bottom: number; weight: number } {
+  const position = Math.min(map.rows - 1, Math.max(0, (y + 0.5) / LIGHT_CELL - 0.5))
+  const base = Math.floor(position)
+  return { top: base * map.cols, bottom: Math.min(map.rows - 1, base + 1) * map.cols, weight: position - base }
+}
+
+function smoothstep(edge0: number, edge1: number, value: number) {
+  const t = Math.min(1, Math.max(0, (value - edge0) / (edge1 - edge0)))
+  return t * t * (3 - 2 * t)
+}
+
+/**
+ * Magic scan: divide by the paper light (shadow removal), push near-white to pure white,
+ * deepen ink with an S-curve, and keep strongly colored pixels (stamps, logos, signatures).
+ */
+async function filterMagic(image: ImageData) {
+  const { data, width, height } = image
+  const light = paperLight(await lowLuminance(image))
+  const columns = columnSampler(width, light.cols)
+
+  for (let y = 0; y < height; y += 1) {
+    if (y % 32 === 0) await nextFrame()
+    const row = sampleRow(light, y)
+    let index = y * width * 4
+    for (let x = 0; x < width; x += 1) {
+      const l = columns.left[x] ?? 0
+      const r = columns.right[x] ?? 0
+      const wx = columns.weight[x] ?? 0
+      const top = (light.values[row.top + l] ?? 255) * (1 - wx) + (light.values[row.top + r] ?? 255) * wx
+      const bottom = (light.values[row.bottom + l] ?? 255) * (1 - wx) + (light.values[row.bottom + r] ?? 255) * wx
+      const background = top * (1 - row.weight) + bottom * row.weight
+      const gain = Math.min(4, 255 / Math.max(background, 30))
+
+      const red = Math.min(255, (data[index] ?? 0) * gain)
+      const green = Math.min(255, (data[index + 1] ?? 0) * gain)
+      const blue = Math.min(255, (data[index + 2] ?? 0) * gain)
+      const level = 0.299 * red + 0.587 * green + 0.114 * blue
+
+      // Within ~13% of the paper light goes to pure white; ink is deepened by the S-curve.
+      const s = Math.min(1, Math.max(0, (level - 28) / (222 - 28)))
+      const curved = s * 0.35 + s * s * (3 - 2 * s) * 0.65
+      const target = 255 * curved
+      const lift = level > 1 ? target / level : 0
+
+      const peak = Math.max(red, green, blue)
+      const saturation = peak > 1 ? (peak - Math.min(red, green, blue)) / peak : 0
+      const keep = smoothstep(0.16, 0.38, saturation)
+
+      const outRed = Math.min(255, red * lift)
+      const outGreen = Math.min(255, green * lift)
+      const outBlue = Math.min(255, blue * lift)
+      data[index] = target + (outRed - target) * keep
+      data[index + 1] = target + (outGreen - target) * keep
+      data[index + 2] = target + (outBlue - target) * keep
+      data[index + 3] = 255
+      index += 4
+    }
+  }
+}
+
+/**
+ * Black and white document: shadow-normalized brightness against a Bradley-style local mean.
+ * Anything clearly darker than its neighborhood is ink (pure black), the rest is pure white.
+ */
+async function filterBlackWhite(image: ImageData) {
+  const { data, width, height } = image
+  const low = await lowLuminance(image)
+  const light = paperLight(low)
+  const mean = localMean(low)
+  const columns = columnSampler(width, light.cols)
+
+  for (let y = 0; y < height; y += 1) {
+    if (y % 32 === 0) await nextFrame()
+    const row = sampleRow(light, y)
+    let index = y * width * 4
+    for (let x = 0; x < width; x += 1) {
+      const l = columns.left[x] ?? 0
+      const r = columns.right[x] ?? 0
+      const wx = columns.weight[x] ?? 0
+      const lightAt = (map: LowMap) => {
+        const top = (map.values[row.top + l] ?? 255) * (1 - wx) + (map.values[row.top + r] ?? 255) * wx
+        const bottom = (map.values[row.bottom + l] ?? 255) * (1 - wx) + (map.values[row.bottom + r] ?? 255) * wx
+        return top * (1 - row.weight) + bottom * row.weight
+      }
+      const gain = Math.min(4, 255 / Math.max(lightAt(light), 30))
+      const level = (0.299 * (data[index] ?? 0) + 0.587 * (data[index + 1] ?? 0) + 0.114 * (data[index + 2] ?? 0)) * gain
+      const neighborhood = lightAt(mean) * gain
+      const ink = level < neighborhood * 0.8 && level < 200 ? 0 : 255
+      data[index] = ink
+      data[index + 1] = ink
+      data[index + 2] = ink
+      data[index + 3] = 255
+      index += 4
+    }
+  }
+}
+
+/**
+ * Unsharp mask on luminance (box blur radius 2). Small deltas are ignored so the white
+ * background does not pick up noise; edges of text and table lines gain micro-contrast.
+ */
+async function unsharp(image: ImageData, amount: number) {
+  const { data, width, height } = image
+  const radius = 2
+  const gray = new Float32Array(width * height)
+  for (let i = 0, p = 0; p < gray.length; p += 1, i += 4) {
+    gray[p] = 0.299 * (data[i] ?? 0) + 0.587 * (data[i + 1] ?? 0) + 0.114 * (data[i + 2] ?? 0)
+  }
+  const blurred = new Float32Array(width * height)
+  const span = radius * 2 + 1
+
+  for (let y = 0; y < height; y += 1) {
+    if (y % 64 === 0) await nextFrame()
+    const base = y * width
+    let sum = 0
+    for (let k = -radius; k <= radius; k += 1) sum += gray[base + Math.min(width - 1, Math.max(0, k))] ?? 0
+    for (let x = 0; x < width; x += 1) {
+      blurred[base + x] = sum / span
+      sum += (gray[base + Math.min(width - 1, x + radius + 1)] ?? 0) - (gray[base + Math.max(0, x - radius)] ?? 0)
+    }
+  }
+
+  const column = new Float32Array(height)
+  for (let x = 0; x < width; x += 1) {
+    if (x % 128 === 0) await nextFrame()
+    let sum = 0
+    for (let k = -radius; k <= radius; k += 1) sum += blurred[Math.min(height - 1, Math.max(0, k)) * width + x] ?? 0
+    for (let y = 0; y < height; y += 1) {
+      column[y] = sum / span
+      sum +=
+        (blurred[Math.min(height - 1, y + radius + 1) * width + x] ?? 0) -
+        (blurred[Math.max(0, y - radius) * width + x] ?? 0)
+    }
+    for (let y = 0; y < height; y += 1) {
+      const p = y * width + x
+      const delta = ((gray[p] ?? 0) - (column[y] ?? 0)) * amount
+      if (Math.abs(delta) < 1.5) continue
+      const i = p * 4
+      data[i] = Math.min(255, Math.max(0, (data[i] ?? 0) + delta))
+      data[i + 1] = Math.min(255, Math.max(0, (data[i + 1] ?? 0) + delta))
+      data[i + 2] = Math.min(255, Math.max(0, (data[i + 2] ?? 0) + delta))
+    }
+  }
 }
 
 export function desaturateCanvas(canvas: HTMLCanvasElement): HTMLCanvasElement {
@@ -259,41 +465,6 @@ export function desaturateCanvas(canvas: HTMLCanvasElement): HTMLCanvasElement {
   }
   context.putImageData(image, 0, 0)
   return canvas
-}
-
-async function filterPixels(image: ImageData, filter: 'magic' | 'bw') {
-  const { data, width, height } = image
-  const gray = new Float32Array(width * height)
-  for (let i = 0; i < gray.length; i += 1) gray[i] = luminance(data, i * 4)
-  const table = integralImage(gray, width, height)
-  const radius = Math.max(8, Math.round(Math.min(width, height) / (filter === 'bw' ? 28 : 14)))
-
-  for (let y = 0; y < height; y += 1) {
-    if (y % 16 === 0) await nextFrame()
-    const y0 = Math.max(0, y - radius)
-    const y1 = Math.min(height, y + radius + 1)
-    for (let x = 0; x < width; x += 1) {
-      const x0 = Math.max(0, x - radius)
-      const x1 = Math.min(width, x + radius + 1)
-      const count = (x1 - x0) * (y1 - y0)
-      const average = areaSum(table, width, x0, y0, x1, y1) / Math.max(1, count)
-      const index = (y * width + x) * 4
-      const lum = gray[y * width + x] ?? 0
-      if (filter === 'bw') {
-        const ink = lum + 12 < average ? 0 : 255
-        data[index] = ink
-        data[index + 1] = ink
-        data[index + 2] = ink
-      } else {
-        const lifted = magicCurve(lum * (242 / Math.max(16, average)))
-        const gain = lum < 1 ? 1 : lifted / lum
-        data[index] = Math.max(0, Math.min(255, (data[index] ?? 0) * gain))
-        data[index + 1] = Math.max(0, Math.min(255, (data[index + 1] ?? 0) * gain))
-        data[index + 2] = Math.max(0, Math.min(255, (data[index + 2] ?? 0) * gain))
-      }
-      data[index + 3] = 255
-    }
-  }
 }
 
 export async function straightenCanvas(
@@ -315,7 +486,10 @@ export async function straightenCanvas(
   }
 }
 
-export async function applyCanvasMagic(source: HTMLCanvasElement): Promise<HTMLCanvasElement> {
+async function processCopy(
+  source: HTMLCanvasElement,
+  run: (pixels: ImageData) => Promise<void>,
+): Promise<HTMLCanvasElement> {
   const canvas = document.createElement('canvas')
   canvas.width = source.width
   canvas.height = source.height
@@ -323,9 +497,22 @@ export async function applyCanvasMagic(source: HTMLCanvasElement): Promise<HTMLC
   if (!context) return source
   context.drawImage(source, 0, 0)
   const pixels = context.getImageData(0, 0, canvas.width, canvas.height)
-  await filterPixels(pixels, 'magic')
+  await run(pixels)
   context.putImageData(pixels, 0, 0)
   return canvas
+}
+
+/** Magic scan: clean white paper, crisp ink, colors kept. */
+export async function applyCanvasMagic(source: HTMLCanvasElement): Promise<HTMLCanvasElement> {
+  return processCopy(source, async (pixels) => {
+    await filterMagic(pixels)
+    await unsharp(pixels, 0.5)
+  })
+}
+
+/** High-grade adaptive black and white. */
+export async function applyCanvasBlackWhite(source: HTMLCanvasElement): Promise<HTMLCanvasElement> {
+  return processCopy(source, filterBlackWhite)
 }
 
 export async function renderCanvasDocument(
@@ -337,12 +524,7 @@ export async function renderCanvasDocument(
   if (filter === 'original') return warped
   if (filter === 'gray') return desaturateCanvas(copyCanvas(warped))
   if (filter === 'magic') return applyCanvasMagic(warped)
-  const context = copyCanvas(warped).getContext('2d', { willReadFrequently: true })
-  if (!context) return warped
-  const pixels = context.getImageData(0, 0, context.canvas.width, context.canvas.height)
-  await filterPixels(pixels, 'bw')
-  context.putImageData(pixels, 0, 0)
-  return context.canvas
+  return applyCanvasBlackWhite(warped)
 }
 
 function copyCanvas(source: HTMLCanvasElement): HTMLCanvasElement {

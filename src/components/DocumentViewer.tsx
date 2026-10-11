@@ -139,7 +139,7 @@ export function DocumentViewer() {
 
 function pageView(page: ScanPage) {
   return {
-    src: filteredSource(page.filter, page.warpUrl, page.magicUrl),
+    src: page.filter === 'bw' ? page.resultUrl : filteredSource(page.filter, page.warpUrl, page.magicUrl),
     css: filterCss(page.filter),
   }
 }

@@ -1,5 +1,11 @@
 import type { Corners, FilterMode } from '../types'
-import { applyCanvasMagic, renderCanvasDocument, straightenCanvas } from './canvas-scan'
+import {
+  applyCanvasBlackWhite,
+  applyCanvasMagic,
+  desaturateCanvas,
+  renderCanvasDocument,
+  straightenCanvas,
+} from './canvas-scan'
 
 const PROCESS_BUDGET_MS = 20_000
 
@@ -18,6 +24,7 @@ async function renderWithCanvas(
   return { canvas, width: canvas.width, height: canvas.height }
 }
 
+/** Perspective warp to a strict A4 page (1:1.414) capped at 3000px on the long edge. */
 export async function straightenDocument(
   image: CanvasImageSource,
   corners: Corners,
@@ -26,21 +33,29 @@ export async function straightenDocument(
   return straightenCanvas(image, corners, performance.now() + PROCESS_BUDGET_MS)
 }
 
-export function paintFastFilter(source: HTMLCanvasElement, filter: 'gray' | 'bw'): HTMLCanvasElement {
+/** Instant grayscale through the 2D context filter. */
+export function paintFastFilter(source: HTMLCanvasElement): HTMLCanvasElement {
   const canvas = document.createElement('canvas')
   canvas.width = source.width
   canvas.height = source.height
   const context = canvas.getContext('2d')
-  if (!context) return source
-  context.filter = filter === 'gray' ? 'grayscale(1)' : 'grayscale(1) contrast(2.25) brightness(1.06)'
+  if (!context) return desaturateCanvas(source)
+  context.filter = 'grayscale(1)'
   context.drawImage(source, 0, 0)
   context.filter = 'none'
   return canvas
 }
 
+/** Magic scan: shadow removal, white paper, crisp ink, colors kept. Yields to the UI while it runs. */
 export async function renderMagic(source: HTMLCanvasElement): Promise<HTMLCanvasElement> {
   await yieldToBrowser()
   return await applyCanvasMagic(source)
+}
+
+/** Adaptive black and white document. Yields to the UI while it runs. */
+export async function renderBlackWhite(source: HTMLCanvasElement): Promise<HTMLCanvasElement> {
+  await yieldToBrowser()
+  return await applyCanvasBlackWhite(source)
 }
 
 export async function renderDocument(
@@ -51,11 +66,11 @@ export async function renderDocument(
   try {
     const warped = await straightenDocument(image, corners)
     if (filter === 'original') return { canvas: warped, width: warped.width, height: warped.height }
-    if (filter === 'gray' || filter === 'bw') {
-      const canvas = paintFastFilter(warped, filter)
+    if (filter === 'gray') {
+      const canvas = paintFastFilter(warped)
       return { canvas, width: canvas.width, height: canvas.height }
     }
-    const canvas = await renderMagic(warped)
+    const canvas = filter === 'bw' ? await renderBlackWhite(warped) : await renderMagic(warped)
     return { canvas, width: canvas.width, height: canvas.height }
   } catch (error) {
     console.error(error)

@@ -8,6 +8,8 @@ export type ScanContextValue = {
   retryEngine: () => void
   screen: Screen
   busy: string | null
+  /** Set for the whole time a full-size page is processed. Never cleared by a timer. */
+  working: string | null
   toast: string | null
   dismissToast: () => void
   pages: ScanPage[]

@@ -11,7 +11,7 @@ import {
   normalizeImage,
 } from '../lib/image'
 import { cachedMagic, cachedWarp, loadMagic, pageKey, storeWarp } from '../lib/page-cache'
-import { paintFastFilter, renderMagic, straightenDocument } from '../lib/process'
+import { paintFastFilter, renderBlackWhite, renderMagic, straightenDocument } from '../lib/process'
 import type { Corners, Draft, EngineStatus, FilterMode, PreviewImage, ScanPage, Screen } from '../types'
 import { ScanContext } from './scan-context'
 
@@ -36,6 +36,8 @@ export function ScanProvider({ children }: { children: ReactNode }) {
   const [engine, setEngine] = useState<EngineStatus>('idle')
   const [screen, setScreen] = useState<Screen>('home')
   const [busy, setBusy] = useState<string | null>(null)
+  const [working, setWorking] = useState<string | null>(null)
+  const workingCount = useRef(0)
   const [toast, setToast] = useState<string | null>(null)
   const [pages, setPages] = useState<ScanPage[]>([])
   const [draft, setDraft] = useState<Draft | null>(null)
@@ -92,7 +94,22 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
+  /** Small "processing" indicator that lasts exactly as long as the heavy work. Returns the stop function. */
+  function beginWorking(label = 'מעבד מסמך...') {
+    workingCount.current += 1
+    setWorking(label)
+    let stopped = false
+    return () => {
+      if (stopped) return
+      stopped = true
+      workingCount.current = Math.max(0, workingCount.current - 1)
+      if (workingCount.current === 0) setWorking(null)
+    }
+  }
+
   function beginBusy(label: string) {
+    // The label above can clear itself after 500ms; the small indicator lasts until the work ends.
+    const stopWorking = beginWorking()
     const token = ++busyToken.current
     let closed = false
     const finish = () => {
@@ -106,6 +123,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     }, 100)
     const failsafe = window.setTimeout(finish, 500)
     return () => {
+      stopWorking()
       closed = true
       window.clearTimeout(timer)
       window.clearTimeout(failsafe)
@@ -121,6 +139,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     if (next?.url) keep.add(next.url)
     if (next?.warpUrl) keep.add(next.warpUrl)
     if (next?.magicUrl) keep.add(next.magicUrl)
+    if (next?.bwUrl) keep.add(next.bwUrl)
     for (const page of pagesRef.current) {
       keep.add(page.resultUrl)
       keep.add(page.warpUrl)
@@ -128,7 +147,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
       keep.add(page.sourceUrl)
     }
     if (previous) {
-      const urls = [previous.url, previous.warpUrl, previous.magicUrl]
+      const urls = [previous.url, previous.warpUrl, previous.magicUrl, previous.bwUrl]
       for (const url of urls) {
         if (url && !keep.has(url)) URL.revokeObjectURL(url)
       }
@@ -237,7 +256,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
         width: normalized.width,
         height: normalized.height,
         corners: defaultCorners(normalized.width, normalized.height, 0.1),
-        filter: 'original' as const,
+        filter: 'magic' as const,
         detected: false,
         detecting: true,
         snapToken: 0,
@@ -368,7 +387,12 @@ export function ScanProvider({ children }: { children: ReactNode }) {
       const magic = cachedMagic(key) ?? (await loadMagic(key, () => renderMagic(canvas)))
       return canvasToJpegBlob(magic, 0.93)
     }
-    return canvasToJpegBlob(paintFastFilter(canvas, filter), 0.93)
+    if (filter === 'bw') {
+      const bwKey = `${key}|bw`
+      const bw = cachedMagic(bwKey) ?? (await loadMagic(bwKey, () => renderBlackWhite(canvas)))
+      return canvasToJpegBlob(bw, 0.93)
+    }
+    return canvasToJpegBlob(paintFastFilter(canvas), 0.93)
   }
 
   async function renderPreview(source: Draft) {
@@ -398,9 +422,17 @@ export function ScanProvider({ children }: { children: ReactNode }) {
         url: warpUrl,
         warpUrl,
         magicUrl: null,
+        bwUrl: null,
         width: warped.canvas.width,
         height: warped.canvas.height,
       })
+      // Magic and B&W are the default enhanced modes: start them once the plain page is on screen.
+      window.setTimeout(() => {
+        const latest = draftRef.current
+        if (latest && token === requestRef.current && (latest.filter === 'magic' || latest.filter === 'bw')) {
+          void fillProcessed(latest)
+        }
+      }, 0)
     } catch (error) {
       console.error(error)
       if (token === requestRef.current) {
@@ -413,9 +445,10 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     }
   }
 
-  async function fillMagic(source: Draft) {
+  async function fillProcessed(source: Draft) {
+    const kind = source.filter === 'bw' ? 'bw' : 'magic'
     const shot = previewRef.current
-    if (!shot || shot.magicUrl || processingRef.current) return
+    if (!shot || (kind === 'bw' ? shot.bwUrl : shot.magicUrl) || processingRef.current) return
     const token = ++requestRef.current
     processingRef.current = true
     processingOwner.current = token
@@ -427,16 +460,19 @@ export function ScanProvider({ children }: { children: ReactNode }) {
       const warp = cachedWarp(key) ?? (await raster(shot.warpUrl))
       storeWarp(key, warp)
       if (token !== requestRef.current) return
-      const magic = cachedMagic(key) ?? (await loadMagic(key, () => renderMagic(warp)))
+      const cacheKey = kind === 'bw' ? `${key}|bw` : key
+      const produce = () => (kind === 'bw' ? renderBlackWhite(warp) : renderMagic(warp))
+      const processed = cachedMagic(cacheKey) ?? (await loadMagic(cacheKey, produce))
       if (token !== requestRef.current) return
-      const magicBlob = await canvasToJpegBlob(magic, 0.93)
+      const blob = await canvasToJpegBlob(processed, 0.93)
       if (token !== requestRef.current) return
-      const magicUrl = URL.createObjectURL(magicBlob)
-      const current = previewRef.current
+      const url = URL.createObjectURL(blob)
+      const current = previewRef.current ?? shot
       replacePreview({
-        url: magicUrl,
-        warpUrl: current?.warpUrl ?? shot.warpUrl,
-        magicUrl,
+        url,
+        warpUrl: current.warpUrl,
+        magicUrl: kind === 'magic' ? url : current.magicUrl,
+        bwUrl: kind === 'bw' ? url : current.bwUrl,
         width: shot.width,
         height: shot.height,
       })
@@ -502,7 +538,9 @@ export function ScanProvider({ children }: { children: ReactNode }) {
       draftRef.current = next
       setDraft(next)
     }
-    if (filter === 'magic' && !previewRef.current?.magicUrl) void fillMagic(current)
+    const shot = previewRef.current
+    if (filter === 'magic' && shot && !shot.magicUrl) void fillProcessed({ ...current, filter })
+    if (filter === 'bw' && shot && !shot.bwUrl) void fillProcessed({ ...current, filter })
   }
 
   function retryPreview() {
@@ -967,6 +1005,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     retryEngine,
     screen,
     busy,
+    working,
     toast,
     dismissToast,
     pages,
