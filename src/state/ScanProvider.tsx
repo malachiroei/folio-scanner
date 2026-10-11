@@ -10,7 +10,7 @@ import {
   nextFrame,
   normalizeImage,
 } from '../lib/image'
-import { cachedMagic, cachedWarp, loadMagic, pageKey, storeWarp } from '../lib/page-cache'
+import { cachedMagic, cachedWarp, clearPageCache, loadMagic, pageKey, storeWarp } from '../lib/page-cache'
 import { paintFastFilter, renderBlackWhite, renderMagic, straightenDocument } from '../lib/process'
 import type { CaptureHint, Corners, Draft, EngineStatus, FilterMode, PreviewImage, ScanPage, Screen } from '../types'
 import { ScanContext } from './scan-context'
@@ -69,6 +69,22 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     localStorage.setItem('folio-theme', theme)
     document.querySelector('meta[name="theme-color"]')?.setAttribute('content', theme === 'dark' ? '#0e1614' : '#efe7da')
   }, [theme])
+
+  useEffect(() => {
+    // Scans live only in memory, so a reload always starts empty. Clear any scan leftovers an older
+    // build may have written, and start clean when the browser restores this page from its
+    // back/forward cache (memory would otherwise still hold the previous document).
+    for (const store of [localStorage, sessionStorage]) {
+      for (const key of Object.keys(store)) {
+        if (/^folio-(pages|session|draft|scan)/.test(key)) store.removeItem(key)
+      }
+    }
+    const onPageShow = (event: PageTransitionEvent) => {
+      if (event.persisted) resetSession()
+    }
+    window.addEventListener('pageshow', onPageShow)
+    return () => window.removeEventListener('pageshow', onPageShow)
+  }, [])
 
   useEffect(() => {
     if (!toast) return
@@ -580,6 +596,45 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     setScreen('home')
   }
 
+  /**
+   * Starts a clean document: no pages, no draft, no preview, no cached renders. Runs after a
+   * successful send or export, on a manual "new document", and when the browser restores this
+   * page from its back/forward cache, so the next scan never gets appended to an old document.
+   */
+  function resetSession() {
+    detectGen.current += 1
+    requestRef.current += 1
+    processingRef.current = false
+    processedKeyRef.current = null
+    userAdjustedRef.current = false
+
+    const urls = new Set<string>()
+    for (const page of pagesRef.current) {
+      urls.add(page.sourceUrl)
+      urls.add(page.resultUrl)
+      urls.add(page.warpUrl)
+      if (page.magicUrl) urls.add(page.magicUrl)
+    }
+    const currentDraft = draftRef.current
+    if (currentDraft) urls.add(currentDraft.sourceUrl)
+    const shot = previewRef.current
+    if (shot) {
+      for (const url of [shot.url, shot.warpUrl, shot.magicUrl, shot.bwUrl]) if (url) urls.add(url)
+    }
+    for (const url of urls) URL.revokeObjectURL(url)
+    clearPageCache()
+
+    pagesRef.current = []
+    draftRef.current = null
+    previewRef.current = null
+    setPages([])
+    setDraft(null)
+    setPreview(null)
+    setSelectedId(null)
+    setBusy(null)
+    setScreen('home')
+  }
+
   function rememberPage(page: ScanPage) {
     const prev = pagesRef.current
     const exists = prev.some((item) => item.id === page.id)
@@ -917,10 +972,12 @@ export function ScanProvider({ children }: { children: ReactNode }) {
         if (error instanceof DOMException && error.name === 'AbortError') return
         console.error(error)
       }
-      if (shared) return
-      downloadBlob(file, file.name)
-      if (email) openMailto(email)
-      else setToast('ה-PDF ירד למכשיר. אפשר לצרף אותו למייל.')
+      if (!shared) {
+        downloadBlob(file, file.name)
+        if (email) openMailto(email)
+        else setToast('ה-PDF ירד למכשיר. אפשר לצרף אותו למייל.')
+      }
+      resetSession()
     } catch (error) {
       console.error(error)
       setToast(errorMessage(error))
@@ -946,6 +1003,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
         throw new Error(payload?.error || 'שליחת המייל נכשלה.')
       }
       setToast(`המסמך נשלח בהצלחה ל-${email}!`)
+      resetSession()
       return true
     } catch (error) {
       console.error(error)
@@ -999,6 +1057,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
       } catch (error) {
         console.error(error)
       }
+      resetSession()
     } catch (error) {
       console.error(error)
       setToast(errorMessage(error))
@@ -1041,6 +1100,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     sharePdf,
     quickSend,
     openPages,
+    startNewDocument: resetSession,
     closePages: () => setScreen('home'),
     selectPage,
     movePage,

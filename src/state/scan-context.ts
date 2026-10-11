@@ -36,6 +36,8 @@ export type ScanContextValue = {
   sharePdf: (email?: string) => Promise<void>
   quickSend: (email: string) => Promise<boolean>
   openPages: () => void
+  /** Drops all pages, the open draft and cached renders, and returns to the home screen. */
+  startNewDocument: () => void
   closePages: () => void
   selectPage: (id: string) => void
   movePage: (id: string, direction: -1 | 1) => void

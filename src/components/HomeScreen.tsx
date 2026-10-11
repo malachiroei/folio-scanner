@@ -1,10 +1,11 @@
-import { Camera, Moon, Sun } from 'lucide-react'
+import { Camera, FilePlus2, Moon, Sun } from 'lucide-react'
 import { useScan } from '../state/scan-context'
 import { Button } from './Button'
 import { UploadDropzone } from './UploadDropzone'
 
 export function HomeScreen() {
-  const { theme, toggleTheme, engine, retryEngine, pages, openCamera, openPages, ingestFile } = useScan()
+  const { theme, toggleTheme, engine, retryEngine, pages, openCamera, openPages, ingestFile, startNewDocument } =
+    useScan()
 
   return (
     <div className="app-bg min-h-dvh text-ink dark:text-paper">
@@ -65,6 +66,16 @@ export function HomeScreen() {
             <Button variant="secondary" className="mt-3 w-full" onClick={openPages}>
               צפייה וייצוא
             </Button>
+            <Button
+              variant="secondary"
+              className="mt-2 w-full"
+              onClick={() => {
+                if (window.confirm('למחוק את כל העמודים ולהתחיל מסמך חדש?')) startNewDocument()
+              }}
+            >
+              <FilePlus2 className="size-4" />
+              מסמך חדש
+            </Button>
           </section>
         )}
 
@@ -80,7 +91,7 @@ export function HomeScreen() {
             </div>
           )}
           <p className="text-center text-xs leading-5 text-mist/80 dark:text-paper/40">
-            העמודים נשמרים בדפדפן עד לייצוא או רענון
+            העמודים נשמרים בזיכרון עד שליחה, ייצוא או רענון
           </p>
         </div>
       </div>

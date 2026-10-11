@@ -1,4 +1,4 @@
-import { ChevronLeft, ChevronRight, Crop, Download, FileDown, Trash2 } from 'lucide-react'
+import { ChevronLeft, ChevronRight, Crop, Download, FilePlus2, FileDown, Trash2 } from 'lucide-react'
 import type { ReactNode } from 'react'
 import { filteredSource, filterCss } from '../lib/view-filter'
 import { useScan } from '../state/scan-context'
@@ -21,6 +21,7 @@ export function DocumentViewer() {
     downloadAll,
     exportPdf,
     closePages,
+    startNewDocument,
   } = useScan()
 
   const selected = pages.find((page) => page.id === selectedId) ?? pages[0]
@@ -132,6 +133,17 @@ export function DocumentViewer() {
             ייצוא ל-PDF
           </Button>
         </div>
+        <Button
+          variant="secondary"
+          className="w-full"
+          disabled={Boolean(busy)}
+          onClick={() => {
+            if (window.confirm('למחוק את כל העמודים ולהתחיל מסמך חדש?')) startNewDocument()
+          }}
+        >
+          <FilePlus2 className="size-4" />
+          מסמך חדש
+        </Button>
       </footer>
     </div>
   )

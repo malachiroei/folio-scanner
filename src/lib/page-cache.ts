@@ -6,6 +6,13 @@ const warps = new Map<string, HTMLCanvasElement>()
 const magics = new Map<string, HTMLCanvasElement>()
 const magicJobs = new Map<string, MagicJob>()
 
+/** Drops every cached warp and magic render (a new document starts with no old pixels in memory). */
+export function clearPageCache() {
+  warps.clear()
+  magics.clear()
+  magicJobs.clear()
+}
+
 export function pageKey(sourceUrl: string, corners: Corners): string {
   const n = (value: number) => Math.round(value)
   return [
