@@ -317,8 +317,8 @@ function smoothstep(edge0: number, edge1: number, value: number) {
 }
 
 /**
- * Magic scan: divide by the paper light (shadow removal), push near-white to pure white,
- * deepen ink with an S-curve, and keep strongly colored pixels (stamps, logos, signatures).
+ * Magic scan, step one: divide by the paper light so shadows and lighting gradients vanish.
+ * Sharpening and the ink curve follow in applyCanvasMagic.
  */
 async function filterMagic(image: ImageData) {
   const { data, width, height } = image
@@ -338,27 +338,45 @@ async function filterMagic(image: ImageData) {
       const background = top * (1 - row.weight) + bottom * row.weight
       const gain = Math.min(4, 255 / Math.max(background, 30))
 
-      const red = Math.min(255, (data[index] ?? 0) * gain)
-      const green = Math.min(255, (data[index + 1] ?? 0) * gain)
-      const blue = Math.min(255, (data[index + 2] ?? 0) * gain)
+      // Paper is now ~255 everywhere. Contrast comes later, after sharpening.
+      data[index] = Math.min(255, (data[index] ?? 0) * gain)
+      data[index + 1] = Math.min(255, (data[index + 1] ?? 0) * gain)
+      data[index + 2] = Math.min(255, (data[index + 2] ?? 0) * gain)
+      data[index + 3] = 255
+      index += 4
+    }
+  }
+}
+
+/**
+ * Ink curve on the shadow-flattened, sharpened page. A steep gamma darkens antialiased text and
+ * thin grid lines toward black; anything within ~8% of the paper level snaps to pure #FFFFFF.
+ * Strongly colored pixels (stamps, logos, signatures) keep their hue.
+ */
+async function inkCurve(image: ImageData) {
+  const { data, width, height } = image
+  const lut = new Uint8ClampedArray(256)
+  for (let level = 0; level < 256; level += 1) {
+    const s = Math.min(1, Math.max(0, (level - 24) / (214 - 24)))
+    const toWhite = smoothstep(0.84, 0.96, s)
+    lut[level] = 255 * (s ** 2.3 * (1 - toWhite) + toWhite)
+  }
+  for (let y = 0; y < height; y += 1) {
+    if (y % 64 === 0) await nextFrame()
+    let index = y * width * 4
+    for (let x = 0; x < width; x += 1) {
+      const red = data[index] ?? 0
+      const green = data[index + 1] ?? 0
+      const blue = data[index + 2] ?? 0
       const level = 0.299 * red + 0.587 * green + 0.114 * blue
-
-      // Within ~13% of the paper light goes to pure white; ink is deepened by the S-curve.
-      const s = Math.min(1, Math.max(0, (level - 28) / (222 - 28)))
-      const curved = s * 0.35 + s * s * (3 - 2 * s) * 0.65
-      const target = 255 * curved
+      const target = lut[Math.round(level)] ?? 255
       const lift = level > 1 ? target / level : 0
-
       const peak = Math.max(red, green, blue)
       const saturation = peak > 1 ? (peak - Math.min(red, green, blue)) / peak : 0
-      const keep = smoothstep(0.16, 0.38, saturation)
-
-      const outRed = Math.min(255, red * lift)
-      const outGreen = Math.min(255, green * lift)
-      const outBlue = Math.min(255, blue * lift)
-      data[index] = target + (outRed - target) * keep
-      data[index + 1] = target + (outGreen - target) * keep
-      data[index + 2] = target + (outBlue - target) * keep
+      const keep = smoothstep(0.2, 0.42, saturation)
+      data[index] = target + (Math.min(255, red * lift) - target) * keep
+      data[index + 1] = target + (Math.min(255, green * lift) - target) * keep
+      data[index + 2] = target + (Math.min(255, blue * lift) - target) * keep
       data[index + 3] = 255
       index += 4
     }
@@ -506,7 +524,8 @@ async function processCopy(
 export async function applyCanvasMagic(source: HTMLCanvasElement): Promise<HTMLCanvasElement> {
   return processCopy(source, async (pixels) => {
     await filterMagic(pixels)
-    await unsharp(pixels, 0.5)
+    await unsharp(pixels, 1.1)
+    await inkCurve(pixels)
   })
 }
 

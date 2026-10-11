@@ -27,10 +27,10 @@ function sourceSize(image: CanvasImageSource): { width: number; height: number }
   return { width: 0, height: 0 }
 }
 
-function takeSample(image: CanvasImageSource): Sample | null {
+function takeSample(image: CanvasImageSource, maxEdge: number): Sample | null {
   const { width, height } = sourceSize(image)
   if (width < 1 || height < 1) return null
-  const scale = Math.min(1, DETECT_MAX / Math.max(width, height))
+  const scale = Math.min(1, maxEdge / Math.max(width, height))
   const w = Math.max(1, Math.round(width * scale))
   const h = Math.max(1, Math.round(height * scale))
   const canvas = document.createElement('canvas')
@@ -136,9 +136,11 @@ function morph(source: Uint8Array, width: number, height: number, radius: number
  * Closing fills printed text so the sheet stays one solid blob. Opening then cuts thin
  * bridges (tray rims, a bright wall behind the board) so the sheet separates from them.
  */
-function close(mask: Uint8Array, width: number, height: number): Uint8Array {
-  const closed = morph(morph(mask, width, height, CLOSE_RADIUS, false), width, height, CLOSE_RADIUS, true)
-  return morph(morph(closed, width, height, OPEN_RADIUS, true), width, height, OPEN_RADIUS, false)
+function close(mask: Uint8Array, width: number, height: number, scale: number): Uint8Array {
+  const closeRadius = Math.max(1, Math.round(CLOSE_RADIUS * scale))
+  const openRadius = Math.max(2, Math.round(OPEN_RADIUS * scale))
+  const closed = morph(morph(mask, width, height, closeRadius, false), width, height, closeRadius, true)
+  return morph(morph(closed, width, height, openRadius, true), width, height, openRadius, false)
 }
 
 function pageAspect(corners: Corners): number {
@@ -366,6 +368,119 @@ function scaleUp(point: Point, fromWidth: number, fromHeight: number, toWidth: n
   )
 }
 
+function intersect(a: Point, da: Point, b: Point, db: Point): Point | null {
+  const denominator = da.x * db.y - da.y * db.x
+  if (Math.abs(denominator) < 1e-6) return null
+  const t = ((b.x - a.x) * db.y - (b.y - a.y) * db.x) / denominator
+  return { x: a.x + da.x * t, y: a.y + da.y * t }
+}
+
+/**
+ * Pulls each side inward until a thin band just inside it is mostly white paper. This drops a
+ * strip of red board, tray rim or table that the blob still included. Sides that never find
+ * paper within 8% of the photo are left alone.
+ */
+function tightenQuad(sample: Sample, points: Point[]): Point[] {
+  const corners = orderCorners(points)
+  const quad = [corners.tl, corners.tr, corners.br, corners.bl]
+  const { data, width, height } = sample
+  const mid = {
+    x: quad.reduce((sum, p) => sum + p.x, 0) / 4,
+    y: quad.reduce((sum, p) => sum + p.y, 0) / 4,
+  }
+
+  const read = (x: number, y: number) => {
+    const px = Math.round(x)
+    const py = Math.round(y)
+    if (px < 0 || py < 0 || px >= width || py >= height) return null
+    const index = (py * width + px) * 4
+    const r = data[index] ?? 0
+    const g = data[index + 1] ?? 0
+    const b = data[index + 2] ?? 0
+    const max = Math.max(r, g, b)
+    return { max, saturation: max === 0 ? 0 : (max - Math.min(r, g, b)) / max }
+  }
+
+  let reference = 0
+  let samples = 0
+  for (const u of [0.3, 0.5, 0.7]) {
+    for (const v of [0.3, 0.5, 0.7]) {
+      const top = { x: corners.tl.x + (corners.tr.x - corners.tl.x) * u, y: corners.tl.y + (corners.tr.y - corners.tl.y) * u }
+      const bottom = { x: corners.bl.x + (corners.br.x - corners.bl.x) * u, y: corners.bl.y + (corners.br.y - corners.bl.y) * u }
+      const pixel = read(top.x + (bottom.x - top.x) * v, top.y + (bottom.y - top.y) * v)
+      if (pixel) {
+        reference += pixel.max
+        samples += 1
+      }
+    }
+  }
+  if (samples === 0) return points
+  reference /= samples
+  const isPaper = (x: number, y: number) => {
+    const pixel = read(x, y)
+    return Boolean(pixel && pixel.max > reference * 0.62 && pixel.saturation < 0.35)
+  }
+
+  const maxShift = Math.max(2, Math.round(Math.min(width, height) * 0.08))
+  const origins: Point[] = []
+  const directions: Point[] = []
+  for (let i = 0; i < 4; i += 1) {
+    const a = quad[i]
+    const b = quad[(i + 1) % 4]
+    if (!a || !b) return points
+    const dx = b.x - a.x
+    const dy = b.y - a.y
+    const length = Math.hypot(dx, dy)
+    if (length < 4) return points
+    let nx = -dy / length
+    let ny = dx / length
+    if (nx * (mid.x - a.x) + ny * (mid.y - a.y) < 0) {
+      nx = -nx
+      ny = -ny
+    }
+    let shift = 0
+    let found = false
+    for (let s = 0; s <= maxShift; s += 1) {
+      let hits = 0
+      let total = 0
+      for (let step = 0; step <= 24; step += 1) {
+        const t = 0.1 + (0.8 * step) / 24
+        total += 1
+        if (isPaper(a.x + dx * t + nx * (s + 1.5), a.y + dy * t + ny * (s + 1.5))) hits += 1
+      }
+      if (hits / total >= 0.6) {
+        shift = s
+        found = true
+        break
+      }
+    }
+    if (!found) shift = 0
+    origins.push({ x: a.x + nx * shift, y: a.y + ny * shift })
+    directions.push({ x: dx, y: dy })
+  }
+
+  const result: Point[] = []
+  for (let i = 0; i < 4; i += 1) {
+    const previous = (i + 3) % 4
+    const corner = intersect(
+      origins[previous] ?? mid,
+      directions[previous] ?? mid,
+      origins[i] ?? mid,
+      directions[i] ?? mid,
+    )
+    if (!corner) return points
+    result.push(corner)
+  }
+  return cornersValid(orderCorners(result), width, height) ? result : points
+}
+
+export type DetectOptions = {
+  /** Longest edge of the analysis copy. 360 for a photo, 240 for the live camera. */
+  maxEdge?: number
+  /** Live preview: only the three white-paper passes (no Otsu fallback). */
+  live?: boolean
+}
+
 /**
  * Snaps to the bright, low-saturation sheet (white paper on a colored board or clear tray).
  * Falls back to a looser color pass, then to an Otsu brightness split.
@@ -375,11 +490,14 @@ export function detectDocumentCorners(
   image: CanvasImageSource,
   width: number,
   height: number,
+  options: DetectOptions = {},
 ): { corners: Corners; detected: boolean } {
   const missed = { corners: defaultCorners(width, height, 0.1), detected: false }
   try {
-    const sample = takeSample(image)
+    const maxEdge = options.maxEdge ?? DETECT_MAX
+    const sample = takeSample(image, maxEdge)
     if (!sample) return missed
+    const scale = maxEdge / DETECT_MAX
     // Strictest first: bright white paper, then looser passes. A passing blob must not run
     // off two or more edges of the photo (that is the room, not the sheet).
     const masks = [
@@ -389,10 +507,11 @@ export function detectDocumentCorners(
       () => paperMask(sample, 145, 100),
       () => brightMask(sample),
     ]
+    const passes = options.live ? masks.slice(0, 3) : masks
     let fallback: Candidate | null = null
     let best: Candidate | null = null
-    for (const build of masks) {
-      const blobs = rankBlobs(close(build(), sample.width, sample.height), sample.width, sample.height)
+    for (const build of passes) {
+      const blobs = rankBlobs(close(build(), sample.width, sample.height, scale), sample.width, sample.height)
       for (const blob of blobs) {
         if (blob.touching >= 2) {
           if (!fallback || blob.score > fallback.score) fallback = blob
@@ -401,16 +520,10 @@ export function detectDocumentCorners(
         if (!best || blob.score > best.score) best = blob
       }
     }
-    if (best) {
-      const corners = orderCorners(
-        best.points.map((point) => scaleUp(point, sample.width, sample.height, width, height)),
-      )
-      if (cornersValid(corners, width, height)) return { corners, detected: true }
-    }
-    if (fallback) {
-      const corners = orderCorners(
-        fallback.points.map((point) => scaleUp(point, sample.width, sample.height, width, height)),
-      )
+    const chosen = best ?? fallback
+    if (chosen) {
+      const points = tightenQuad(sample, chosen.points)
+      const corners = orderCorners(points.map((point) => scaleUp(point, sample.width, sample.height, width, height)))
       if (cornersValid(corners, width, height)) return { corners, detected: true }
     }
     return missed

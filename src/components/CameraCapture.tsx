@@ -1,6 +1,24 @@
 import { Images, SwitchCamera, X } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
+import { detectDocumentCorners } from '../lib/detect'
+import { distance } from '../lib/geometry'
 import { useScan } from '../state/scan-context'
+import type { Corners } from '../types'
+
+/** Live detection runs about every 140ms on a 240px copy of the video frame. */
+const LIVE_INTERVAL_MS = 140
+const LIVE_EDGE = 240
+const LIVE_MISSES_BEFORE_CLEAR = 5
+
+type LiveQuad = { corners: Corners; width: number; height: number }
+
+function blend(from: Corners, to: Corners, amount: number): Corners {
+  const mix = (a: { x: number; y: number }, b: { x: number; y: number }) => ({
+    x: a.x + (b.x - a.x) * amount,
+    y: a.y + (b.y - a.y) * amount,
+  })
+  return { tl: mix(from.tl, to.tl), tr: mix(from.tr, to.tr), br: mix(from.br, to.br), bl: mix(from.bl, to.bl) }
+}
 
 type ImageCaptureInstance = {
   takePhoto: (settings?: { imageWidth?: number; imageHeight?: number }) => Promise<Blob>
@@ -36,6 +54,57 @@ export function CameraCapture() {
   const [ready, setReady] = useState(false)
   const [capturing, setCapturing] = useState(false)
   const streamRef = useRef<MediaStream | null>(null)
+  const [quad, setQuad] = useState<LiveQuad | null>(null)
+
+  // Live page outline: a light pass on a 240px copy of the current frame, never blocking the video.
+  useEffect(() => {
+    if (!ready) return
+    let stopped = false
+    let timer = 0
+    let frame = 0
+    let current: LiveQuad | null = null
+    let misses = 0
+
+    const tick = () => {
+      if (stopped) return
+      const video = videoRef.current
+      if (video && video.videoWidth > 0 && video.readyState >= 2 && !document.hidden) {
+        const width = video.videoWidth
+        const height = video.videoHeight
+        const found = detectDocumentCorners(video, width, height, { maxEdge: LIVE_EDGE, live: true })
+        if (found.detected) {
+          misses = 0
+          const jump = distance(found.corners.tl, current?.corners.tl ?? found.corners.tl)
+          const smooth = current && current.width === width && jump < width * 0.25
+          current = {
+            corners: smooth && current ? blend(current.corners, found.corners, 0.55) : found.corners,
+            width,
+            height,
+          }
+          setQuad(current)
+        } else {
+          misses += 1
+          if (misses >= LIVE_MISSES_BEFORE_CLEAR && current) {
+            current = null
+            setQuad(null)
+          }
+        }
+      }
+      timer = window.setTimeout(() => {
+        frame = requestAnimationFrame(tick)
+      }, LIVE_INTERVAL_MS)
+    }
+
+    timer = window.setTimeout(() => {
+      frame = requestAnimationFrame(tick)
+    }, LIVE_INTERVAL_MS)
+    return () => {
+      stopped = true
+      window.clearTimeout(timer)
+      cancelAnimationFrame(frame)
+      setQuad(null)
+    }
+  }, [ready, facing])
 
   useEffect(() => {
     const video = videoRef.current
@@ -179,6 +248,28 @@ export function CameraCapture() {
         muted
         playsInline
       />
+      {quad && (
+        <svg
+          viewBox={`0 0 ${quad.width} ${quad.height}`}
+          preserveAspectRatio="xMidYMid meet"
+          className={`pointer-events-none absolute inset-0 h-full w-full ${facing === 'user' ? '-scale-x-100' : ''}`}
+          aria-hidden="true"
+        >
+          <polygon
+            points={[quad.corners.tl, quad.corners.tr, quad.corners.br, quad.corners.bl]
+              .map((point) => `${point.x},${point.y}`)
+              .join(' ')}
+            fill="rgba(231,160,106,0.16)"
+            stroke="#e7a06a"
+            strokeWidth={3}
+            strokeLinejoin="round"
+            vectorEffect="non-scaling-stroke"
+          />
+          {[quad.corners.tl, quad.corners.tr, quad.corners.br, quad.corners.bl].map((point, index) => (
+            <circle key={index} cx={point.x} cy={point.y} r={quad.width * 0.012} fill="#fff" stroke="#e7a06a" strokeWidth={3} vectorEffect="non-scaling-stroke" />
+          ))}
+        </svg>
+      )}
       <div className="absolute inset-x-0 top-0 flex items-center justify-between px-4 pt-[max(0.75rem,env(safe-area-inset-top))]">
         <button
           type="button"
