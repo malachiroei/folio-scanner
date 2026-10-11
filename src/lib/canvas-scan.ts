@@ -39,16 +39,19 @@ const MIN_EDGE = 2800
 const MAX_EDGE = 3508
 const MAX_UPSCALE = 3
 
-/** Global paper-white normalization — never a local photo mean. */
+/** Global paper-white + black-point levels — never a local photo mean. */
 const LIGHT_GRID = 8
 const WHITE_PERCENTILE = 0.95
+const BLACK_PERCENTILE = 0.05
 const PAPER_FLOOR = 200
 const PAPER_LO = 220
-const INK_HI = 75
-const INK_BLACK = 5
-const MID_GAMMA = 0.95
-const SAT_BOOST = 1.4
-const SHARPEN_AMOUNT = 0.5
+const BLACK_POINT = 35
+const BLACK_MIN = 28
+const BLACK_MAX = 42
+const SAT_BOOST = 1.35
+const GREY_CHROMA = 8
+const SHARPEN_AMOUNT = 1.25
+const SHARPEN_THRESHOLD = 3
 const BW_THRESHOLD = 148
 const YIELD_MS = 24
 
@@ -242,21 +245,17 @@ function smoothstep(t: number) {
 }
 
 /**
- * After paper stretch: ink to #050505, paper rolled to #FFFFFF,
- * midtones (photos, stamps, charts) keep a mild S-curve with gamma 0.95.
+ * After two-point levels: midtone S-curve for photo punch, then paper
+ * above 220 rolls to #FFFFFF. Blacks are already at the floor from levels.
  */
 function magicCurve(luma: number) {
-  if (luma < INK_HI) {
-    const t = luma / INK_HI
-    return INK_BLACK + (INK_HI - INK_BLACK) * t ** 1.3
+  const n = luma / 255
+  const s = n < 0.5 ? 2 * n * n : 1 - 2 * (1 - n) * (1 - n)
+  const contrasted = (n * 0.45 + s * 0.55) * 255
+  if (contrasted > PAPER_LO) {
+    return contrasted + (255 - contrasted) * smoothstep((contrasted - PAPER_LO) / 18)
   }
-  if (luma > PAPER_LO) {
-    return luma + (255 - luma) * smoothstep((luma - PAPER_LO) / 18)
-  }
-  const n = (luma - INK_HI) / (PAPER_LO - INK_HI)
-  const s = n * n * (3 - 2 * n)
-  const mild = n * 0.7 + s * 0.3
-  return INK_HI + (PAPER_LO - INK_HI) * mild ** MID_GAMMA
+  return contrasted
 }
 
 function buildMagicLut() {
@@ -298,6 +297,31 @@ function pageWhitePoint(luma: Float32Array) {
     hist[Math.min(255, Math.max(0, Math.round(luma[i] ?? 0)))] += 1
   }
   return Math.max(PAPER_FLOOR, histPercentile(hist, luma.length, WHITE_PERCENTILE))
+}
+
+/**
+ * Black floor after white-normalization. Uses the 5th percentile when it
+ * looks like ink/shadow (~28–42), otherwise the CamScanner-style floor of 35
+ * so haze at 50–60 drops to a real black without crushing midtones.
+ */
+function pageBlackPoint(luma: Float32Array, grid: Float32Array, width: number, height: number) {
+  const hist = new Uint32Array(256)
+  for (let y = 0; y < height; y += 1) {
+    const row = y * width
+    for (let x = 0; x < width; x += 1) {
+      const paper = localPaperWhite(grid, x, y, width, height)
+      const norm = Math.min(255, Math.max(0, ((luma[row + x] ?? 0) / paper) * 255))
+      hist[norm | 0] += 1
+    }
+  }
+  const measured = histPercentile(hist, luma.length, BLACK_PERCENTILE)
+  if (measured < 12 || measured > 48) return BLACK_POINT
+  return Math.min(BLACK_MAX, Math.max(BLACK_MIN, measured))
+}
+
+function stretchLevels(normL: number, blackPoint: number) {
+  const span = Math.max(1, 255 - blackPoint)
+  return Math.min(255, Math.max(0, ((normL - blackPoint) / span) * 255))
 }
 
 /**
@@ -351,14 +375,15 @@ function localPaperWhite(grid: Float32Array, x: number, y: number, width: number
 }
 
 /**
- * Stretch every pixel by the paper white of its page quadrant, then apply the
- * Magic Color curve. Photos stay at their natural dark values because the
- * divisor is always paper (~200–255), never a local car/asphalt mean.
+ * White-normalize against paper, then stretch black→white so tires/ink drop
+ * to punchy darks. Midtone S-curve and 1.35× vibrance restore photo color
+ * without touching near-greys or the cleaned paper.
  */
 async function applyToneAndColor(
   data: Uint8ClampedArray,
   luma: Float32Array,
   grid: Float32Array,
+  blackPoint: number,
   width: number,
   height: number,
   clock: { last: number },
@@ -374,7 +399,8 @@ async function applyToneAndColor(
       const srcL = luma[p] ?? 0
       const paper = localPaperWhite(grid, x, y, width, height)
       const normL = Math.min(255, Math.max(0, (srcL / paper) * 255))
-      const next = MAGIC_LUT[normL | 0] ?? normL
+      const stretched = stretchLevels(normL, blackPoint)
+      const next = MAGIC_LUT[stretched | 0] ?? stretched
 
       let outR: number
       let outG: number
@@ -398,7 +424,8 @@ async function applyToneAndColor(
         outB = next + (outB - next) * keep
       }
 
-      const sat = 1 + (SAT_BOOST - 1) * (1 - paperMix)
+      const chroma = Math.max(outR, outG, outB) - Math.min(outR, outG, outB)
+      const sat = chroma < GREY_CHROMA ? 1 : 1 + (SAT_BOOST - 1) * (1 - paperMix)
       const mid = 0.299 * outR + 0.587 * outG + 0.114 * outB
       data[i] = Math.min(255, Math.max(0, mid + (outR - mid) * sat))
       data[i + 1] = Math.min(255, Math.max(0, mid + (outG - mid) * sat))
@@ -408,8 +435,8 @@ async function applyToneAndColor(
   }
 }
 
-/** 3×3 unsharp mask on luminance so text, tables, and barcodes stay razor-sharp. */
-function sharpen3x3(image: ImageData, amount: number) {
+/** 3×3 unsharp on luminance. Amount 1.25 / threshold 3 for Magic Color; gentler for warp. */
+function sharpen3x3(image: ImageData, amount: number, threshold = 1.2) {
   const { data, width, height } = image
   const gray = new Float32Array(width * height)
   for (let i = 0, p = 0; p < gray.length; p += 1, i += 4) {
@@ -419,14 +446,11 @@ function sharpen3x3(image: ImageData, amount: number) {
     for (let x = 1; x < width - 1; x += 1) {
       const p = y * width + x
       const center = gray[p] ?? 0
-      const lap =
-        center * 4 -
-        (gray[p - 1] ?? 0) -
-        (gray[p + 1] ?? 0) -
-        (gray[p - width] ?? 0) -
-        (gray[p + width] ?? 0)
-      const next = center + lap * amount
-      if (Math.abs(next - center) < 1.2) continue
+      const blur =
+        ((gray[p - 1] ?? 0) + (gray[p + 1] ?? 0) + (gray[p - width] ?? 0) + (gray[p + width] ?? 0)) / 4
+      const delta = center - blur
+      if (Math.abs(delta) < threshold) continue
+      const next = center + delta * amount
       const lift = center > 1 ? next / center : 1
       const i = p * 4
       data[i] = Math.min(255, Math.max(0, (data[i] ?? 0) * lift))
@@ -442,8 +466,9 @@ async function applyMagicColor(image: ImageData) {
   const luma = extractLuma(data, width * height)
   const whitePoint = pageWhitePoint(luma)
   const grid = paperWhiteGrid(luma, width, height, whitePoint)
-  await applyToneAndColor(data, luma, grid, width, height, clock)
-  sharpen3x3(image, SHARPEN_AMOUNT)
+  const blackPoint = pageBlackPoint(luma, grid, width, height)
+  await applyToneAndColor(data, luma, grid, blackPoint, width, height, clock)
+  sharpen3x3(image, SHARPEN_AMOUNT, SHARPEN_THRESHOLD)
 }
 
 async function applyFastBlackWhite(image: ImageData) {
@@ -452,6 +477,7 @@ async function applyFastBlackWhite(image: ImageData) {
   const luma = extractLuma(data, width * height)
   const whitePoint = pageWhitePoint(luma)
   const grid = paperWhiteGrid(luma, width, height, whitePoint)
+  const blackPoint = pageBlackPoint(luma, grid, width, height)
   for (let y = 0; y < height; y += 1) {
     if (y % 48 === 0) await yieldBusy(clock)
     let p = y * width
@@ -459,7 +485,8 @@ async function applyFastBlackWhite(image: ImageData) {
     for (let x = 0; x < width; x += 1, p += 1, i += 4) {
       const paper = localPaperWhite(grid, x, y, width, height)
       const normL = Math.min(255, Math.max(0, ((luma[p] ?? 0) / paper) * 255))
-      const ink = normL < BW_THRESHOLD ? 0 : 255
+      const stretched = stretchLevels(normL, blackPoint)
+      const ink = stretched < BW_THRESHOLD ? 0 : 255
       data[i] = ink
       data[i + 1] = ink
       data[i + 2] = ink
