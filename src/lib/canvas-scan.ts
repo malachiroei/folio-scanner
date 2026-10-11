@@ -47,8 +47,9 @@ const TEX_WIDTH = 280
 const PAPER_FLAT = 9
 const PHOTO_VAR = 12
 const PAPER_KNEE = 225
-const GAMMA = 0.85
-const SAT_BOOST = 1.18
+const PHOTO_BLACK = 26
+const PHOTO_WHITE = 240
+const SAT_BOOST = 1.6
 
 function sourceSize(image: CanvasImageSource): { width: number; height: number } {
   if (image instanceof HTMLImageElement) {
@@ -511,39 +512,68 @@ function paperKnee(luma: number) {
   return luma + (255 - luma) * s
 }
 
+function flattenPixel(src: Uint8ClampedArray, bg: Uint8ClampedArray, i: number) {
+  const red = Math.min(255, ((src[i] ?? 0) / Math.max(bg[i] ?? 0, 18)) * 255)
+  const green = Math.min(255, ((src[i + 1] ?? 0) / Math.max(bg[i + 1] ?? 0, 18)) * 255)
+  const blue = Math.min(255, ((src[i + 2] ?? 0) / Math.max(bg[i + 2] ?? 0, 18)) * 255)
+  return { red, green, blue, luma: 0.299 * red + 0.587 * green + 0.114 * blue }
+}
+
+function histPercentile(hist: Uint32Array, total: number, q: number) {
+  const target = total * q
+  let acc = 0
+  for (let value = 0; value < 256; value += 1) {
+    acc += hist[value] ?? 0
+    if (acc >= target) return value
+  }
+  return q < 0.5 ? 0 : 255
+}
+
+/** 5th–95th luminance of textured photo pixels after paper flatten. */
+function photoStretch(src: Uint8ClampedArray, bg: Uint8ClampedArray, texture: Uint8Array) {
+  const hist = new Uint32Array(256)
+  let count = 0
+  const pixels = src.length / 4
+  for (let p = 0, i = 0; p < pixels; p += 1, i += 4) {
+    if ((texture[p] ?? 0) < PHOTO_VAR) continue
+    const bin = Math.min(255, Math.max(0, Math.round(flattenPixel(src, bg, i).luma)))
+    hist[bin] += 1
+    count += 1
+  }
+  if (count < 64) return { lo: 48, hi: 210, span: 162 }
+  const lo = histPercentile(hist, count, 0.05)
+  const hi = histPercentile(hist, count, 0.95)
+  const span = Math.max(hi - lo, 48)
+  return { lo, hi: lo + span, span }
+}
+
 /**
- * Magic Color: white paper, vivid stamps/vouchers, greyscale photos left intact.
+ * Magic Color: white paper, vivid stamps/vouchers, photos with a real black point.
  * Paper vs photo is local variance — never saturation (cars and asphalt are monochrome).
  */
 function magicColor(src: Uint8ClampedArray, bg: Uint8ClampedArray, texture: Uint8Array) {
+  const stretch = photoStretch(src, bg, texture)
   const pixels = src.length / 4
   for (let p = 0, i = 0; p < pixels; p += 1, i += 4) {
-    const red0 = src[i] ?? 0
-    const green0 = src[i + 1] ?? 0
-    const blue0 = src[i + 2] ?? 0
-    const br = Math.max(bg[i] ?? 0, 18)
-    const bg_ = Math.max(bg[i + 1] ?? 0, 18)
-    const bb = Math.max(bg[i + 2] ?? 0, 18)
-    const red = Math.min(255, (red0 / br) * 255)
-    const green = Math.min(255, (green0 / bg_) * 255)
-    const blue = Math.min(255, (blue0 / bb) * 255)
-    const luma = 0.299 * red + 0.587 * green + 0.114 * blue
+    const { red, green, blue, luma } = flattenPixel(src, bg, i)
     const tex = texture[p] ?? 0
     const photo = tex >= PHOTO_VAR
     const flat = tex <= PAPER_FLAT
+    const sat = Math.max(red, green, blue) - Math.min(red, green, blue)
 
     let next = luma
-    if (!photo && flat && luma >= PAPER_KNEE) {
+    if (!photo && flat && sat < 18 && luma >= PAPER_KNEE) {
       next = paperKnee(luma)
-    } else {
-      next = 255 * (luma / 255) ** GAMMA
+    } else if (photo) {
+      next = PHOTO_BLACK + ((luma - stretch.lo) / stretch.span) * (PHOTO_WHITE - PHOTO_BLACK)
+      if (next < 8) next = 8
+      else if (next > 248) next = 248
     }
 
     const scale = luma > 1 ? next / luma : 0
     let outR = red * scale
     let outG = green * scale
     let outB = blue * scale
-    const sat = Math.max(outR, outG, outB) - Math.min(outR, outG, outB)
     if (sat > 12) {
       const mid = 0.299 * outR + 0.587 * outG + 0.114 * outB
       outR = mid + (outR - mid) * SAT_BOOST
