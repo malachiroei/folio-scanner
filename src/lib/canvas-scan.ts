@@ -1,4 +1,4 @@
-import type { Corners, FilterMode, Point } from '../types'
+﻿import type { Corners, FilterMode, Point } from '../types'
 import { distance, outputSize } from './geometry'
 import { nextFrame } from './image'
 
@@ -385,8 +385,10 @@ async function filterMagic(image: ImageData) {
   }
 }
 
-const INK_BLACK = 80 // at or below this level a pixel is fully inked
-const INK_FLOOR = 17 // #111111, the darkest ink
+const INK_BLACK = 90 // at or below this level a pixel is fully inked
+const INK_FLOOR = 10 // #0A0A0A, the darkest ink
+const EDGE_MARGIN = 0.05 // width of the perimeter band, as a share of the shorter side
+const EDGE_KNEE = 130 // inside that band, levels from here up fade to pure white at the very edge
 const PAPER_KNEE = 192 // normalized levels from here up fade to paper (fully white by ~208)
 const PAPER_KNEE_OUT = 232 // where the linear stretch ends before the white ramp
 
@@ -407,15 +409,26 @@ async function inkCurve(image: ImageData) {
     const toWhite = smoothstep(PAPER_KNEE, PAPER_KNEE + 16, level)
     lut[level] = ink * (1 - toWhite) + 255 * toWhite
   }
+  // Lens vignette and the shadow of the page edge leave the outer margin grayer than the light map
+  // can explain. Inside this band the paper threshold drops toward the very edge, so the margin
+  // is lifted to pure white. Real ink is far darker than the lowered threshold and is untouched.
+  const margin = Math.max(24, Math.round(Math.min(width, height) * EDGE_MARGIN))
   for (let y = 0; y < height; y += 1) {
     if (y % 64 === 0) await nextFrame()
     let index = y * width * 4
+    const fromY = Math.min(y, height - 1 - y)
     for (let x = 0; x < width; x += 1) {
       const red = data[index] ?? 0
       const green = data[index + 1] ?? 0
       const blue = data[index + 2] ?? 0
       const level = 0.299 * red + 0.587 * green + 0.114 * blue
-      const target = lut[Math.round(level)] ?? 255
+      let target = lut[Math.round(level)] ?? 255
+      const fromEdge = Math.min(x, width - 1 - x, fromY)
+      if (fromEdge < margin) {
+        const strength = 1 - smoothstep(0, margin, fromEdge)
+        const edgeWhite = smoothstep(EDGE_KNEE, EDGE_KNEE + 20, level) * strength
+        target = target * (1 - edgeWhite) + 255 * edgeWhite
+      }
       const lift = level > 1 ? target / level : 0
       const peak = Math.max(red, green, blue)
       const saturation = peak > 1 ? (peak - Math.min(red, green, blue)) / peak : 0
@@ -467,10 +480,10 @@ async function filterBlackWhite(image: ImageData) {
 }
 
 /**
- * Unsharp mask on luminance (box blur radius 2). Small deltas are ignored so the white
+ * Unsharp mask on luminance (box blur of the given radius). Small deltas are ignored so the white
  * background does not pick up noise; edges of text and table lines gain micro-contrast.
  */
-async function unsharp(image: ImageData, amount: number, radius = 2) {
+async function unsharp(image: ImageData, amount: number, radius = 2, brighten = 1) {
   const { data, width, height } = image
   const gray = new Float32Array(width * height)
   for (let i = 0, p = 0; p < gray.length; p += 1, i += 4) {
@@ -505,7 +518,10 @@ async function unsharp(image: ImageData, amount: number, radius = 2) {
       const p = y * width + x
       // Soft threshold: differences under 2 levels (noise, JPEG blocks) get no boost at all and larger
       // ones fade in, so flat paper stays clean and edges are never kinked.
-      const raw = ((gray[p] ?? 0) - (column[y] ?? 0)) * amount
+      // `brighten` scales only the positive side (pixels brighter than their surroundings), so dark
+      // strokes gain the full boost while bright halos beside them stay small.
+      const diff = (gray[p] ?? 0) - (column[y] ?? 0)
+      const raw = diff * amount * (diff > 0 ? brighten : 1)
       const delta = raw - Math.max(-2, Math.min(2, raw))
       if (delta === 0) continue
       const i = p * 4
@@ -584,8 +600,9 @@ async function processCopy(
 export async function applyCanvasMagic(source: HTMLCanvasElement): Promise<HTMLCanvasElement> {
   return processCopy(source, async (pixels) => {
     await filterMagic(pixels)
-    await unsharp(pixels, 0.8)
-    await unsharp(pixels, 0.5, 1)
+    // Micro-contrast on ink edges: a broad pass for stroke body, then the strong 1px pass (amount 1.3).
+    await unsharp(pixels, 0.6, 2, 0.6)
+    await unsharp(pixels, 1.3, 1, 0.5)
     await inkCurve(pixels)
   })
 }
