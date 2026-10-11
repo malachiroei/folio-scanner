@@ -1,5 +1,5 @@
 import type { Corners, Point } from '../types'
-import { clampPoint, cornersValid, defaultCorners, distance, orderCorners, polygonArea } from './geometry'
+import { clampPoint, cornersValid, distance, inwardPageCorners, orderCorners, polygonArea } from './geometry'
 
 /**
  * Pure canvas detection. No OpenCV, no WebAssembly, no script download:
@@ -368,6 +368,131 @@ function scaleUp(point: Point, fromWidth: number, fromHeight: number, toWidth: n
   )
 }
 
+/* ---------- white paper on a white desk: shadow and edge based detection ---------- */
+
+function lumaOf(sample: Sample): Float32Array {
+  const { data, width, height } = sample
+  const gray = new Float32Array(width * height)
+  for (let pixel = 0, index = 0; pixel < gray.length; pixel += 1, index += 4) {
+    gray[pixel] = 0.299 * (data[index] ?? 0) + 0.587 * (data[index + 1] ?? 0) + 0.114 * (data[index + 2] ?? 0)
+  }
+  return gray
+}
+
+/** Separable box max (dilate) or min (erode) on a float image. */
+function rankFilter(source: Float32Array, width: number, height: number, radius: number, max: boolean) {
+  const pick = max ? Math.max : Math.min
+  const horizontal = new Float32Array(source.length)
+  for (let y = 0; y < height; y += 1) {
+    const row = y * width
+    for (let x = 0; x < width; x += 1) {
+      let value = source[row + x] ?? 0
+      for (let k = -radius; k <= radius; k += 1) {
+        const nx = Math.min(width - 1, Math.max(0, x + k))
+        value = pick(value, source[row + nx] ?? 0)
+      }
+      horizontal[row + x] = value
+    }
+  }
+  const output = new Float32Array(source.length)
+  for (let x = 0; x < width; x += 1) {
+    for (let y = 0; y < height; y += 1) {
+      let value = horizontal[y * width + x] ?? 0
+      for (let k = -radius; k <= radius; k += 1) {
+        const ny = Math.min(height - 1, Math.max(0, y + k))
+        value = pick(value, horizontal[ny * width + x] ?? 0)
+      }
+      output[y * width + x] = value
+    }
+  }
+  return output
+}
+
+function boxBlur(source: Float32Array, width: number, height: number, radius: number) {
+  const span = radius * 2 + 1
+  const horizontal = new Float32Array(source.length)
+  for (let y = 0; y < height; y += 1) {
+    const row = y * width
+    let sum = 0
+    for (let k = -radius; k <= radius; k += 1) sum += source[row + Math.min(width - 1, Math.max(0, k))] ?? 0
+    for (let x = 0; x < width; x += 1) {
+      horizontal[row + x] = sum / span
+      sum += (source[row + Math.min(width - 1, x + radius + 1)] ?? 0) - (source[row + Math.max(0, x - radius)] ?? 0)
+    }
+  }
+  const output = new Float32Array(source.length)
+  for (let x = 0; x < width; x += 1) {
+    let sum = 0
+    for (let k = -radius; k <= radius; k += 1) sum += horizontal[Math.min(height - 1, Math.max(0, k)) * width + x] ?? 0
+    for (let y = 0; y < height; y += 1) {
+      output[y * width + x] = sum / span
+      sum +=
+        (horizontal[Math.min(height - 1, y + radius + 1) * width + x] ?? 0) -
+        (horizontal[Math.max(0, y - radius) * width + x] ?? 0)
+    }
+  }
+  return output
+}
+
+/**
+ * Regions enclosed by physical page boundaries, for a sheet that is as white as its desk.
+ * A grayscale closing (the bilateral-blur role) erases text and table grids but keeps the
+ * sheet's outline. Sobel edges on that flattened image catch the faint step and the shadow along
+ * the paper edge; the threshold adapts to the strongest edges in the frame. What remains after
+ * removing the dilated edges are closed regions: the sheet is one of them, the desk is another.
+ */
+function edgeRegions(sample: Sample, scale: number): Uint8Array {
+  const { width, height } = sample
+  const gray = lumaOf(sample)
+  const radius = Math.max(2, Math.round(4 * scale))
+  const closed = rankFilter(rankFilter(gray, width, height, radius, true), width, height, radius, false)
+  const smooth = boxBlur(boxBlur(closed, width, height, 1), width, height, 1)
+
+  const magnitude = new Float32Array(width * height)
+  const bins = new Uint32Array(400)
+  let counted = 0
+  for (let y = 1; y < height - 1; y += 1) {
+    for (let x = 1; x < width - 1; x += 1) {
+      const at = (dx: number, dy: number) => smooth[(y + dy) * width + x + dx] ?? 0
+      const gx = (at(1, -1) + 2 * at(1, 0) + at(1, 1) - at(-1, -1) - 2 * at(-1, 0) - at(-1, 1)) / 8
+      const gy = (at(-1, 1) + 2 * at(0, 1) + at(1, 1) - at(-1, -1) - 2 * at(0, -1) - at(1, -1)) / 8
+      const value = Math.hypot(gx, gy)
+      magnitude[y * width + x] = value
+      const bin = Math.min(399, Math.floor(value * 20))
+      bins[bin] = (bins[bin] ?? 0) + 1
+      counted += 1
+    }
+  }
+  let seen = 0
+  let p97 = 0
+  for (let bin = 0; bin < 400; bin += 1) {
+    seen += bins[bin] ?? 0
+    if (seen >= counted * 0.97) {
+      p97 = bin / 20
+      break
+    }
+  }
+  const threshold = Math.max(0.7, Math.min(p97 * 0.5, 3.5))
+
+  const edges = new Uint8Array(width * height)
+  for (let i = 0; i < edges.length; i += 1) edges[i] = (magnitude[i] ?? 0) > threshold ? 1 : 0
+  const thick = morph(edges, width, height, 1, false)
+  const regions = new Uint8Array(thick.length)
+  for (let i = 0; i < regions.length; i += 1) regions[i] = thick[i] ? 0 : 1
+  const openRadius = Math.max(2, Math.round(3 * scale))
+  return morph(morph(regions, width, height, openRadius, true), width, height, openRadius, false)
+}
+
+/** Edge regions lose about the edge thickness on each side; give it back. */
+function pushOut(points: Point[], amount: number): Point[] {
+  const cx = points.reduce((sum, p) => sum + p.x, 0) / points.length
+  const cy = points.reduce((sum, p) => sum + p.y, 0) / points.length
+  return points.map((p) => {
+    const length = Math.hypot(p.x - cx, p.y - cy) || 1
+    return { x: p.x + ((p.x - cx) / length) * amount, y: p.y + ((p.y - cy) / length) * amount }
+  })
+}
+
 function intersect(a: Point, da: Point, b: Point, db: Point): Point | null {
   const denominator = da.x * db.y - da.y * db.x
   if (Math.abs(denominator) < 1e-6) return null
@@ -492,7 +617,7 @@ export function detectDocumentCorners(
   height: number,
   options: DetectOptions = {},
 ): { corners: Corners; detected: boolean } {
-  const missed = { corners: defaultCorners(width, height, 0.1), detected: false }
+  const missed = { corners: inwardPageCorners(width, height), detected: false }
   try {
     const maxEdge = options.maxEdge ?? DETECT_MAX
     const sample = takeSample(image, maxEdge)
@@ -520,9 +645,17 @@ export function detectDocumentCorners(
         if (!best || blob.score > best.score) best = blob
       }
     }
-    const chosen = best ?? fallback
-    if (chosen) {
-      const points = tightenQuad(sample, chosen.points)
+    let points: Point[] | null = best ? best.points : null
+    if (!points) {
+      // White sheet on a white desk: the brightness passes see one big blob touching the frame.
+      // Look for the sheet's own boundary instead, and ignore regions that run off the photo.
+      const regions = rankBlobs(edgeRegions(sample, scale), sample.width, sample.height)
+      const inside = regions.find((blob) => blob.touching < 2)
+      if (inside) points = pushOut(inside.points, 2 * scale + 1)
+    }
+    if (!points && fallback) points = fallback.points
+    if (points) {
+      points = tightenQuad(sample, points)
       const corners = orderCorners(points.map((point) => scaleUp(point, sample.width, sample.height, width, height)))
       if (cornersValid(corners, width, height)) return { corners, detected: true }
     }

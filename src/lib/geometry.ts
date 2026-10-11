@@ -81,6 +81,30 @@ export function defaultCorners(width: number, height: number, inset = 0.08): Cor
   }
 }
 
+/**
+ * A centered, vertical A4-shaped rectangle (1:1.414) with `pad` of empty space on every side.
+ * Used when no page is found, so the pins start near where a page usually is instead of at the
+ * very edges of the photo.
+ */
+export function inwardPageCorners(width: number, height: number, pad = 0.12): Corners {
+  const maxWidth = width * (1 - 2 * pad)
+  const maxHeight = height * (1 - 2 * pad)
+  let pageHeight = maxHeight
+  let pageWidth = pageHeight / Math.SQRT2
+  if (pageWidth > maxWidth) {
+    pageWidth = maxWidth
+    pageHeight = pageWidth * Math.SQRT2
+  }
+  const left = (width - pageWidth) / 2
+  const top = (height - pageHeight) / 2
+  return {
+    tl: { x: left, y: top },
+    tr: { x: left + pageWidth, y: top },
+    br: { x: left + pageWidth, y: top + pageHeight },
+    bl: { x: left, y: top + pageHeight },
+  }
+}
+
 export function orderCorners(points: Point[]): Corners {
   if (points.length !== 4) {
     throw new Error('לחיתוך דרושות 4 פינות.')

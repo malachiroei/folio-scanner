@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { detectDocumentCorners } from '../lib/detect'
-import { cornersValid, defaultCorners } from '../lib/geometry'
+import { cornersValid, defaultCorners, inwardPageCorners } from '../lib/geometry'
 import { isOpenCvReady, loadOpenCv } from '../lib/opencv'
 import {
   canvasToJpegBlob,
@@ -255,7 +255,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
         sourceUrl: normalized.url,
         width: normalized.width,
         height: normalized.height,
-        corners: defaultCorners(normalized.width, normalized.height, 0.1),
+        corners: inwardPageCorners(normalized.width, normalized.height),
         filter: 'magic' as const,
         detected: false,
         detecting: true,
@@ -300,7 +300,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     userAdjustedRef.current = false
     const next = {
       ...current,
-      corners: defaultCorners(current.width, current.height, 0.1),
+      corners: inwardPageCorners(current.width, current.height),
       detected: false,
       detecting: true,
     }
@@ -316,7 +316,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     userAdjustedRef.current = true
     const next = {
       ...current,
-      corners: defaultCorners(current.width, current.height, 0.1),
+      corners: inwardPageCorners(current.width, current.height),
       detected: false,
       detecting: false,
     }

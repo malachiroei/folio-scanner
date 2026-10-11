@@ -1,4 +1,4 @@
-﻿import type { Corners, FilterMode, Point } from '../types'
+import type { Corners, FilterMode, Point } from '../types'
 import { outputSize } from './geometry'
 import { nextFrame } from './image'
 
@@ -424,9 +424,8 @@ async function filterBlackWhite(image: ImageData) {
  * Unsharp mask on luminance (box blur radius 2). Small deltas are ignored so the white
  * background does not pick up noise; edges of text and table lines gain micro-contrast.
  */
-async function unsharp(image: ImageData, amount: number) {
+async function unsharp(image: ImageData, amount: number, radius = 2) {
   const { data, width, height } = image
-  const radius = 2
   const gray = new Float32Array(width * height)
   for (let i = 0, p = 0; p < gray.length; p += 1, i += 4) {
     gray[p] = 0.299 * (data[i] ?? 0) + 0.587 * (data[i + 1] ?? 0) + 0.114 * (data[i + 2] ?? 0)
@@ -525,6 +524,7 @@ export async function applyCanvasMagic(source: HTMLCanvasElement): Promise<HTMLC
   return processCopy(source, async (pixels) => {
     await filterMagic(pixels)
     await unsharp(pixels, 1.1)
+    await unsharp(pixels, 0.7, 1)
     await inkCurve(pixels)
   })
 }
