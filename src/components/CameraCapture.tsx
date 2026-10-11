@@ -3,14 +3,17 @@ import { useEffect, useRef, useState } from 'react'
 import { detectDocumentCorners } from '../lib/detect'
 import { distance } from '../lib/geometry'
 import { useScan } from '../state/scan-context'
-import type { Corners } from '../types'
+import type { CaptureHint, Corners } from '../types'
 
 /** Live detection runs about every 140ms on a 240px copy of the video frame. */
 const LIVE_INTERVAL_MS = 140
 const LIVE_EDGE = 240
 const LIVE_MISSES_BEFORE_CLEAR = 5
 
-type LiveQuad = { corners: Corners; width: number; height: number }
+type LiveQuad = { corners: Corners; width: number; height: number; at: number }
+
+/** A live outline older than this no longer matches what the camera sees. */
+const LIVE_MAX_AGE_MS = 900
 
 function blend(from: Corners, to: Corners, amount: number): Corners {
   const mix = (a: { x: number; y: number }, b: { x: number; y: number }) => ({
@@ -55,6 +58,7 @@ export function CameraCapture() {
   const [capturing, setCapturing] = useState(false)
   const streamRef = useRef<MediaStream | null>(null)
   const [quad, setQuad] = useState<LiveQuad | null>(null)
+  const quadRef = useRef<LiveQuad | null>(null)
 
   // Live page outline: a light pass on a 240px copy of the current frame, never blocking the video.
   useEffect(() => {
@@ -80,12 +84,15 @@ export function CameraCapture() {
             corners: smooth && current ? blend(current.corners, found.corners, 0.55) : found.corners,
             width,
             height,
+            at: performance.now(),
           }
+          quadRef.current = current
           setQuad(current)
         } else {
           misses += 1
           if (misses >= LIVE_MISSES_BEFORE_CLEAR && current) {
             current = null
+            quadRef.current = null
             setQuad(null)
           }
         }
@@ -102,6 +109,7 @@ export function CameraCapture() {
       stopped = true
       window.clearTimeout(timer)
       cancelAnimationFrame(frame)
+      quadRef.current = null
       setQuad(null)
     }
   }, [ready, facing])
@@ -199,22 +207,36 @@ export function CameraCapture() {
     }
   }
 
+  /** The outline tracked live at the moment of the tap, as 0..1 fractions of the video frame. */
+  function liveHint(mirrored: boolean): CaptureHint | undefined {
+    const live = quadRef.current
+    if (!live || performance.now() - live.at > LIVE_MAX_AGE_MS) return undefined
+    const unit = (point: { x: number; y: number }) => ({ x: point.x / live.width, y: point.y / live.height })
+    return {
+      corners: { tl: unit(live.corners.tl), tr: unit(live.corners.tr), br: unit(live.corners.br), bl: unit(live.corners.bl) },
+      aspect: live.width / live.height,
+      mirrored,
+    }
+  }
+
   async function capture() {
     if (capturing) return
     setCapturing(true)
+    // Taken before the (slow) photo call, so it describes what the user framed when tapping.
+    const hint = liveHint(false)
     try {
       const photo = await takeSensorPhoto()
       if (photo && photo.size > 0) {
-        ingestBlob(photo)
+        ingestBlob(photo, hint)
         return
       }
-      captureFrame()
+      captureFrame(hint && facing === 'user' ? { ...hint, mirrored: true } : hint)
     } finally {
       setCapturing(false)
     }
   }
 
-  function captureFrame() {
+  function captureFrame(hint?: CaptureHint) {
     const video = videoRef.current
     if (!video || !video.videoWidth) return
     const scale = Math.min(1, 4000 / Math.max(video.videoWidth, video.videoHeight))
@@ -232,7 +254,7 @@ export function CameraCapture() {
     context.drawImage(video, 0, 0, width, height)
     canvas.toBlob(
       (blob) => {
-        if (blob) ingestBlob(blob)
+        if (blob) ingestBlob(blob, hint)
       },
       'image/jpeg',
       0.95,

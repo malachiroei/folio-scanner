@@ -1,4 +1,4 @@
-import type { CornerKey, Corners, Point } from '../types'
+import type { CaptureHint, CornerKey, Corners, Point } from '../types'
 
 export const CORNER_KEYS: CornerKey[] = ['tl', 'tr', 'br', 'bl']
 
@@ -134,4 +134,31 @@ export function outputSize(corners: Corners): { width: number; height: number } 
     width: Math.max(32, Math.round(width * scale)),
     height: Math.max(32, Math.round(height * scale)),
   }
+}
+
+/**
+ * Maps page corners measured on the live video frame onto the photo taken from the same
+ * camera. The video and the photo can have different proportions (for example 16:9 preview
+ * and 4:3 photo); the preview shows the largest centered area of the photo with the video's
+ * proportions, so the corners are placed inside that area. Returns null when the two
+ * disagree on orientation, since the mapping would be a guess.
+ */
+export function mapLiveCorners(hint: CaptureHint, width: number, height: number): Corners | null {
+  const photoAspect = width / height
+  if (!(hint.aspect > 0) || !(photoAspect > 0)) return null
+  if (hint.aspect >= 1 !== photoAspect >= 1 && Math.abs(Math.log(hint.aspect)) > 0.05) return null
+
+  let areaWidth = width
+  let areaHeight = height
+  if (photoAspect > hint.aspect) areaWidth = height * hint.aspect
+  else areaHeight = width / hint.aspect
+  const left = (width - areaWidth) / 2
+  const top = (height - areaHeight) / 2
+
+  const place = (point: Point): Point => {
+    const nx = hint.mirrored ? 1 - point.x : point.x
+    return { x: left + nx * areaWidth, y: top + point.y * areaHeight }
+  }
+  const mapped = orderCorners([place(hint.corners.tl), place(hint.corners.tr), place(hint.corners.br), place(hint.corners.bl)])
+  return cornersValid(mapped, width, height) ? mapped : null
 }

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { detectDocumentCorners } from '../lib/detect'
-import { cornersValid, defaultCorners, inwardPageCorners } from '../lib/geometry'
+import { cornersValid, defaultCorners, inwardPageCorners, mapLiveCorners } from '../lib/geometry'
 import { isOpenCvReady, loadOpenCv } from '../lib/opencv'
 import {
   canvasToJpegBlob,
@@ -12,7 +12,7 @@ import {
 } from '../lib/image'
 import { cachedMagic, cachedWarp, loadMagic, pageKey, storeWarp } from '../lib/page-cache'
 import { paintFastFilter, renderBlackWhite, renderMagic, straightenDocument } from '../lib/process'
-import type { Corners, Draft, EngineStatus, FilterMode, PreviewImage, ScanPage, Screen } from '../types'
+import type { CaptureHint, Corners, Draft, EngineStatus, FilterMode, PreviewImage, ScanPage, Screen } from '../types'
 import { ScanContext } from './scan-context'
 
 function readTheme(): 'light' | 'dark' {
@@ -243,7 +243,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     }
   }
 
-  async function ingestBlob(blob: Blob) {
+  async function ingestBlob(blob: Blob, hint?: CaptureHint) {
     setScreen('prepare')
     setBusy('מכין את התמונה…')
     await nextFrame()
@@ -251,14 +251,17 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     try {
       normalized = await normalizeImage(blob)
       userAdjustedRef.current = false
+      // The outline already tracked live is reused 1:1; detection only runs when the live view had none.
+      const live = hint ? mapLiveCorners(hint, normalized.width, normalized.height) : null
+      detectGen.current += 1
       const next = {
         sourceUrl: normalized.url,
         width: normalized.width,
         height: normalized.height,
-        corners: inwardPageCorners(normalized.width, normalized.height),
+        corners: live ?? inwardPageCorners(normalized.width, normalized.height),
         filter: 'magic' as const,
-        detected: false,
-        detecting: true,
+        detected: live !== null,
+        detecting: live === null,
         snapToken: 0,
         editingId: null,
       }
@@ -267,7 +270,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
       setDraft(next)
       setBusy(null)
       setScreen('corners')
-      scheduleLocate(normalized.url, normalized.width, normalized.height)
+      if (!live) scheduleLocate(normalized.url, normalized.width, normalized.height)
     } catch (error) {
       if (normalized) URL.revokeObjectURL(normalized.url)
       setToast(errorMessage(error))

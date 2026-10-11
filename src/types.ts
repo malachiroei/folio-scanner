@@ -44,3 +44,12 @@ export type PreviewImage = {
   width: number
   height: number
 }
+
+/** Page outline found on the live camera frame, as fractions (0..1) of that frame. */
+export type CaptureHint = {
+  corners: Corners
+  /** Width / height of the video frame the corners were measured on. */
+  aspect: number
+  /** True when the saved picture is a mirrored copy of the video frame. */
+  mirrored: boolean
+}

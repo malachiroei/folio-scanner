@@ -91,32 +91,31 @@ async function decodeFitted(blob: Blob, width: number, height: number): Promise<
   return bitmap
 }
 
+/**
+ * Decode with EXIF orientation applied and a size cap. The resize box must use the
+ * ORIENTED proportions: photos from phones are often stored sideways with an EXIF
+ * rotation, and a raw-sized box would squash the picture into the wrong aspect.
+ */
 async function decodeBitmap(blob: Blob): Promise<ImageBitmap> {
-  const encoded = await readEncodedSize(blob).catch(() => null)
-  if (encoded) {
-    try {
-      return await decodeFitted(blob, encoded.width, encoded.height)
-    } catch {
-      // Resize options were rejected. Decode once below and scale on the canvas.
-    }
-  }
-
   try {
     const probe = await createImageBitmap(blob, { imageOrientation: 'from-image', resizeWidth: 64 })
     if (Math.max(probe.width, probe.height) > 256) return probe
     const aspect = probe.width / Math.max(1, probe.height)
     probe.close()
-    const landscape = aspect >= 1
-    return await decodeFitted(
-      blob,
-      landscape ? MAX_SOURCE_EDGE : MAX_SOURCE_EDGE * aspect,
-      landscape ? MAX_SOURCE_EDGE / aspect : MAX_SOURCE_EDGE,
-    )
-  } catch {
-    return await createImageBitmap(blob)
-  }
-}
 
+    const encoded = await readEncodedSize(blob).catch(() => null)
+    const long = encoded ? Math.max(encoded.width, encoded.height) : MAX_SOURCE_EDGE
+    const short = encoded ? Math.min(encoded.width, encoded.height) : MAX_SOURCE_EDGE / Math.max(aspect, 1 / aspect)
+    const landscape = aspect >= 1
+    const bitmap = await decodeFitted(blob, landscape ? long : short, landscape ? short : long)
+    const decoded = bitmap.width / Math.max(1, bitmap.height)
+    if (Math.abs(decoded - aspect) / aspect < 0.03) return bitmap
+    bitmap.close()
+  } catch {
+    // Resize options were rejected. Decode once below and scale on the canvas.
+  }
+  return await createImageBitmap(blob, { imageOrientation: 'from-image' })
+}
 export async function normalizeImage(blob: Blob): Promise<{ url: string; width: number; height: number }> {
   let bitmap: ImageBitmap
   try {
