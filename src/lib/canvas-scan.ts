@@ -41,26 +41,22 @@ const MAX_UPSCALE = 3
 /** Destination mesh density: piecewise affine cells approximate the homography without seams. */
 const WARP_GRID = 48
 
-/** CamScanner Magic Color: continuous-tone color. Never a 1-bit binary threshold. */
+/** Uniform mathematical scan: flat-field → luma curve → saturation → unsharp. No region masks. */
 const LIGHT_GRID = 16
 const LIGHT_PERCENTILE = 0.95
 const LIGHT_BLUR_PASSES = 4
 const LIGHT_FLOOR = 0.85
 const FLAT_TARGET = 255
 const SAT_BOOST = 1.4
-const PAPER_LUMA = 205
-const PAPER_SAT = 0.045
-const SNAP_LUMA = 205
-const SNAP_SAT = 0.1
-const INK_LUMA = 160
-const INK_TARGET = 16
-const INK_SAT = 0.1
-const INK_DEFICIT = 12
-const PHOTO_SAT = 0.1
-const PHOTO_FRAC = 0.3
-const PHOTO_STD = 8
-const SHARPEN_AMOUNT = 1.2
-const SHARPEN_NOISE = 4
+const SAT_MIN = 0.08
+const PAPER_LUMA = 215
+const PAPER_SAT = 0.1
+const INK_LUMA = 165
+const INK_HARD = 90
+const INK_HARD_GAIN = 0.4
+const INK_SOFT_GAIN = 0.75
+const SHARPEN_AMOUNT = 1.25
+const SHARPEN_NOISE = 3
 const YIELD_MS = 24
 
 function sourceSize(image: CanvasImageSource): { width: number; height: number } {
@@ -327,7 +323,7 @@ async function warpCanvas(
   return canvas
 }
 
-/* ---------- Magic Color: flat-field → levels → unsharp → chroma. Continuous tone, never 1-bit. ---------- */
+/* ---------- Scan: illumination ÷ → luma curve → saturation → unsharp. No region masks. ---------- */
 
 async function yieldBusy(clock: { last: number }) {
   if (performance.now() - clock.last < YIELD_MS) return
@@ -480,8 +476,8 @@ function finishLightGrid(hists: Uint32Array, global: Uint32Array, counts: Uint32
 
 /**
  * Paper-white field per RGB channel: 16×16 95th-percentile cells, closed and
- * blurred, then bilinearly sampled. Floor at global 95th × 0.85 so a dark
- * photo cell cannot pull the estimated paper color down.
+ * blurred, then bilinearly sampled across the page. Floor at global 95th × 0.85
+ * so a dark tile cannot collapse the lighting estimate toward its own content.
  */
 function illuminationRgb(data: Uint8ClampedArray, width: number, height: number) {
   const cells = LIGHT_GRID * LIGHT_GRID
@@ -557,30 +553,14 @@ function scaleToLuma(r: number, g: number, b: number, fromL: number, toL: number
   return [r * scale, g * scale, b * scale]
 }
 
-function integralPlane(src: Float32Array, width: number, height: number, square: boolean) {
-  const iw = width + 1
-  const out = new Float64Array(iw * (height + 1))
-  for (let y = 1; y <= height; y += 1) {
-    let run = 0
-    const srcRow = (y - 1) * width
-    const prev = (y - 1) * iw
-    const cur = y * iw
-    for (let x = 1; x <= width; x += 1) {
-      const value = src[srcRow + x - 1] ?? 0
-      run += square ? value * value : value
-      out[cur + x] = (out[prev + x] ?? 0) + run
-    }
-  }
-  return out
-}
-
-function boxSum(ii: Float64Array, iw: number, x0: number, y0: number, x1: number, y1: number) {
-  return (ii[y1 * iw + x1] ?? 0) - (ii[y0 * iw + x1] ?? 0) - (ii[y1 * iw + x0] ?? 0) + (ii[y0 * iw + x0] ?? 0)
-}
-
 function boostSat(r: number, g: number, b: number, sat: number): [number, number, number] {
   const [hue, , value] = rgbToHsv(r, g, b)
   return hsvToRgb(hue, Math.min(1, sat * SAT_BOOST), value)
+}
+
+function smooth01(t: number) {
+  const x = t < 0 ? 0 : t > 1 ? 1 : t
+  return x * x * (3 - 2 * x)
 }
 
 /** Every pixel: `normC = clamp((C / bgC) * 255)`. Never skips or clears a region. */
@@ -610,110 +590,55 @@ async function whiteBalanceRgb(
   }
 }
 
-function neighborhood(
-  sum: Float64Array,
-  sq: Float64Array,
-  iw: number,
-  x: number,
-  y: number,
-  radius: number,
-  width: number,
-  height: number,
-) {
-  const x0 = Math.max(0, x - radius)
-  const y0 = Math.max(0, y - radius)
-  const x1 = Math.min(width, x + radius + 1)
-  const y1 = Math.min(height, y + radius + 1)
-  const n = (x1 - x0) * (y1 - y0)
-  if (n < 1) return { mean: 255, std: 0, n: 0 }
-  const mean = boxSum(sum, iw, x0, y0, x1, y1) / n
-  const moment = boxSum(sq, iw, x0, y0, x1, y1) / n
-  const variance = moment - mean * mean
-  return { mean, std: Math.sqrt(variance > 0 ? variance : 0), n }
-}
-
-function writeLuma(data: Uint8ClampedArray, i: number, red: number, green: number, blue: number, fromL: number, toL: number) {
-  const rgb = scaleToLuma(red, green, blue, fromL, toL)
-  data[i] = clamp255(rgb[0])
-  data[i + 1] = clamp255(rgb[1])
-  data[i + 2] = clamp255(rgb[2])
-  data[i + 3] = 255
-}
-
-/** Smooth photo levels: [40–80] → [20–30], midtones unchanged, highlights unclipped. */
-function photoTone(tone: number) {
-  if (tone <= 40) return 18 + (tone / 40) * 2
-  if (tone <= 80) return 20 + ((tone - 40) / 40) * 10
-  if (tone >= 250) return 248
-  return tone
-}
-
 /**
- * Every pixel is written. Texture/saturation uses a smooth photo curve so car
- * edges are never crushed as ink. Flat paper/ink get a document curve.
+ * One transfer for every pixel. Ink darkens below 165, paper eases to white
+ * above 215 when nearly gray, and 90–215 midtones stay continuous — no photo mask.
  */
-async function applyMagicCurve(
+function scanLuma(normL: number, sat: number) {
+  let next: number
+  if (normL < INK_HARD) {
+    const t = smooth01(normL / INK_HARD)
+    next = Math.floor(normL * (INK_HARD_GAIN + (INK_SOFT_GAIN - INK_HARD_GAIN) * t))
+  } else if (normL < INK_LUMA) {
+    const darkened = normL * INK_SOFT_GAIN
+    const t = smooth01((normL - INK_HARD) / (INK_LUMA - INK_HARD))
+    next = Math.floor(darkened + (normL - darkened) * t)
+  } else {
+    next = normL
+  }
+  if (normL > PAPER_LUMA && sat < PAPER_SAT) {
+    const t = smooth01((normL - PAPER_LUMA) / (255 - PAPER_LUMA))
+    next = next + (255 - next) * t
+  }
+  return clamp255(next)
+}
+
+/** Luma curve then 1.4× HSV saturation when S > 0.08. Every pixel is written. */
+async function applyScanTone(
   data: Uint8ClampedArray,
   width: number,
   height: number,
   clock: { last: number },
 ) {
-  const luma = new Float32Array(width * height)
-  const mid = new Float32Array(width * height)
-  const paper = new Float32Array(width * height)
-  for (let p = 0, i = 0; p < luma.length; p += 1, i += 4) {
-    const tone = pixelLuma(data[i] ?? 0, data[i + 1] ?? 0, data[i + 2] ?? 0)
-    luma[p] = tone
-    mid[p] = tone > 45 && tone <= 220 ? 1 : 0
-    paper[p] = tone > 220 ? 1 : 0
-  }
-  const sum = integralPlane(luma, width, height, false)
-  const sq = integralPlane(luma, width, height, true)
-  const midSum = integralPlane(mid, width, height, false)
-  const paperSum = integralPlane(paper, width, height, false)
-  const iw = width + 1
-  const photoRadius = Math.max(10, Math.round(width / 20))
-  const inkRadius = Math.max(4, Math.round(width / 90))
-  await yieldBusy(clock)
-
-  for (let y = 0; y < height; y += 1) {
-    if (y % 32 === 0) await yieldBusy(clock)
-    const row = y * width
-    let i = row * 4
-    for (let x = 0; x < width; x += 1, i += 4) {
-      const red = data[i] ?? 0
-      const green = data[i + 1] ?? 0
-      const blue = data[i + 2] ?? 0
-      const tone = luma[row + x] ?? 0
-      const sat = pixelSat(red, green, blue)
-      const wide = neighborhood(sum, sq, iw, x, y, photoRadius, width, height)
-      const local = neighborhood(sum, sq, iw, x, y, inkRadius, width, height)
-      const x0 = Math.max(0, x - photoRadius)
-      const y0 = Math.max(0, y - photoRadius)
-      const x1 = Math.min(width, x + photoRadius + 1)
-      const y1 = Math.min(height, y + photoRadius + 1)
-      const n = (x1 - x0) * (y1 - y0)
-      const frac = n < 1 ? 0 : boxSum(midSum, iw, x0, y0, x1, y1) / n
-      const paperFrac = n < 1 ? 1 : boxSum(paperSum, iw, x0, y0, x1, y1) / n
-      const photo = sat >= PHOTO_SAT || (frac >= PHOTO_FRAC && paperFrac < 0.55 && wide.std >= PHOTO_STD)
-      let next = tone
-      if (photo) {
-        next = photoTone(tone)
-      } else if (sat < SNAP_SAT && tone > SNAP_LUMA) {
-        const t = Math.min(1, (tone - SNAP_LUMA) / (255 - SNAP_LUMA))
-        const ease = t * t * (3 - 2 * t)
-        next = tone + (255 - tone) * ease
-      } else if (sat < INK_SAT && tone < INK_LUMA) {
-        next = INK_TARGET
-      } else if (sat < INK_SAT && tone <= SNAP_LUMA && local.mean - tone >= INK_DEFICIT) {
-        next = INK_TARGET
-      }
-      writeLuma(data, i, red, green, blue, tone, next)
-    }
+  const count = width * height
+  for (let p = 0; p < count; p += 1) {
+    if (p % (width * 32) === 0) await yieldBusy(clock)
+    const i = p * 4
+    const red = data[i] ?? 0
+    const green = data[i + 1] ?? 0
+    const blue = data[i + 2] ?? 0
+    const normL = pixelLuma(red, green, blue)
+    const sat = pixelSat(red, green, blue)
+    const rgb = scaleToLuma(red, green, blue, normL, scanLuma(normL, sat))
+    const out = sat > SAT_MIN ? boostSat(rgb[0], rgb[1], rgb[2], sat) : rgb
+    data[i] = clamp255(out[0])
+    data[i + 1] = clamp255(out[1])
+    data[i + 2] = clamp255(out[2])
+    data[i + 3] = 255
   }
 }
 
-/** Unsharp mask: skip |L − blur| < 4, boost 1.2, clamp 0–255. */
+/** Unsharp mask: skip |L − blur| < 3, boost 1.25, clamp 0–255. */
 function sharpenLuma(image: ImageData) {
   const { data, width, height } = image
   const gray = new Float32Array(width * height)
@@ -747,31 +672,6 @@ function sharpenLuma(image: ImageData) {
   }
 }
 
-/** 1.4× HSV saturation on non-paper pixels so stamps, vouchers, and plates stay vivid. */
-async function boostNonPaperChroma(
-  data: Uint8ClampedArray,
-  width: number,
-  height: number,
-  clock: { last: number },
-) {
-  for (let y = 0; y < height; y += 1) {
-    if (y % 48 === 0) await yieldBusy(clock)
-    let i = y * width * 4
-    for (let x = 0; x < width; x += 1, i += 4) {
-      const red = data[i] ?? 0
-      const green = data[i + 1] ?? 0
-      const blue = data[i + 2] ?? 0
-      const luma = pixelLuma(red, green, blue)
-      const sat = pixelSat(red, green, blue)
-      if (luma >= PAPER_LUMA || sat < PAPER_SAT) continue
-      const chroma = boostSat(red, green, blue, sat)
-      data[i] = clamp255(chroma[0])
-      data[i + 1] = clamp255(chroma[1])
-      data[i + 2] = clamp255(chroma[2])
-    }
-  }
-}
-
 function desaturatePixels(data: Uint8ClampedArray) {
   for (let i = 0; i < data.length; i += 4) {
     const tone = Math.round(pixelLuma(data[i] ?? 0, data[i + 1] ?? 0, data[i + 2] ?? 0))
@@ -785,16 +685,15 @@ async function applyMagicColor(image: ImageData) {
   const { data, width, height } = image
   const clock = { last: performance.now() }
   await whiteBalanceRgb(data, width, height, clock)
-  await applyMagicCurve(data, width, height, clock)
+  await applyScanTone(data, width, height, clock)
   sharpenLuma(image)
-  await boostNonPaperChroma(data, width, height, clock)
 }
 
 async function applyFastBlackWhite(image: ImageData) {
   const { data, width, height } = image
   const clock = { last: performance.now() }
   await whiteBalanceRgb(data, width, height, clock)
-  await applyMagicCurve(data, width, height, clock)
+  await applyScanTone(data, width, height, clock)
   sharpenLuma(image)
   desaturatePixels(data)
   await yieldBusy(clock)
@@ -858,7 +757,7 @@ async function processPixels(
   return canvas
 }
 
-/** Magic Color: white paper, crisp text, continuous-tone photos. Never 1-bit. */
+/** Magic Color: white paper, crisp text, continuous-tone photos. Never 1-bit, never a region mask. */
 export async function applyCanvasMagic(source: HTMLCanvasElement): Promise<HTMLCanvasElement> {
   return processPixels(source, applyMagicColor)
 }
