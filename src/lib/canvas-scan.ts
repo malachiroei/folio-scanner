@@ -47,14 +47,15 @@ const LIGHT_PERCENTILE = 0.95
 const LIGHT_BLUR_PASSES = 4
 const LIGHT_FLOOR = 0.85
 const FLAT_TARGET = 255
-const SAT_BOOST = 1.4
+const SAT_BOOST = 1.6
 const SAT_MIN = 0.08
 const PAPER_LUMA = 215
 const PAPER_SAT = 0.1
-const INK_LUMA = 165
 const INK_HARD = 90
-const INK_HARD_GAIN = 0.4
-const INK_SOFT_GAIN = 0.75
+const MID_DARK = 160
+const SHADOW_TARGET = 20
+const MID_DARK_TARGET = 100
+const HIGHLIGHT_TARGET = 220
 const SHARPEN_AMOUNT = 1.25
 const SHARPEN_NOISE = 3
 const YIELD_MS = 24
@@ -591,29 +592,28 @@ async function whiteBalanceRgb(
 }
 
 /**
- * One transfer for every pixel. Ink darkens below 165, paper eases to white
- * above 215 when nearly gray, and 90–215 midtones stay continuous — no photo mask.
+ * Contrast stretch: shadows → deep black, print → solid ink, car midtones stay
+ * continuous, paper snaps to white. Same path for every pixel — no region mask.
  */
 function scanLuma(normL: number, sat: number) {
   let next: number
   if (normL < INK_HARD) {
-    const t = smooth01(normL / INK_HARD)
-    next = Math.floor(normL * (INK_HARD_GAIN + (INK_SOFT_GAIN - INK_HARD_GAIN) * t))
-  } else if (normL < INK_LUMA) {
-    const darkened = normL * INK_SOFT_GAIN
-    const t = smooth01((normL - INK_HARD) / (INK_LUMA - INK_HARD))
-    next = Math.floor(darkened + (normL - darkened) * t)
+    next = Math.floor((normL / INK_HARD) * SHADOW_TARGET)
+  } else if (normL < MID_DARK) {
+    next = SHADOW_TARGET + Math.floor(((normL - INK_HARD) / (MID_DARK - INK_HARD)) * (MID_DARK_TARGET - SHADOW_TARGET))
+  } else if (normL <= PAPER_LUMA) {
+    const t = smooth01((normL - MID_DARK) / (PAPER_LUMA - MID_DARK))
+    next = MID_DARK_TARGET + t * (HIGHLIGHT_TARGET - MID_DARK_TARGET)
+  } else if (sat < PAPER_SAT) {
+    next = 255
   } else {
-    next = normL
-  }
-  if (normL > PAPER_LUMA && sat < PAPER_SAT) {
     const t = smooth01((normL - PAPER_LUMA) / (255 - PAPER_LUMA))
-    next = next + (255 - next) * t
+    next = HIGHLIGHT_TARGET + t * (255 - HIGHLIGHT_TARGET)
   }
   return clamp255(next)
 }
 
-/** Luma curve then 1.4× HSV saturation when S > 0.08. Every pixel is written. */
+/** Luma curve then 1.6× HSV saturation when S > 0.08. Every pixel is written. */
 async function applyScanTone(
   data: Uint8ClampedArray,
   width: number,
