@@ -22,6 +22,8 @@ const PAPER_LUMA_MIN = 140
 const SHEET_MIN_AREA = 0.2
 const KEYBOARD_LUMA = 50
 const SHEET_CLOSE = 15
+const INK_LUMA_MAX = 120
+const CONTENT_EXPAND = 0.09
 const A4_ASPECT = Math.SQRT2
 const CLOSE_RADIUS = 2
 const OPEN_RADIUS = 4
@@ -272,6 +274,67 @@ function hullPerimeter(points: Point[]) {
     if (a && b) length += distance(a, b)
   }
   return length
+}
+
+function expandFromCenter(points: Point[], width: number, height: number, amount = CONTENT_EXPAND): Point[] {
+  if (points.length !== 4) return points
+  const cx = points.reduce((sum, point) => sum + point.x, 0) / 4
+  const cy = points.reduce((sum, point) => sum + point.y, 0) / 4
+  const expanded = points.map((point) =>
+    clampPoint(
+      { x: point.x + (point.x - cx) * amount, y: point.y + (point.y - cy) * amount },
+      width,
+      height,
+    ),
+  )
+  try {
+    const corners = orderCorners(expanded)
+    if (!quadIsConvex(corners)) return points
+    return [corners.tl, corners.tr, corners.br, corners.bl]
+  } catch {
+    return points
+  }
+}
+
+function clampTopBelowKeyboard(points: Point[], keyboardY: number, height: number): Point[] {
+  if (keyboardY < 4 || points.length !== 4) return points
+  const pad = Math.max(3, Math.round(height * 0.01))
+  const floor = Math.min(height * 0.42, keyboardY + pad)
+  try {
+    const corners = orderCorners(points)
+    const clampY = (point: Point): Point => ({ x: point.x, y: Math.max(point.y, floor) })
+    const next = orderCorners([clampY(corners.tl), clampY(corners.tr), corners.br, corners.bl])
+    return quadIsConvex(next) ? [next.tl, next.tr, next.br, next.bl] : points
+  } catch {
+    return points
+  }
+}
+
+function isKeyboardBlob(minX: number, minY: number, maxX: number, maxY: number, keyboardY: number, width: number, height: number): boolean {
+  const bw = maxX - minX + 1
+  const bh = maxY - minY + 1
+  const cy = (minY + maxY) / 2
+  if (keyboardY > 4 && maxY <= keyboardY + Math.max(6, height * 0.03)) return true
+  if (cy < keyboardY) return true
+  if (minY < height * 0.2 && bh < height * 0.08 && bw > Math.max(bh * 1.8, width * 0.12)) return true
+  return false
+}
+
+function finishContentQuad(points: Point[], width: number, height: number, keyboardY: number): Point[] | null {
+  const extrema = getDocumentCornersFromHull(points)
+  if (!extrema) return null
+  try {
+    const ordered = orderCorners(extrema)
+    if (!quadLooksLikeSheet(ordered, width, height) && polygonArea(extrema) < width * height * 0.12) return null
+    const expanded = expandFromCenter([ordered.tl, ordered.tr, ordered.br, ordered.bl], width, height)
+    const clamped = clampTopBelowKeyboard(expanded, keyboardY, height)
+    const corners = orderCorners(clamped)
+    return cornersValid(corners, width, height) && quadIsConvex(corners)
+      ? [corners.tl, corners.tr, corners.br, corners.bl]
+      : null
+  } catch {
+    return null
+  }
 }
 
 /**
@@ -683,6 +746,63 @@ function findPaperSheetCv(sample: Sample): Point[] | null {
   }
 }
 
+function contourBounds(points: Point[]) {
+  let minX = Number.POSITIVE_INFINITY
+  let minY = Number.POSITIVE_INFINITY
+  let maxX = Number.NEGATIVE_INFINITY
+  let maxY = Number.NEGATIVE_INFINITY
+  for (const point of points) {
+    if (point.x < minX) minX = point.x
+    if (point.y < minY) minY = point.y
+    if (point.x > maxX) maxX = point.x
+    if (point.y > maxY) maxY = point.y
+  }
+  return { minX, minY, maxX, maxY }
+}
+
+/**
+ * Hull of all print/photo clusters (luma < 120), skipping the keyboard, then expand
+ * ~9% for paper margins so the fold is not treated as the bottom edge.
+ */
+function findContentHullCv(sample: Sample): Point[] | null {
+  const cv = getCv()
+  const bin = new MatBin()
+  try {
+    const src = bin.keep(cv.imread(sample.canvas))
+    const grayMat = bin.keep(new cv.Mat())
+    cv.cvtColor(src, grayMat, cv.COLOR_RGBA2GRAY)
+    const binary = bin.keep(new cv.Mat())
+    cv.threshold(grayMat, binary, INK_LUMA_MAX, 255, cv.THRESH_BINARY_INV)
+    const closeKernel = bin.keep(cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(9, 9)))
+    const closed = bin.keep(new cv.Mat())
+    cv.morphologyEx(binary, closed, cv.MORPH_CLOSE, closeKernel)
+    const bridged = bridgeFoldsCv(cv, bin, closed)
+    const contours = bin.keep(new cv.MatVector())
+    const hierarchy = bin.keep(new cv.Mat())
+    cv.findContours(bridged, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+    const gray = lumaOf(sample)
+    const keyboardY = keyboardFloor(gray, sample.width, sample.height)
+    const frame = sample.width * sample.height
+    const gathered: Point[] = []
+    for (let i = 0; i < contours.size(); i += 1) {
+      const contour = contours.get(i)
+      const area = cv.contourArea(contour)
+      if (area < frame * 0.0015) continue
+      const pts = matPoints(contour)
+      const box = contourBounds(pts)
+      if (isKeyboardBlob(box.minX, box.minY, box.maxX, box.maxY, keyboardY, sample.width, sample.height)) continue
+      gathered.push(...pts)
+    }
+    if (gathered.length < 4) return null
+    return finishContentQuad(convexHull(gathered), sample.width, sample.height, keyboardY)
+  } catch (error) {
+    console.error(error)
+    return null
+  } finally {
+    bin.release()
+  }
+}
+
 /**
  * Morphological gradient (dilate − erode, 3×3) finds the paper border when the desk
  * is almost as bright as the sheet. Hull area, not thin-ring pixel count, is the gate.
@@ -831,6 +951,103 @@ function lumaPaperMask(sample: Sample): Uint8Array {
     if ((gray[i] ?? 0) > PAPER_LUMA_MIN) mask[i] = 1
   }
   return mask
+}
+
+function lumaInkMask(sample: Sample): Uint8Array {
+  const gray = lumaOf(sample)
+  const mask = new Uint8Array(gray.length)
+  for (let i = 0; i < gray.length; i += 1) {
+    if ((gray[i] ?? 0) < INK_LUMA_MAX) mask[i] = 1
+  }
+  return mask
+}
+
+function gatherInkHullPoints(
+  mask: Uint8Array,
+  width: number,
+  height: number,
+  keyboardY: number,
+): Point[] {
+  const frame = width * height
+  const minPixels = Math.max(24, Math.round(frame * 0.0008))
+  const seen = new Uint8Array(mask.length)
+  const stack = new Int32Array(mask.length)
+  const gathered: Point[] = []
+
+  for (let start = 0; start < mask.length; start += 1) {
+    if (!mask[start] || seen[start]) continue
+    let top = 0
+    stack[top] = start
+    top += 1
+    seen[start] = 1
+    const ring: Point[] = []
+    let count = 0
+    let minX = width
+    let minY = height
+    let maxX = 0
+    let maxY = 0
+    while (top > 0) {
+      top -= 1
+      const index = stack[top] ?? 0
+      const x = index % width
+      const y = (index - x) / width
+      count += 1
+      if (x < minX) minX = x
+      if (y < minY) minY = y
+      if (x > maxX) maxX = x
+      if (y > maxY) maxY = y
+      const edge =
+        x <= 0 ||
+        y <= 0 ||
+        x >= width - 1 ||
+        y >= height - 1 ||
+        !mask[index - 1] ||
+        !mask[index + 1] ||
+        !mask[index - width] ||
+        !mask[index + width]
+      if (edge) ring.push({ x, y })
+      if (x > 0 && mask[index - 1] && !seen[index - 1]) {
+        seen[index - 1] = 1
+        stack[top] = index - 1
+        top += 1
+      }
+      if (x < width - 1 && mask[index + 1] && !seen[index + 1]) {
+        seen[index + 1] = 1
+        stack[top] = index + 1
+        top += 1
+      }
+      if (y > 0 && mask[index - width] && !seen[index - width]) {
+        seen[index - width] = 1
+        stack[top] = index - width
+        top += 1
+      }
+      if (y < height - 1 && mask[index + width] && !seen[index + width]) {
+        seen[index + width] = 1
+        stack[top] = index + width
+        top += 1
+      }
+    }
+    if (count < minPixels) continue
+    if (isKeyboardBlob(minX, minY, maxX, maxY, keyboardY, width, height)) continue
+    gathered.push(...ring)
+  }
+  return gathered
+}
+
+function findContentHullCanvas(sample: Sample): Point[] | null {
+  const gray = lumaOf(sample)
+  const keyboardY = keyboardFloor(gray, sample.width, sample.height)
+  const closed = morph(
+    morph(lumaInkMask(sample), sample.width, sample.height, 4, false),
+    sample.width,
+    sample.height,
+    4,
+    true,
+  )
+  const bridged = bridgeFolds(closed, sample.width, sample.height)
+  const gathered = gatherInkHullPoints(bridged, sample.width, sample.height, keyboardY)
+  if (gathered.length < 4) return null
+  return finishContentQuad(convexHull(gathered), sample.width, sample.height, keyboardY)
 }
 
 function collectHullQuadsFromMask(mask: Uint8Array, width: number, height: number): Point[][] {
@@ -1044,11 +1261,29 @@ function findGradientHullCanvas(sample: Sample): Point[] | null {
 }
 
 function findPaperQuad(sample: Sample): Point[] | null {
+  const gray = lumaOf(sample)
+  const keyboardY = keyboardFloor(gray, sample.width, sample.height)
+  const finish = (found: Point[] | null): Point[] | null => {
+    if (!found || found.length !== 4) return null
+    const clamped = clampTopBelowKeyboard(found, keyboardY, sample.height)
+    try {
+      const corners = orderCorners(clamped)
+      return cornersValid(corners, sample.width, sample.height) && quadIsConvex(corners)
+        ? [corners.tl, corners.tr, corners.br, corners.bl]
+        : null
+    } catch {
+      return null
+    }
+  }
   if (isOpenCvReady()) {
-    const sheet = findPaperSheetCv(sample)
+    const content = finish(findContentHullCv(sample))
+    if (content) return content
+    const sheet = finish(findPaperSheetCv(sample))
     if (sheet) return sheet
   }
-  const canvasSheet = findPaperSheetCanvas(sample)
+  const canvasContent = finish(findContentHullCanvas(sample))
+  if (canvasContent) return canvasContent
+  const canvasSheet = finish(findPaperSheetCanvas(sample))
   if (canvasSheet) return canvasSheet
   const collected: Point[][] = []
   const take = (found: Point[] | null) => {
@@ -1067,10 +1302,8 @@ function findPaperQuad(sample: Sample): Point[] | null {
   }
   const fallback = pickOuterQuad(collected, sample.width, sample.height)
   if (!fallback) return null
-  const gray = lumaOf(sample)
-  const keyboardY = keyboardFloor(gray, sample.width, sample.height)
   if (scorePaperSheet(fallback, gray, sample.width, sample.height, keyboardY) < 0) return null
-  return fallback
+  return finish(fallback)
 }
 
 type Line = { slope: number; offset: number }
@@ -1685,8 +1918,8 @@ export type DetectOptions = {
 }
 
 /**
- * White sheet (luma > 140) vs black keyboard. 15×15 close, external hull extrema.
- * Gradient ranking is not used first — it snaps to keys and desk edges.
+ * Printable-content hull (luma < 120) expanded ~9% for paper margins, clamped
+ * below the keyboard band. White-sheet and brightness passes are fallbacks.
  */
 export function detectDocumentCorners(
   image: CanvasImageSource,
@@ -1701,7 +1934,10 @@ export function detectDocumentCorners(
     if (!sample) return missed
     const paper = findPaperQuad(sample)
     if (paper) {
-      const corners = orderCorners(paper.map((point) => scaleUp(point, sample.width, sample.height, width, height)))
+      const scaled = paper.map((point) => scaleUp(point, sample.width, sample.height, width, height))
+      const keyboardY = keyboardFloor(lumaOf(sample), sample.width, sample.height) * (height / sample.height)
+      const clamped = clampTopBelowKeyboard(scaled, keyboardY, height)
+      const corners = orderCorners(clamped)
       if (sheetCornersOk(corners, width, height)) return { corners, detected: true }
     }
     const gray = lumaOf(sample)
