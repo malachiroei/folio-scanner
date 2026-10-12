@@ -291,7 +291,8 @@ export function ScanProvider({ children }: { children: ReactNode }) {
       setDraft(next)
       setBusy(null)
       setScreen('corners')
-      scheduleLocate(normalized.url, normalized.width, normalized.height, live ?? undefined)
+      // Live preview already locked the box — do not re-detect (that jumps the pins onto a fold).
+      if (!live) scheduleLocate(normalized.url, normalized.width, normalized.height)
     } catch (error) {
       if (normalized) URL.revokeObjectURL(normalized.url)
       setToast(errorMessage(error))

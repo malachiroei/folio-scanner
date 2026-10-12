@@ -203,28 +203,27 @@ export function outputSize(corners: Corners): { width: number; height: number } 
 }
 
 /**
- * Maps page corners measured on the live video frame onto the photo taken from the same
- * camera. The video and the photo can have different proportions (for example 16:9 preview
- * and 4:3 photo); the preview shows the largest centered area of the photo with the video's
- * proportions, so the corners are placed inside that area. Returns null when the two
- * disagree on orientation, since the mapping would be a guess.
+ * Maps live-preview corners (unit 0..1 of the video frame) onto the captured photo.
+ * Same relative position: photoPoint = { x: nx * photoWidth, y: ny * photoHeight }.
  */
 export function mapLiveCorners(hint: CaptureHint, width: number, height: number): Corners | null {
-  const photoAspect = width / height
-  if (!(hint.aspect > 0) || !(photoAspect > 0)) return null
-  if (hint.aspect >= 1 !== photoAspect >= 1 && Math.abs(Math.log(hint.aspect)) > 0.05) return null
-
-  let areaWidth = width
-  let areaHeight = height
-  if (photoAspect > hint.aspect) areaWidth = height * hint.aspect
-  else areaHeight = width / hint.aspect
-  const left = (width - areaWidth) / 2
-  const top = (height - areaHeight) / 2
-
+  if (!(hint.aspect > 0) || width < 1 || height < 1) return null
   const place = (point: Point): Point => {
     const nx = hint.mirrored ? 1 - point.x : point.x
-    return { x: left + nx * areaWidth, y: top + point.y * areaHeight }
+    return {
+      x: clamp(nx * width, 0, width),
+      y: clamp(point.y * height, 0, height),
+    }
   }
-  const mapped = orderCorners([place(hint.corners.tl), place(hint.corners.tr), place(hint.corners.br), place(hint.corners.bl)])
-  return cornersValid(mapped, width, height) ? mapped : null
+  try {
+    const mapped = orderCorners([
+      place(hint.corners.tl),
+      place(hint.corners.tr),
+      place(hint.corners.br),
+      place(hint.corners.bl),
+    ])
+    return cornersValid(mapped, width, height) ? mapped : null
+  } catch {
+    return null
+  }
 }

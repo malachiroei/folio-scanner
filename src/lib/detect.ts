@@ -23,6 +23,10 @@ const CLOSE_RADIUS = 2
 const OPEN_RADIUS = 4
 const ANGLE_GOOD_MIN = 70
 const ANGLE_GOOD_MAX = 110
+/** Half an A4 across a fold looks ~square. Full portrait A4 is ~1.41. */
+const FOLD_ASPECT_MAX = 1.15
+const A4_ASPECT_LO = 1.35
+const A4_ASPECT_HI = 1.55
 
 type Sample = { data: Uint8ClampedArray; width: number; height: number; canvas: HTMLCanvasElement }
 
@@ -173,21 +177,34 @@ function angleFit(corners: Corners): number {
   return score
 }
 
-/** Convex 4-gon covering 25–92% of the frame. */
+function a4AspectScore(aspect: number): number {
+  if (aspect < FOLD_ASPECT_MAX) return -1
+  if (aspect >= A4_ASPECT_LO && aspect <= A4_ASPECT_HI) return 2.2
+  if (aspect >= 1.2 && aspect <= 1.8) return 1.25
+  return 0.4
+}
+
+/** Convex 4-gon covering 25–92% of the frame, not a square half-page across a fold. */
 function quadLooksLikeSheet(corners: Corners, width: number, height: number): boolean {
   if (!cornersValid(corners, width, height) || !quadIsConvex(corners)) return false
   const view = width * height
   if (view < 1) return false
   const frac = polygonArea([corners.tl, corners.tr, corners.br, corners.bl]) / view
-  return frac >= MIN_AREA && frac <= MAX_AREA
+  if (frac < MIN_AREA || frac > MAX_AREA) return false
+  return pageAspect(corners) >= FOLD_ASPECT_MAX
+}
+
+/** Live mapped box: trust the preview. Do not reject for A4 aspect. */
+export function sheetCornersOk(corners: Corners, width: number, height: number): boolean {
+  if (!cornersValid(corners, width, height) || !quadIsConvex(corners)) return false
+  const view = width * height
+  if (view < 1) return false
+  const frac = polygonArea([corners.tl, corners.tr, corners.br, corners.bl]) / view
+  return frac >= 0.12 && frac <= 0.98
 }
 
 function fallbackFrame(width: number, height: number): Corners {
   return fullFrameCorners(width, height)
-}
-
-export function sheetCornersOk(corners: Corners, width: number, height: number): boolean {
-  return quadLooksLikeSheet(corners, width, height)
 }
 
 function cross(o: Point, a: Point, b: Point) {
@@ -396,17 +413,22 @@ function bestQuadFromBinaryCv(cv: Cv, binary: CvMat, sample: Sample): Point[] | 
     cv.findContours(closed, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
     const frame = sample.width * sample.height
     let best: Point[] | null = null
-    let bestArea = 0
+    let bestScore = 0
     for (let i = 0; i < contours.size(); i += 1) {
       const contour = contours.get(i)
       const area = cv.contourArea(contour)
-      if (area < frame * MIN_AREA || area > frame * MAX_AREA || area <= bestArea) continue
+      if (area < frame * MIN_AREA || area > frame * MAX_AREA) continue
       const hull = bin.keep(new cv.Mat())
       cv.convexHull(contour, hull, false, true)
       const accepted = approxFourCv(cv, bin, hull, sample.width, sample.height)
       if (!accepted) continue
+      const aspect = pageAspect(orderCorners(accepted))
+      const fit = a4AspectScore(aspect)
+      if (fit < 0) continue
+      const score = area * fit
+      if (score <= bestScore) continue
       best = accepted
-      bestArea = area
+      bestScore = score
     }
     return best
   } catch (error) {
@@ -714,11 +736,11 @@ function rankBlobs(mask: Uint8Array, width: number, height: number, gray: Float3
     // A sheet sits inside the photo; a wall or table runs off the frame.
     const touching =
       Number(minX <= 1) + Number(minY <= 1) + Number(maxX >= width - 2) + Number(maxY >= height - 2)
-    const a4 = Math.abs(aspect - A4_ASPECT)
+    const a4 = a4AspectScore(aspect)
+    if (a4 < 0) continue
     const edge = boundaryStrength(gray, width, height, points)
-    let score = ratio * 2.4 + fill * 1.1 + edge * 1.8 - touching * 1.5 + angleFit(ordered)
-    if (a4 <= 0.16) score += 1.8
-    else if (aspect >= 1.15 && aspect <= 1.7) score += 0.7
+    let score = ratio * 2.4 + fill * 1.1 + edge * 1.8 - touching * 1.5 + angleFit(ordered) + a4
+    if (Math.abs(aspect - A4_ASPECT) <= 0.16) score += 1.8
     candidates.push({ points: [ordered.tl, ordered.tr, ordered.br, ordered.bl], score, touching })
   }
 
@@ -887,7 +909,8 @@ function lockLargestSheet(candidates: Candidate[]): Candidate | null {
   for (const candidate of ranked) {
     if (candidate.score < floor) continue
     const aspect = pageAspect(orderCorners(candidate.points))
-    if (Math.abs(aspect - A4_ASPECT) > 0.35) continue
+    if (a4AspectScore(aspect) < 0) continue
+    if (Math.abs(aspect - A4_ASPECT) > 0.4) continue
     const area = polygonArea(candidate.points)
     if (area > chosenArea * 1.05) {
       chosen = candidate
