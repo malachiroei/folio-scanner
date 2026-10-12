@@ -57,6 +57,57 @@ export function cornersValid(corners: Corners, width: number, height: number): b
   return edgeWidth >= 32 && edgeHeight >= 32
 }
 
+/** Same-sign cross products around TL→TR→BR→BL. Rejects bows, arrows, and crossed pins. */
+export function quadIsConvex(corners: Corners): boolean {
+  const points = [corners.tl, corners.tr, corners.br, corners.bl]
+  let sign = 0
+  for (let i = 0; i < 4; i += 1) {
+    const a = points[i]
+    const b = points[(i + 1) % 4]
+    const c = points[(i + 2) % 4]
+    if (!a || !b || !c) return false
+    const cross = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x)
+    if (Math.abs(cross) < 1e-8) continue
+    const next = cross > 0 ? 1 : -1
+    if (sign !== 0 && next !== sign) return false
+    sign = next
+  }
+  return sign !== 0
+}
+
+/** Interior corner angles in degrees, in TL, TR, BR, BL order. */
+export function quadAngles(corners: Corners): number[] {
+  const points = [corners.tl, corners.tr, corners.br, corners.bl]
+  return points.map((curr, index) => {
+    const prev = points[(index + 3) % 4]
+    const next = points[(index + 1) % 4]
+    if (!prev || !next) return 0
+    const ax = prev.x - curr.x
+    const ay = prev.y - curr.y
+    const bx = next.x - curr.x
+    const by = next.y - curr.y
+    const den = (Math.hypot(ax, ay) || 1) * (Math.hypot(bx, by) || 1)
+    const cos = Math.min(1, Math.max(-1, (ax * bx + ay * by) / den))
+    return (Math.acos(cos) * 180) / Math.PI
+  })
+}
+
+/** Axis-aligned bounding rectangle of the four pins — a safe warp when the quad is twisted. */
+export function boundingRectCorners(corners: Corners): Corners {
+  const xs = [corners.tl.x, corners.tr.x, corners.br.x, corners.bl.x]
+  const ys = [corners.tl.y, corners.tr.y, corners.br.y, corners.bl.y]
+  const minX = Math.min(...xs)
+  const maxX = Math.max(...xs)
+  const minY = Math.min(...ys)
+  const maxY = Math.max(...ys)
+  return {
+    tl: { x: minX, y: minY },
+    tr: { x: maxX, y: minY },
+    br: { x: maxX, y: maxY },
+    bl: { x: minX, y: maxY },
+  }
+}
+
 export function lerpCorners(from: Corners, to: Corners, t: number): Corners {
   const mix = (a: Point, b: Point): Point => ({
     x: a.x + (b.x - a.x) * t,
@@ -87,7 +138,7 @@ export function defaultCorners(width: number, height: number, inset = 0.08): Cor
  * Used when no page is found, so the pins start near where a page usually is instead of at the
  * very edges of the photo.
  */
-export function inwardPageCorners(width: number, height: number, pad = 0.12): Corners {
+export function inwardPageCorners(width: number, height: number, pad = 0.06): Corners {
   const maxWidth = width * (1 - 2 * pad)
   const maxHeight = height * (1 - 2 * pad)
   const landscape = width > height * 1.05

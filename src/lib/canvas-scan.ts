@@ -1,5 +1,5 @@
 ﻿import type { Corners, FilterMode, Point } from '../types'
-import { distance, outputSize } from './geometry'
+import { boundingRectCorners, distance, outputSize, quadIsConvex } from './geometry'
 import { nextFrame } from './image'
 
 /**
@@ -52,9 +52,10 @@ const SAT_MIN = 0.08
 const PAPER_LUMA = 215
 const PAPER_SAT = 0.1
 const INK_HARD = 90
-const MID_DARK = 160
+const MID_DARK = 175
 const SHADOW_TARGET = 20
 const MID_DARK_TARGET = 100
+const INK_RICH = 24
 const HIGHLIGHT_TARGET = 220
 const SHARPEN_AMOUNT = 1.25
 const SHARPEN_NOISE = 3
@@ -271,6 +272,11 @@ function paintScaled(
  * homography; each triangle is drawn with the browser's high-quality bilinear/bicubic sampler
  * so small Hebrew type is not smeared on a screen-sized canvas.
  */
+/** Source quad must stay convex; dest is always the rectangle (width × height). */
+function warpSourceCorners(corners: Corners): Corners {
+  return quadIsConvex(corners) ? corners : boundingRectCorners(corners)
+}
+
 async function warpCanvas(
   source: HTMLCanvasElement,
   corners: Corners,
@@ -283,9 +289,10 @@ async function warpCanvas(
     { x: width, y: height },
     { x: 0, y: height },
   ]
-  const to = [corners.tl, corners.tr, corners.br, corners.bl]
+  const sourceQuad = warpSourceCorners(corners)
+  const to = [sourceQuad.tl, sourceQuad.tr, sourceQuad.br, sourceQuad.bl]
   const map = homography(from, to)
-  if (!map) return paintScaled(source, width, height, corners)
+  if (!map) return paintScaled(source, width, height, sourceQuad)
 
   const canvas = document.createElement('canvas')
   canvas.width = width
@@ -592,18 +599,23 @@ async function whiteBalanceRgb(
 }
 
 /**
- * Contrast stretch: shadows → deep black, print → solid ink, car midtones stay
- * continuous, paper snaps to white. Same path for every pixel — no region mask.
+ * Contrast stretch: shadows → deep black, faint gray print (up to luma 175) →
+ * #181818, car midtones stay continuous, paper snaps to white. No region mask.
  */
 function scanLuma(normL: number, sat: number) {
+  const grayInk = sat < PAPER_SAT ? 1 - sat / PAPER_SAT : 0
   let next: number
   if (normL < INK_HARD) {
     next = Math.floor((normL / INK_HARD) * SHADOW_TARGET)
   } else if (normL < MID_DARK) {
-    next = SHADOW_TARGET + Math.floor(((normL - INK_HARD) / (MID_DARK - INK_HARD)) * (MID_DARK_TARGET - SHADOW_TARGET))
+    const t = (normL - INK_HARD) / (MID_DARK - INK_HARD)
+    const mild = SHADOW_TARGET + t * (MID_DARK_TARGET - SHADOW_TARGET)
+    const rich = SHADOW_TARGET + t * (INK_RICH - SHADOW_TARGET)
+    next = Math.floor(mild + (rich - mild) * grayInk)
   } else if (normL <= PAPER_LUMA) {
-    const t = smooth01((normL - MID_DARK) / (PAPER_LUMA - MID_DARK))
-    next = MID_DARK_TARGET + t * (HIGHLIGHT_TARGET - MID_DARK_TARGET)
+    const t = (normL - MID_DARK) / (PAPER_LUMA - MID_DARK)
+    const start = MID_DARK_TARGET + (INK_RICH - MID_DARK_TARGET) * grayInk
+    next = start + t * (HIGHLIGHT_TARGET - start)
   } else if (sat < PAPER_SAT) {
     next = 255
   } else {

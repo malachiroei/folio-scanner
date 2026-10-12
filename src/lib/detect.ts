@@ -1,5 +1,14 @@
 import type { Corners, Point } from '../types'
-import { clampPoint, cornersValid, distance, inwardPageCorners, orderCorners, polygonArea } from './geometry'
+import {
+  clampPoint,
+  cornersValid,
+  defaultCorners,
+  distance,
+  orderCorners,
+  polygonArea,
+  quadAngles,
+  quadIsConvex,
+} from './geometry'
 
 /**
  * Pure canvas detection. No OpenCV, no WebAssembly, no script download:
@@ -12,6 +21,15 @@ const MAX_AREA = 0.95
 const A4_ASPECT = Math.SQRT2
 const CLOSE_RADIUS = 2
 const OPEN_RADIUS = 4
+/** Portrait A4 width/height ≈ 0.707. Outside this, the contour is not a page. */
+const SHEET_ASPECT_MIN = 0.55
+const SHEET_ASPECT_MAX = 0.85
+const ANGLE_GOOD_MIN = 70
+const ANGLE_GOOD_MAX = 110
+const ANGLE_HARD_MIN = 55
+const ANGLE_HARD_MAX = 125
+/** Centered axis-aligned rectangle covering ~88% of the frame. */
+const FALLBACK_INSET = 0.06
 
 type Sample = { data: Uint8ClampedArray; width: number; height: number }
 
@@ -150,6 +168,36 @@ function pageAspect(corners: Corners): number {
   const shortSide = Math.min(width, height)
   if (shortSide < 1) return Number.POSITIVE_INFINITY
   return Math.max(width, height) / shortSide
+}
+
+function sheetRatio(corners: Corners): number {
+  const width = (distance(corners.tl, corners.tr) + distance(corners.bl, corners.br)) / 2
+  const height = (distance(corners.tl, corners.bl) + distance(corners.tr, corners.br)) / 2
+  const longSide = Math.max(width, height)
+  if (longSide < 1) return 0
+  return Math.min(width, height) / longSide
+}
+
+function angleFit(corners: Corners): number {
+  const angles = quadAngles(corners)
+  let score = 0
+  for (const angle of angles) {
+    if (angle >= ANGLE_GOOD_MIN && angle <= ANGLE_GOOD_MAX) score += 0.55
+    else score -= 0.85
+  }
+  return score
+}
+
+/** Convex, near-rectangular, A4-ish. Rejects folds, bows, and triangles. */
+function quadLooksLikeSheet(corners: Corners, width: number, height: number): boolean {
+  if (!cornersValid(corners, width, height) || !quadIsConvex(corners)) return false
+  const ratio = sheetRatio(corners)
+  if (ratio < SHEET_ASPECT_MIN || ratio > SHEET_ASPECT_MAX) return false
+  return quadAngles(corners).every((angle) => angle >= ANGLE_HARD_MIN && angle <= ANGLE_HARD_MAX)
+}
+
+function fallbackFrame(width: number, height: number): Corners {
+  return defaultCorners(width, height, FALLBACK_INSET)
 }
 
 type Line = { slope: number; offset: number }
@@ -368,8 +416,12 @@ function rankBlobs(mask: Uint8Array, width: number, height: number, gray: Float3
     if (fitted) {
       const fittedCorners = orderCorners(fitted)
       const fittedArea = polygonArea([fittedCorners.tl, fittedCorners.tr, fittedCorners.br, fittedCorners.bl])
-      // Trust the fit only if it stays close to the blob's own size.
-      if (cornersValid(fittedCorners, width, height) && fittedArea > count * 0.8 && fittedArea < count * 1.6) {
+      // Outer side-fit only: skip fold-snapped extremes when the four sides look like a page.
+      if (
+        quadLooksLikeSheet(fittedCorners, width, height) &&
+        fittedArea > count * 0.8 &&
+        fittedArea < count * 1.6
+      ) {
         points = [fittedCorners.tl, fittedCorners.tr, fittedCorners.br, fittedCorners.bl]
       }
     }
@@ -378,19 +430,18 @@ function rankBlobs(mask: Uint8Array, width: number, height: number, gray: Float3
     const fill = Math.min(1, count / quadArea)
     if (fill < 0.7) continue
     const ordered = orderCorners(points)
-    if (!cornersValid(ordered, width, height)) continue
+    if (!quadLooksLikeSheet(ordered, width, height)) continue
     const aspect = pageAspect(ordered)
-    if (aspect > 2.1) continue
 
     // A sheet sits inside the photo; a wall or table runs off the frame.
     const touching =
       Number(minX <= 1) + Number(minY <= 1) + Number(maxX >= width - 2) + Number(maxY >= height - 2)
     const a4 = Math.abs(aspect - A4_ASPECT)
     const edge = boundaryStrength(gray, width, height, points)
-    let score = ratio * 2.4 + fill * 1.1 + edge * 1.8 - touching * 1.5
+    let score = ratio * 2.4 + fill * 1.1 + edge * 1.8 - touching * 1.5 + angleFit(ordered)
     if (a4 <= 0.16) score += 1.8
     else if (aspect >= 1.15 && aspect <= 1.7) score += 0.7
-    candidates.push({ points, score, touching })
+    candidates.push({ points: [ordered.tl, ordered.tr, ordered.br, ordered.bl], score, touching })
   }
 
   candidates.sort((a, b) => b.score - a.score)
@@ -769,7 +820,7 @@ export function detectDocumentCorners(
   height: number,
   options: DetectOptions = {},
 ): { corners: Corners; detected: boolean } {
-  const missed = { corners: inwardPageCorners(width, height), detected: false }
+  const missed = { corners: fallbackFrame(width, height), detected: false }
   try {
     const maxEdge = options.maxEdge ?? DETECT_MAX
     const sample = takeSample(image, maxEdge)
@@ -811,9 +862,12 @@ export function detectDocumentCorners(
     }
     if (!points && fallback) points = fallback.points
     if (points) {
-      points = tightenQuad(sample, points)
-      const corners = orderCorners(points.map((point) => scaleUp(point, sample.width, sample.height, width, height)))
-      if (cornersValid(corners, width, height)) return { corners, detected: true }
+      const raw = orderCorners(points.map((point) => scaleUp(point, sample.width, sample.height, width, height)))
+      const tightened = orderCorners(
+        tightenQuad(sample, points).map((point) => scaleUp(point, sample.width, sample.height, width, height)),
+      )
+      if (quadLooksLikeSheet(tightened, width, height)) return { corners: tightened, detected: true }
+      if (quadLooksLikeSheet(raw, width, height)) return { corners: raw, detected: true }
     }
     return missed
   } catch (error) {
@@ -838,7 +892,7 @@ export function refineToPaper(image: CanvasImageSource, width: number, height: n
     const corners = orderCorners(refined.map((point) => scaleUp(point, sample.width, sample.height, width, height)))
     const before = polygonArea([seed.tl, seed.tr, seed.br, seed.bl])
     const after = polygonArea([corners.tl, corners.tr, corners.br, corners.bl])
-    if (!cornersValid(corners, width, height) || after < before * 0.6) return seed
+    if (!quadLooksLikeSheet(corners, width, height) || after < before * 0.6) return seed
     return corners
   } catch (error) {
     console.error(error)
