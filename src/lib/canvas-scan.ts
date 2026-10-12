@@ -47,19 +47,18 @@ const LIGHT_PERCENTILE = 0.95
 const LIGHT_BLUR_PASSES = 4
 const LIGHT_FLOOR = 0.85
 const FLAT_TARGET = 255
-const WHITE_KNEE = 228
+const WHITE_KNEE = 224
 const SAT_BOOST = 1.4
 const PAPER_LUMA = 210
 const PAPER_SAT = 0.045
-const SHARPEN_AMOUNT = 1.85
+const SHARPEN_AMOUNT = 1.55
 /** Large-window ink pull: faint table type vs local paper, never a 1-bit snap. */
 const INK_WINDOW = 32
-const INK_GATE = 8
-const INK_DEFICIT = 26
-const INK_PULL = 0.88
-const INK_FLOOR = 16
-const INK_PAPER_MEAN = 185
-const INK_MAX_SAT = 0.18
+const INK_GATE = 16
+const INK_GAIN = 1.85
+const INK_PAPER_MEAN = 216
+const INK_PHOTO_STD = 24
+const INK_MAX_SAT = 0.16
 const YIELD_MS = 24
 
 const TONE_LUT = buildToneLut()
@@ -558,7 +557,7 @@ function scaleToLuma(r: number, g: number, b: number, fromL: number, toL: number
   return [r * scale, g * scale, b * scale]
 }
 
-function integralLuma(src: Float32Array, width: number, height: number) {
+function integralPlane(src: Float32Array, width: number, height: number, square: boolean) {
   const iw = width + 1
   const out = new Float64Array(iw * (height + 1))
   for (let y = 1; y <= height; y += 1) {
@@ -567,31 +566,16 @@ function integralLuma(src: Float32Array, width: number, height: number) {
     const prev = (y - 1) * iw
     const cur = y * iw
     for (let x = 1; x <= width; x += 1) {
-      run += src[srcRow + x - 1] ?? 0
+      const value = src[srcRow + x - 1] ?? 0
+      run += square ? value * value : value
       out[cur + x] = (out[prev + x] ?? 0) + run
     }
   }
   return out
 }
 
-function boxMean(
-  ii: Float64Array,
-  iw: number,
-  x: number,
-  y: number,
-  radius: number,
-  width: number,
-  height: number,
-) {
-  const x0 = Math.max(0, x - radius)
-  const y0 = Math.max(0, y - radius)
-  const x1 = Math.min(width, x + radius + 1)
-  const y1 = Math.min(height, y + radius + 1)
-  const n = (x1 - x0) * (y1 - y0)
-  if (n < 1) return 255
-  return (
-    ((ii[y1 * iw + x1] ?? 0) - (ii[y0 * iw + x1] ?? 0) - (ii[y1 * iw + x0] ?? 0) + (ii[y0 * iw + x0] ?? 0)) / n
-  )
+function boxSum(ii: Float64Array, iw: number, x0: number, y0: number, x1: number, y1: number) {
+  return (ii[y1 * iw + x1] ?? 0) - (ii[y0 * iw + x1] ?? 0) - (ii[y1 * iw + x0] ?? 0) + (ii[y0 * iw + x0] ?? 0)
 }
 
 /**
@@ -670,7 +654,8 @@ async function boostPrintedInk(
   for (let p = 0, i = 0; p < luma.length; p += 1, i += 4) {
     luma[p] = pixelLuma(data[i] ?? 0, data[i + 1] ?? 0, data[i + 2] ?? 0)
   }
-  const sum = integralLuma(luma, width, height)
+  const sum = integralPlane(luma, width, height, false)
+  const sq = integralPlane(luma, width, height, true)
   const iw = width + 1
   const radius = Math.max(9, Math.round(width / INK_WINDOW))
   await yieldBusy(clock)
@@ -684,15 +669,23 @@ async function boostPrintedInk(
       const green = data[i + 1] ?? 0
       const blue = data[i + 2] ?? 0
       if (pixelSat(red, green, blue) > INK_MAX_SAT) continue
-      const mean = boxMean(sum, iw, x, y, radius, width, height)
+      const x0 = Math.max(0, x - radius)
+      const y0 = Math.max(0, y - radius)
+      const x1 = Math.min(width, x + radius + 1)
+      const y1 = Math.min(height, y + radius + 1)
+      const n = (x1 - x0) * (y1 - y0)
+      if (n < 1) continue
+      const mean = boxSum(sum, iw, x0, y0, x1, y1) / n
       if (mean < INK_PAPER_MEAN) continue
+      const moment = boxSum(sq, iw, x0, y0, x1, y1) / n
+      const variance = moment - mean * mean
+      const std = Math.sqrt(variance > 0 ? variance : 0)
+      if (mean < 228 && std > INK_PHOTO_STD) continue
       const tone = luma[row + x] ?? 0
       const deficit = mean - tone
       if (deficit < INK_GATE) continue
-      const t = deficit > INK_DEFICIT ? 1 : deficit / INK_DEFICIT
-      const mix = INK_PULL * t
-      const next = tone * (1 - mix) + INK_FLOOR * mix
-      const rgb = scaleToLuma(red, green, blue, tone, next)
+      const next = tone - INK_GAIN * deficit
+      const rgb = scaleToLuma(red, green, blue, tone, next < 12 ? 12 : next)
       data[i] = clamp255(rgb[0])
       data[i + 1] = clamp255(rgb[1])
       data[i + 2] = clamp255(rgb[2])
