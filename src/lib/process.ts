@@ -46,7 +46,7 @@ export function paintFastFilter(source: HTMLCanvasElement): HTMLCanvasElement {
   return canvas
 }
 
-/** Magic scan: shadow removal, white paper, protected photos, colors kept. Yields to the UI while it runs. */
+/** Magic scan: RGB paper white, punchy ink, protected photos. Yields to the UI while it runs. */
 export async function renderMagic(source: HTMLCanvasElement): Promise<HTMLCanvasElement> {
   await yieldToBrowser()
   return await applyCanvasMagic(source)
