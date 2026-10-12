@@ -39,7 +39,7 @@ const MIN_EDGE = 2800
 const MAX_EDGE = 3508
 const MAX_UPSCALE = 3
 /** Destination mesh density: piecewise affine cells approximate the homography without seams. */
-const WARP_GRID = 24
+const WARP_GRID = 40
 
 /** CamScanner Magic Color: continuous-tone color. Never a 1-bit binary threshold. */
 const LIGHT_GRID = 16
@@ -51,13 +51,19 @@ const WHITE_KNEE = 224
 const SAT_BOOST = 1.4
 const PAPER_LUMA = 210
 const PAPER_SAT = 0.045
-const SHARPEN_AMOUNT = 1.55
-/** Large-window ink pull: faint table type vs local paper, never a 1-bit snap. */
+const SHARPEN_AMOUNT = 1.35
+const PHOTO_SHARP = 1.2
+const PHOTO_WINDOW = 160
+const PHOTO_MEAN_LO = 48
+const PHOTO_MEAN_HI = 198
+const PHOTO_STD = 14
+/** Large-window ink pull: faint table type vs local paper. Already-dark ink is left alone. */
 const INK_WINDOW = 32
-const INK_GATE = 16
-const INK_GAIN = 1.85
-const INK_PAPER_MEAN = 216
-const INK_PHOTO_STD = 24
+const INK_GATE = 12
+const INK_GAIN_FAINT = 2.3
+const INK_GAIN_SOLID = 1.05
+const INK_DARK_SKIP = 92
+const INK_PAPER_MEAN = 214
 const INK_MAX_SAT = 0.16
 const YIELD_MS = 24
 
@@ -299,8 +305,8 @@ async function warpCanvas(
   context.fillStyle = '#ffffff'
   context.fillRect(0, 0, width, height)
 
-  const padX = 0.75
-  const padY = 0.75
+  const padX = 0.45
+  const padY = 0.45
   for (let gy = 0; gy < WARP_GRID; gy += 1) {
     if (gy % 4 === 0) await nextFrame()
     const y0 = (gy / WARP_GRID) * height
@@ -640,11 +646,38 @@ async function whiteBalanceRgb(
   }
 }
 
-/**
- * Darken printed ink that sits below the local paper mean (faint table numbers, Hebrew).
- * Photo interiors, yellow plates, and stamps are skipped — this is not a binary threshold.
- */
-async function boostPrintedInk(
+function neighborhood(
+  sum: Float64Array,
+  sq: Float64Array,
+  iw: number,
+  x: number,
+  y: number,
+  radius: number,
+  width: number,
+  height: number,
+) {
+  const x0 = Math.max(0, x - radius)
+  const y0 = Math.max(0, y - radius)
+  const x1 = Math.min(width, x + radius + 1)
+  const y1 = Math.min(height, y + radius + 1)
+  const n = (x1 - x0) * (y1 - y0)
+  if (n < 1) return { mean: 255, std: 0 }
+  const mean = boxSum(sum, iw, x0, y0, x1, y1) / n
+  const moment = boxSum(sq, iw, x0, y0, x1, y1) / n
+  const variance = moment - mean * mean
+  return { mean, std: Math.sqrt(variance > 0 ? variance : 0) }
+}
+
+function writeLuma(data: Uint8ClampedArray, i: number, red: number, green: number, blue: number, fromL: number, toL: number) {
+  const rgb = scaleToLuma(red, green, blue, fromL, toL)
+  data[i] = clamp255(rgb[0])
+  data[i + 1] = clamp255(rgb[1])
+  data[i + 2] = clamp255(rgb[2])
+  data[i + 3] = 255
+}
+
+/** Small-window local contrast on photo interiors so plates and cars stay crisp. */
+async function punchPhotos(
   data: Uint8ClampedArray,
   width: number,
   height: number,
@@ -657,6 +690,39 @@ async function boostPrintedInk(
   const sum = integralPlane(luma, width, height, false)
   const sq = integralPlane(luma, width, height, true)
   const iw = width + 1
+  const radius = Math.max(4, Math.round(width / PHOTO_WINDOW))
+  await yieldBusy(clock)
+
+  for (let y = 0; y < height; y += 1) {
+    if (y % 32 === 0) await yieldBusy(clock)
+    const row = y * width
+    let i = row * 4
+    for (let x = 0; x < width; x += 1, i += 4) {
+      const { mean, std } = neighborhood(sum, sq, iw, x, y, radius, width, height)
+      if (mean < PHOTO_MEAN_LO || mean > PHOTO_MEAN_HI || std < PHOTO_STD) continue
+      const tone = luma[row + x] ?? 0
+      const next = tone + PHOTO_SHARP * (tone - mean)
+      writeLuma(data, i, data[i] ?? 0, data[i + 1] ?? 0, data[i + 2] ?? 0, tone, next)
+    }
+  }
+}
+
+/**
+ * Darken only *faint* printed ink vs local paper. Already-dark body text is skipped so
+ * strokes do not blob. Photos and yellow plates are skipped.
+ */
+async function boostPrintedInk(
+  data: Uint8ClampedArray,
+  width: number,
+  height: number,
+  clock: { last: number },
+) {
+  const luma = new Float32Array(width * height)
+  for (let p = 0, i = 0; p < luma.length; p += 1, i += 4) {
+    luma[p] = pixelLuma(data[i] ?? 0, data[i + 1] ?? 0, data[i + 2] ?? 0)
+  }
+  const sum = integralPlane(luma, width, height, false)
+  const iw = width + 1
   const radius = Math.max(9, Math.round(width / INK_WINDOW))
   await yieldBusy(clock)
 
@@ -668,6 +734,8 @@ async function boostPrintedInk(
       const red = data[i] ?? 0
       const green = data[i + 1] ?? 0
       const blue = data[i + 2] ?? 0
+      const tone = luma[row + x] ?? 0
+      if (tone < INK_DARK_SKIP) continue
       if (pixelSat(red, green, blue) > INK_MAX_SAT) continue
       const x0 = Math.max(0, x - radius)
       const y0 = Math.max(0, y - radius)
@@ -677,19 +745,12 @@ async function boostPrintedInk(
       if (n < 1) continue
       const mean = boxSum(sum, iw, x0, y0, x1, y1) / n
       if (mean < INK_PAPER_MEAN) continue
-      const moment = boxSum(sq, iw, x0, y0, x1, y1) / n
-      const variance = moment - mean * mean
-      const std = Math.sqrt(variance > 0 ? variance : 0)
-      if (mean < 228 && std > INK_PHOTO_STD) continue
-      const tone = luma[row + x] ?? 0
       const deficit = mean - tone
       if (deficit < INK_GATE) continue
-      const next = tone - INK_GAIN * deficit
-      const rgb = scaleToLuma(red, green, blue, tone, next < 12 ? 12 : next)
-      data[i] = clamp255(rgb[0])
-      data[i + 1] = clamp255(rgb[1])
-      data[i + 2] = clamp255(rgb[2])
-      data[i + 3] = 255
+      const t = deficit > 55 ? 1 : Math.max(0, (deficit - INK_GATE) / (55 - INK_GATE))
+      const gain = INK_GAIN_FAINT * (1 - t) + INK_GAIN_SOLID * t
+      const next = Math.max(24, tone - gain * deficit)
+      writeLuma(data, i, red, green, blue, tone, next)
     }
   }
 }
@@ -798,6 +859,7 @@ async function applyMagicColor(image: ImageData) {
   const { data, width, height } = image
   const clock = { last: performance.now() }
   await whiteBalanceRgb(data, width, height, clock)
+  await punchPhotos(data, width, height, clock)
   await boostPrintedInk(data, width, height, clock)
   await applyLevelsAndKnee(data, width, height, clock)
   sharpenLuma(image, SHARPEN_AMOUNT)
@@ -808,6 +870,7 @@ async function applyFastBlackWhite(image: ImageData) {
   const { data, width, height } = image
   const clock = { last: performance.now() }
   await whiteBalanceRgb(data, width, height, clock)
+  await punchPhotos(data, width, height, clock)
   await boostPrintedInk(data, width, height, clock)
   await applyLevelsAndKnee(data, width, height, clock)
   sharpenLuma(image, SHARPEN_AMOUNT)
