@@ -132,6 +132,13 @@ export function defaultCorners(width: number, height: number, inset = 0.08): Cor
   }
 }
 
+/** Centered rectangle at 5% / 95% of the frame (90% coverage). Safe crop when detection fails. */
+export const FULL_FRAME_INSET = 0.05
+
+export function fullFrameCorners(width: number, height: number): Corners {
+  return defaultCorners(width, height, FULL_FRAME_INSET)
+}
+
 /**
  * A centered A4-shaped rectangle (1:1.414), upright in a portrait photo and lying down in a
  * landscape one, with `pad` of empty space on every side.

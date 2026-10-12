@@ -501,13 +501,9 @@ export function CornerEditor() {
                   ? 'גרור פינה. הזכוכית המגדלת והצלב מסמנים את הנקודה המדויקת.'
                   : 'הקווים נחתכים. הרחק את הפינות כך שיקיפו את העמוד.'}
         </p>
-        <button
-          type="button"
-          onClick={resetPins}
-          className="mx-auto block min-h-11 rounded-2xl bg-paper px-4 py-2 text-sm font-semibold text-ink shadow-[0_8px_20px_rgba(20,34,28,0.08)] ring-1 ring-black/10 active:scale-[0.98] dark:bg-night-2 dark:text-paper dark:ring-white/10"
-        >
-          אפס פינות
-        </button>
+        <Button variant="secondary" className="w-full" onClick={resetPins}>
+          איפוס מסגרת למלבן מלא
+        </Button>
         <Button className="relative z-40 w-full" onClick={processPage}>
           המשך לעיבוד
           <ChevronRight className="dir-icon size-5" />

@@ -51,11 +51,12 @@ const SAT_BOOST = 1.6
 const SAT_MIN = 0.08
 const PAPER_LUMA = 215
 const PAPER_SAT = 0.1
+const INK_SAT = 0.12
 const INK_HARD = 90
 const MID_DARK = 175
 const SHADOW_TARGET = 20
 const MID_DARK_TARGET = 100
-const INK_RICH = 24
+const INK_FAINT_GAIN = 85
 const HIGHLIGHT_TARGET = 220
 const SHARPEN_AMOUNT = 1.25
 const SHARPEN_NOISE = 3
@@ -599,22 +600,21 @@ async function whiteBalanceRgb(
 }
 
 /**
- * Contrast stretch: shadows → deep black, faint gray print (up to luma 175) →
- * #181818, car midtones stay continuous, paper snaps to white. No region mask.
+ * Contrast stretch: gray print (L < 175, S < 0.12) → toward #151515; colored
+ * midtones stay continuous; paper snaps to white. No region mask.
  */
 function scanLuma(normL: number, sat: number) {
-  const grayInk = sat < PAPER_SAT ? 1 - sat / PAPER_SAT : 0
   let next: number
-  if (normL < INK_HARD) {
+  if (normL < MID_DARK && sat < INK_SAT) {
+    next = Math.floor(Math.pow(Math.max(0, normL) / MID_DARK, 1.5) * INK_FAINT_GAIN)
+  } else if (normL < INK_HARD) {
     next = Math.floor((normL / INK_HARD) * SHADOW_TARGET)
   } else if (normL < MID_DARK) {
     const t = (normL - INK_HARD) / (MID_DARK - INK_HARD)
-    const mild = SHADOW_TARGET + t * (MID_DARK_TARGET - SHADOW_TARGET)
-    const rich = SHADOW_TARGET + t * (INK_RICH - SHADOW_TARGET)
-    next = Math.floor(mild + (rich - mild) * grayInk)
+    next = Math.floor(SHADOW_TARGET + t * (MID_DARK_TARGET - SHADOW_TARGET))
   } else if (normL <= PAPER_LUMA) {
     const t = (normL - MID_DARK) / (PAPER_LUMA - MID_DARK)
-    const start = MID_DARK_TARGET + (INK_RICH - MID_DARK_TARGET) * grayInk
+    const start = sat < INK_SAT ? INK_FAINT_GAIN : MID_DARK_TARGET
     next = start + t * (HIGHLIGHT_TARGET - start)
   } else if (sat < PAPER_SAT) {
     next = 255

@@ -2,8 +2,8 @@ import type { Corners, Point } from '../types'
 import {
   clampPoint,
   cornersValid,
-  defaultCorners,
   distance,
+  fullFrameCorners,
   orderCorners,
   polygonArea,
   quadAngles,
@@ -16,20 +16,18 @@ import {
  * screen can never freeze after a photo.
  */
 const DETECT_MAX = 360
-const MIN_AREA = 0.3
+const MIN_AREA = 0.65
 const MAX_AREA = 0.95
 const A4_ASPECT = Math.SQRT2
 const CLOSE_RADIUS = 2
 const OPEN_RADIUS = 4
-/** Portrait A4 width/height ≈ 0.707. Outside this, the contour is not a page. */
-const SHEET_ASPECT_MIN = 0.55
-const SHEET_ASPECT_MAX = 0.85
+/** A4 long/short ≈ 1.414. A diagonal fold-crop is usually outside this. */
+const SHEET_ASPECT_MIN = 1.25
+const SHEET_ASPECT_MAX = 1.65
 const ANGLE_GOOD_MIN = 70
 const ANGLE_GOOD_MAX = 110
-const ANGLE_HARD_MIN = 55
-const ANGLE_HARD_MAX = 125
-/** Centered axis-aligned rectangle covering ~88% of the frame. */
-const FALLBACK_INSET = 0.06
+const ANGLE_HARD_MIN = 65
+const ANGLE_HARD_MAX = 115
 
 type Sample = { data: Uint8ClampedArray; width: number; height: number }
 
@@ -170,14 +168,6 @@ function pageAspect(corners: Corners): number {
   return Math.max(width, height) / shortSide
 }
 
-function sheetRatio(corners: Corners): number {
-  const width = (distance(corners.tl, corners.tr) + distance(corners.bl, corners.br)) / 2
-  const height = (distance(corners.tl, corners.bl) + distance(corners.tr, corners.br)) / 2
-  const longSide = Math.max(width, height)
-  if (longSide < 1) return 0
-  return Math.min(width, height) / longSide
-}
-
 function angleFit(corners: Corners): number {
   const angles = quadAngles(corners)
   let score = 0
@@ -188,16 +178,22 @@ function angleFit(corners: Corners): number {
   return score
 }
 
-/** Convex, near-rectangular, A4-ish. Rejects folds, bows, and triangles. */
+/** Convex A4-like quad covering ≥65% of the frame. Rejects folds, bows, and half-page crops. */
 function quadLooksLikeSheet(corners: Corners, width: number, height: number): boolean {
   if (!cornersValid(corners, width, height) || !quadIsConvex(corners)) return false
-  const ratio = sheetRatio(corners)
-  if (ratio < SHEET_ASPECT_MIN || ratio > SHEET_ASPECT_MAX) return false
+  const view = width * height
+  if (view < 1 || polygonArea([corners.tl, corners.tr, corners.br, corners.bl]) < view * MIN_AREA) return false
+  const aspect = pageAspect(corners)
+  if (aspect < SHEET_ASPECT_MIN || aspect > SHEET_ASPECT_MAX) return false
   return quadAngles(corners).every((angle) => angle >= ANGLE_HARD_MIN && angle <= ANGLE_HARD_MAX)
 }
 
 function fallbackFrame(width: number, height: number): Corners {
-  return defaultCorners(width, height, FALLBACK_INSET)
+  return fullFrameCorners(width, height)
+}
+
+export function sheetCornersOk(corners: Corners, width: number, height: number): boolean {
+  return quadLooksLikeSheet(corners, width, height)
 }
 
 type Line = { slope: number; offset: number }

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { detectDocumentCorners, refineToPaper } from '../lib/detect'
-import { cornersValid, defaultCorners, inwardPageCorners, mapLiveCorners } from '../lib/geometry'
+import { detectDocumentCorners, refineToPaper, sheetCornersOk } from '../lib/detect'
+import { cornersValid, defaultCorners, fullFrameCorners, mapLiveCorners } from '../lib/geometry'
 import { isOpenCvReady, loadOpenCv } from '../lib/opencv'
 import {
   canvasToJpegBlob,
@@ -197,17 +197,17 @@ export function ScanProvider({ children }: { children: ReactNode }) {
 
   function applyAutoCorners(corners: Corners, detected: boolean) {
     if (userAdjustedRef.current) return
-    setDraft((current) =>
-      current
-        ? {
-            ...current,
-            corners,
-            detected,
-            detecting: false,
-            snapToken: current.snapToken + 1,
-          }
-        : current,
-    )
+    setDraft((current) => {
+      if (!current) return current
+      const ok = detected && sheetCornersOk(corners, current.width, current.height)
+      return {
+        ...current,
+        corners: ok ? corners : fullFrameCorners(current.width, current.height),
+        detected: ok,
+        detecting: false,
+        snapToken: current.snapToken + 1,
+      }
+    })
   }
 
   function stopDetecting() {
@@ -272,13 +272,14 @@ export function ScanProvider({ children }: { children: ReactNode }) {
       normalized = await normalizeImage(blob)
       userAdjustedRef.current = false
       // The outline already tracked live is reused 1:1; detection only runs when the live view had none.
-      const live = hint ? mapLiveCorners(hint, normalized.width, normalized.height) : null
+      const mapped = hint ? mapLiveCorners(hint, normalized.width, normalized.height) : null
+      const live = mapped && sheetCornersOk(mapped, normalized.width, normalized.height) ? mapped : null
       detectGen.current += 1
       const next = {
         sourceUrl: normalized.url,
         width: normalized.width,
         height: normalized.height,
-        corners: live ?? inwardPageCorners(normalized.width, normalized.height),
+        corners: live ?? fullFrameCorners(normalized.width, normalized.height),
         filter: 'magic' as const,
         detected: live !== null,
         detecting: live === null,
@@ -323,7 +324,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     userAdjustedRef.current = false
     const next = {
       ...current,
-      corners: inwardPageCorners(current.width, current.height),
+      corners: fullFrameCorners(current.width, current.height),
       detected: false,
       detecting: true,
     }
@@ -339,9 +340,10 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     userAdjustedRef.current = true
     const next = {
       ...current,
-      corners: inwardPageCorners(current.width, current.height),
+      corners: fullFrameCorners(current.width, current.height),
       detected: false,
       detecting: false,
+      snapToken: current.snapToken + 1,
     }
     draftRef.current = next
     setDraft(next)
