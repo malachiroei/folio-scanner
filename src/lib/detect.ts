@@ -9,15 +9,15 @@ import {
   quadAngles,
   quadIsConvex,
 } from './geometry'
-import { getCv, isOpenCvReady, MatBin } from './opencv'
+import { getCv, isOpenCvReady, MatBin, type Cv, type CvMat } from './opencv'
 
 /**
  * Paper hull on a ~480px copy: Canny → largest external contour → 4-gon.
  * OpenCV when loaded; otherwise a canvas Sobel/Canny stand-in. Never freezes the corner screen.
  */
 const DETECT_MAX = 480
-const MIN_AREA = 0.3
-const MAX_AREA = 0.95
+const MIN_AREA = 0.25
+const MAX_AREA = 0.92
 const A4_ASPECT = Math.SQRT2
 const CLOSE_RADIUS = 2
 const OPEN_RADIUS = 4
@@ -173,7 +173,7 @@ function angleFit(corners: Corners): number {
   return score
 }
 
-/** Convex 4-gon covering 30–95% of the frame. No aspect-ratio straitjacket. */
+/** Convex 4-gon covering 25–92% of the frame. */
 function quadLooksLikeSheet(corners: Corners, width: number, height: number): boolean {
   if (!cornersValid(corners, width, height) || !quadIsConvex(corners)) return false
   const view = width * height
@@ -374,12 +374,111 @@ function findCannyQuadCanvas(sample: Sample): Point[] | null {
   return chosen?.points ?? null
 }
 
-function findCannyQuad(sample: Sample): Point[] | null {
+function approxFourCv(cv: Cv, bin: MatBin, hull: CvMat, width: number, height: number): Point[] | null {
+  const peri = cv.arcLength(hull, true)
+  for (const scale of [0.02, 0.025, 0.03, 0.015, 0.04, 0.012]) {
+    const approx = bin.keep(new cv.Mat())
+    cv.approxPolyDP(hull, approx, scale * peri, true)
+    const accepted = acceptSampleQuad(matPoints(approx), width, height)
+    if (accepted) return accepted
+  }
+  return null
+}
+
+function bestQuadFromBinaryCv(cv: Cv, binary: CvMat, sample: Sample): Point[] | null {
+  const bin = new MatBin()
+  try {
+    const kernel = bin.keep(cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(5, 5)))
+    const closed = bin.keep(new cv.Mat())
+    cv.morphologyEx(binary, closed, cv.MORPH_CLOSE, kernel)
+    const contours = bin.keep(new cv.MatVector())
+    const hierarchy = bin.keep(new cv.Mat())
+    cv.findContours(closed, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+    const frame = sample.width * sample.height
+    let best: Point[] | null = null
+    let bestArea = 0
+    for (let i = 0; i < contours.size(); i += 1) {
+      const contour = contours.get(i)
+      const area = cv.contourArea(contour)
+      if (area < frame * MIN_AREA || area > frame * MAX_AREA || area <= bestArea) continue
+      const hull = bin.keep(new cv.Mat())
+      cv.convexHull(contour, hull, false, true)
+      const accepted = approxFourCv(cv, bin, hull, sample.width, sample.height)
+      if (!accepted) continue
+      best = accepted
+      bestArea = area
+    }
+    return best
+  } catch (error) {
+    console.error(error)
+    return null
+  } finally {
+    bin.release()
+  }
+}
+
+/** White paper on a light desk: Otsu + adaptive threshold beat Canny's faint gradient. */
+function findThresholdQuadCv(sample: Sample): Point[] | null {
+  const cv = getCv()
+  const bin = new MatBin()
+  try {
+    const src = bin.keep(cv.imread(sample.canvas))
+    const gray = bin.keep(new cv.Mat())
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY)
+    const blur = bin.keep(new cv.Mat())
+    cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0)
+    const block = Math.max(11, Math.round(Math.min(sample.width, sample.height) / 16) | 1)
+    const adaptive = bin.keep(new cv.Mat())
+    cv.adaptiveThreshold(blur, adaptive, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY, block, 4)
+    const fromAdaptive = bestQuadFromBinaryCv(cv, adaptive, sample)
+    if (fromAdaptive) return fromAdaptive
+    const otsu = bin.keep(new cv.Mat())
+    cv.threshold(blur, otsu, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
+    const fromOtsu = bestQuadFromBinaryCv(cv, otsu, sample)
+    if (fromOtsu) return fromOtsu
+    const kernel = bin.keep(cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3)))
+    const grad = bin.keep(new cv.Mat())
+    cv.morphologyEx(blur, grad, cv.MORPH_GRADIENT, kernel)
+    const edges = bin.keep(new cv.Mat())
+    cv.threshold(grad, edges, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
+    return bestQuadFromBinaryCv(cv, edges, sample)
+  } catch (error) {
+    console.error(error)
+    return null
+  } finally {
+    bin.release()
+  }
+}
+
+function adaptiveMask(gray: Float32Array, width: number, height: number): Uint8Array {
+  const radius = Math.max(7, Math.round(Math.min(width, height) / 18))
+  const mean = boxBlur(gray, width, height, radius)
+  const mask = new Uint8Array(width * height)
+  for (let i = 0; i < mask.length; i += 1) {
+    mask[i] = (gray[i] ?? 0) > (mean[i] ?? 0) + 3 ? 1 : 0
+  }
+  return mask
+}
+
+function largestQuadFromMask(mask: Uint8Array, sample: Sample, gray: Float32Array): Point[] | null {
+  const blobs = rankBlobs(close(mask, sample.width, sample.height, 1), sample.width, sample.height, gray)
+  const chosen = blobs.find((blob) => blob.touching < 3) ?? blobs[0]
+  return chosen?.points ?? null
+}
+
+function findThresholdQuadCanvas(sample: Sample): Point[] | null {
+  const gray = lumaOf(sample)
+  const fromAdaptive = largestQuadFromMask(adaptiveMask(gray, sample.width, sample.height), sample, gray)
+  if (fromAdaptive) return fromAdaptive
+  return largestQuadFromMask(brightMask(sample), sample, gray)
+}
+
+function findPaperQuad(sample: Sample): Point[] | null {
   if (isOpenCvReady()) {
-    const found = findCannyQuadCv(sample)
+    const found = findThresholdQuadCv(sample) ?? findCannyQuadCv(sample)
     if (found) return found
   }
-  return findCannyQuadCanvas(sample)
+  return findThresholdQuadCanvas(sample) ?? findCannyQuadCanvas(sample)
 }
 
 type Line = { slope: number; offset: number }
@@ -989,8 +1088,8 @@ export type DetectOptions = {
 }
 
 /**
- * Canny outer hull first (4 vertices, 30–95% of the frame). Then paper-blob
- * passes. If nothing looks like a sheet, a 10% inset rectangle — never the raw frame.
+ * Otsu / adaptive threshold hull first (white paper on a light desk), then Canny,
+ * then paper-blob passes. Fallback is a 10% inset — never the raw viewfinder edge.
  */
 export function detectDocumentCorners(
   image: CanvasImageSource,
@@ -1003,9 +1102,9 @@ export function detectDocumentCorners(
     const maxEdge = options.maxEdge ?? DETECT_MAX
     const sample = takeSample(image, maxEdge)
     if (!sample) return missed
-    const canny = findCannyQuad(sample)
-    if (canny) {
-      const corners = orderCorners(canny.map((point) => scaleUp(point, sample.width, sample.height, width, height)))
+    const paper = findPaperQuad(sample)
+    if (paper) {
+      const corners = orderCorners(paper.map((point) => scaleUp(point, sample.width, sample.height, width, height)))
       if (quadLooksLikeSheet(corners, width, height)) return { corners, detected: true }
     }
     const gray = lumaOf(sample)

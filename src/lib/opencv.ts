@@ -121,6 +121,7 @@ export type Cv = {
   MORPH_ELLIPSE: number
   MORPH_CLOSE: number
   MORPH_OPEN: number
+  MORPH_GRADIENT: number
   CV_8U: number
   CV_8UC1: number
   CV_8UC3: number

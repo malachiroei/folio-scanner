@@ -1,23 +1,14 @@
 ﻿import type { Corners, FilterMode, Point } from '../types'
-import { boundingRectCorners, distance, outputSize, quadIsConvex } from './geometry'
+import { boundingRectCorners, distance, quadIsConvex } from './geometry'
 import { nextFrame } from './image'
+import { getCv, isOpenCvReady, MatBin } from './opencv'
 
-/**
- * Strict A4 container (1:1.414). A wider-than-tall quad becomes a landscape page (3508x2480 at
- * most), anything else a portrait page (2480x3508), so a document is never rotated or squeezed
- * into the wrong orientation. Very elongated shapes (receipts) keep their measured size.
- */
-function a4Size(
-  size: { width: number; height: number },
-  landscape: boolean,
-): { width: number; height: number } {
-  const long = Math.max(size.width, size.height)
-  const short = Math.min(size.width, size.height)
-  if (short < 1) return size
-  const ratio = long / short
-  if (ratio > 2.1) return size
-  const snapped = Math.round(long / Math.SQRT2)
-  return landscape ? { width: long, height: snapped } : { width: snapped, height: long }
+/** 300 DPI A4: 2480×3508 portrait, 3508×2480 landscape. */
+const A4_SHORT = 2480
+const A4_LONG = 3508
+
+function a4Page(landscape: boolean): { width: number; height: number } {
+  return landscape ? { width: A4_LONG, height: A4_SHORT } : { width: A4_SHORT, height: A4_LONG }
 }
 
 /**
@@ -30,14 +21,6 @@ function isLandscape(corners: Corners): boolean {
   return width > height
 }
 
-/**
- * Long edge of the straightened page: never below 2800px (about 240 DPI on A4), up to full A4 at
- * 300 DPI (3508x2480 landscape, 2480x3508 portrait). Smaller quads are enlarged with high-quality
- * interpolation, but never more than 3x, so a tiny source does not blow up memory for nothing.
- */
-const MIN_EDGE = 2800
-const MAX_EDGE = 3508
-const MAX_UPSCALE = 3
 /** Destination mesh density: piecewise affine cells approximate the homography without seams. */
 const WARP_GRID = 48
 
@@ -273,9 +256,57 @@ function paintScaled(
  * homography; each triangle is drawn with the browser's high-quality bilinear/bicubic sampler
  * so small Hebrew type is not smeared on a screen-sized canvas.
  */
-/** Source quad must stay convex; dest is always the rectangle (width × height). */
+/** Source quad must stay convex; dest is always the full A4 rectangle. */
 function warpSourceCorners(corners: Corners): Corners {
   return quadIsConvex(corners) ? corners : boundingRectCorners(corners)
+}
+
+function warpPerspectiveCv(
+  source: HTMLCanvasElement,
+  corners: Corners,
+  width: number,
+  height: number,
+): HTMLCanvasElement | null {
+  if (!isOpenCvReady()) return null
+  const cv = getCv()
+  const bin = new MatBin()
+  try {
+    const src = bin.keep(cv.imread(source))
+    const from = bin.keep(
+      cv.matFromArray(4, 1, cv.CV_32FC2, [
+        corners.tl.x,
+        corners.tl.y,
+        corners.tr.x,
+        corners.tr.y,
+        corners.br.x,
+        corners.br.y,
+        corners.bl.x,
+        corners.bl.y,
+      ]),
+    )
+    const to = bin.keep(cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, width, 0, width, height, 0, height]))
+    const matrix = bin.keep(cv.getPerspectiveTransform(from, to))
+    const dst = bin.keep(new cv.Mat())
+    cv.warpPerspective(
+      src,
+      dst,
+      matrix,
+      new cv.Size(width, height),
+      cv.INTER_LINEAR,
+      cv.BORDER_REPLICATE,
+      new cv.Scalar(255, 255, 255, 255),
+    )
+    const canvas = document.createElement('canvas')
+    canvas.width = width
+    canvas.height = height
+    cv.imshow(canvas, dst)
+    return canvas
+  } catch (error) {
+    console.error(error)
+    return null
+  } finally {
+    bin.release()
+  }
 }
 
 async function warpCanvas(
@@ -291,6 +322,8 @@ async function warpCanvas(
     { x: 0, y: height },
   ]
   const sourceQuad = warpSourceCorners(corners)
+  const cvWarp = warpPerspectiveCv(source, sourceQuad, width, height)
+  if (cvWarp) return cvWarp
   const to = [sourceQuad.tl, sourceQuad.tr, sourceQuad.br, sourceQuad.bl]
   const map = homography(from, to)
   if (!map) return paintScaled(source, width, height, sourceQuad)
@@ -738,11 +771,7 @@ export async function straightenCanvas(
   image: CanvasImageSource,
   corners: Corners,
 ): Promise<HTMLCanvasElement> {
-  const fitted = a4Size(outputSize(corners), isLandscape(corners))
-  const longEdge = Math.max(fitted.width, fitted.height, 1)
-  const scale = Math.min(MAX_EDGE / longEdge, Math.min(MAX_UPSCALE, Math.max(1, MIN_EDGE / longEdge)))
-  const width = Math.max(32, Math.round(fitted.width * scale))
-  const height = Math.max(32, Math.round(fitted.height * scale))
+  const { width, height } = a4Page(isLandscape(corners))
   const copy = drawSource(image)
   try {
     return await warpCanvas(copy, insetCorners(corners), width, height)
