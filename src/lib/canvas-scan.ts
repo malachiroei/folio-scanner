@@ -18,7 +18,7 @@ function a4Page(landscape: boolean): { width: number; height: number } {
 function isLandscape(corners: Corners): boolean {
   const width = (distance(corners.tl, corners.tr) + distance(corners.bl, corners.br)) / 2
   const height = (distance(corners.tl, corners.bl) + distance(corners.tr, corners.br)) / 2
-  return width > height
+  return width > height * 1.15
 }
 
 /** Destination mesh density: piecewise affine cells approximate the homography without seams. */
@@ -753,20 +753,6 @@ export function desaturateCanvas(canvas: HTMLCanvasElement): HTMLCanvasElement {
   return canvas
 }
 
-/**
- * Pulls the corners a hair toward the center so a sliver of table never reaches the A4 edge,
- * without eating the license-plate crop at the top of the sheet.
- */
-function insetCorners(corners: Corners, amount = 0.001): Corners {
-  const cx = (corners.tl.x + corners.tr.x + corners.br.x + corners.bl.x) / 4
-  const cy = (corners.tl.y + corners.tr.y + corners.br.y + corners.bl.y) / 4
-  const pull = (point: Point): Point => ({
-    x: point.x + (cx - point.x) * amount * 2,
-    y: point.y + (cy - point.y) * amount * 2,
-  })
-  return { tl: pull(corners.tl), tr: pull(corners.tr), br: pull(corners.br), bl: pull(corners.bl) }
-}
-
 export async function straightenCanvas(
   image: CanvasImageSource,
   corners: Corners,
@@ -774,7 +760,7 @@ export async function straightenCanvas(
   const { width, height } = a4Page(isLandscape(corners))
   const copy = drawSource(image)
   try {
-    return await warpCanvas(copy, insetCorners(corners), width, height)
+    return await warpCanvas(copy, corners, width, height)
   } finally {
     copy.width = 0
     copy.height = 0
