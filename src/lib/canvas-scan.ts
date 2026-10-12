@@ -39,19 +39,25 @@ const MIN_EDGE = 2800
 const MAX_EDGE = 3508
 const MAX_UPSCALE = 3
 
-/** Uniform Magic Color: flatten to 255, snap paper white, punch blacks, boost chroma. */
+/** Dual-layer Magic Color: luma illumination, variance-gated paper/photo, chroma, unsharp. */
 const LIGHT_GRID = 16
-const LIGHT_PERCENTILE = 0.9
+const LIGHT_PERCENTILE = 0.95
 const LIGHT_BLUR_PASSES = 4
+const LIGHT_FLOOR = 0.85
 const FLAT_TARGET = 255
-const WHITE_SNAP = 195
-const WHITE_SNAP_FULL = 200
-const BLACK_LO = 85
-const BLACK_OUT = 10
-const SAT_KEEP = 0.06
-const SAT_BOOST = 1.7
-const SHARPEN_AMOUNT = 1.35
-const SHARPEN_THRESHOLD = 2
+const VAR_RADIUS = 3
+const VAR_PAPER = 80
+const PAPER_L = 200
+const PAPER_S = 0.12
+const INK_L = 80
+const INK_OUT = 8
+const SAT_KEEP = 0.08
+const SAT_BOOST = 1.5
+const PHOTO_GAMMA = 1.05
+const PHOTO_HIGH = 240
+const PHOTO_FLOOR = 22
+const SHARPEN_AMOUNT = 1.25
+const SHARPEN_THRESHOLD = 1
 const BW_THRESHOLD = 148
 const YIELD_MS = 24
 
@@ -237,7 +243,7 @@ async function warpCanvas(
   return canvas
 }
 
-/* ---------- Uniform Magic Color: flatten → punch → vivid sat → unsharp ---------- */
+/* ---------- Dual-layer Magic Color: illuminate → gate paper/photo → sat → unsharp ---------- */
 
 async function yieldBusy(clock: { last: number }) {
   if (performance.now() - clock.last < YIELD_MS) return
@@ -247,6 +253,10 @@ async function yieldBusy(clock: { last: number }) {
 
 function clamp255(value: number) {
   return value < 0 ? 0 : value > 255 ? 255 : value
+}
+
+function clamp01(value: number) {
+  return value < 0 ? 0 : value > 1 ? 1 : value
 }
 
 function smoothstep(edge0: number, edge1: number, x: number) {
@@ -335,51 +345,87 @@ function blurGrid3x3(grid: Float32Array, size: number) {
   return next
 }
 
+function dilateGrid3x3(grid: Float32Array, size: number) {
+  const next = new Float32Array(size * size)
+  for (let y = 0; y < size; y += 1) {
+    for (let x = 0; x < size; x += 1) {
+      let peak = 0
+      for (let dy = -1; dy <= 1; dy += 1) {
+        const yy = y + dy
+        if (yy < 0 || yy >= size) continue
+        const row = yy * size
+        for (let dx = -1; dx <= 1; dx += 1) {
+          const xx = x + dx
+          if (xx < 0 || xx >= size) continue
+          const value = grid[row + xx] ?? 0
+          if (value > peak) peak = value
+        }
+      }
+      next[y * size + x] = peak
+    }
+  }
+  return next
+}
+
+function erodeGrid3x3(grid: Float32Array, size: number) {
+  const next = new Float32Array(size * size)
+  for (let y = 0; y < size; y += 1) {
+    for (let x = 0; x < size; x += 1) {
+      let floor = Number.POSITIVE_INFINITY
+      for (let dy = -1; dy <= 1; dy += 1) {
+        const yy = y + dy
+        if (yy < 0 || yy >= size) continue
+        const row = yy * size
+        for (let dx = -1; dx <= 1; dx += 1) {
+          const xx = x + dx
+          if (xx < 0 || xx >= size) continue
+          const value = grid[row + xx] ?? 0
+          if (value < floor) floor = value
+        }
+      }
+      next[y * size + x] = Number.isFinite(floor) ? floor : 1
+    }
+  }
+  return next
+}
+
 /**
- * Paper-white field per channel: 16×16 90th-percentile R/G/B, then a heavy box
- * filter. Dividing each channel by this surface both lifts shadows and removes
- * the warm gray cast that a luma-only divide leaves on the page.
+ * Ambient paper-white field from luminance: 16×16 95th-percentile cells, a
+ * morphological close so photo holes do not sink the light estimate, then blur.
+ * `paper95` is the global 95th percentile used as the illumination floor.
  */
-function illuminationRgb(data: Uint8ClampedArray, width: number, height: number) {
+function illuminationLuma(luma: Float32Array, width: number, height: number) {
   const cells = LIGHT_GRID * LIGHT_GRID
-  const hists = [new Uint32Array(cells * 256), new Uint32Array(cells * 256), new Uint32Array(cells * 256)]
+  const hists = new Uint32Array(cells * 256)
   const counts = new Uint32Array(cells)
+  const global = new Uint32Array(256)
 
   for (let y = 0; y < height; y += 1) {
     const gy = Math.min(LIGHT_GRID - 1, ((y * LIGHT_GRID) / height) | 0)
+    const row = y * width
     for (let x = 0; x < width; x += 1) {
       const gx = Math.min(LIGHT_GRID - 1, ((x * LIGHT_GRID) / width) | 0)
       const id = gy * LIGHT_GRID + gx
-      const i = (y * width + x) * 4
-      const histR = hists[0]
-      const histG = hists[1]
-      const histB = hists[2]
-      if (!histR || !histG || !histB) continue
-      histR[id * 256 + Math.min(255, Math.max(0, Math.round(data[i] ?? 0)))] += 1
-      histG[id * 256 + Math.min(255, Math.max(0, Math.round(data[i + 1] ?? 0)))] += 1
-      histB[id * 256 + Math.min(255, Math.max(0, Math.round(data[i + 2] ?? 0)))] += 1
+      const bin = Math.min(255, Math.max(0, Math.round(luma[row + x] ?? 0)))
+      hists[id * 256 + bin] += 1
       counts[id] += 1
+      global[bin] += 1
     }
   }
 
-  const grids = [new Float32Array(cells), new Float32Array(cells), new Float32Array(cells)]
+  const paper95 = Math.max(1, histPercentile(global, width * height, LIGHT_PERCENTILE))
+  const grid = new Float32Array(cells)
   for (let id = 0; id < cells; id += 1) {
     const n = Math.max(1, counts[id] ?? 1)
-    for (let c = 0; c < 3; c += 1) {
-      const hist = hists[c]?.subarray(id * 256, id * 256 + 256)
-      const grid = grids[c]
-      if (!hist || !grid) continue
-      grid[id] = Math.max(1, histPercentile(hist, n, LIGHT_PERCENTILE))
-    }
+    const hist = hists.subarray(id * 256, id * 256 + 256)
+    grid[id] = Math.max(1, histPercentile(hist, n, LIGHT_PERCENTILE))
   }
 
-  return grids.map((grid) => {
-    let smooth = grid
-    for (let pass = 0; pass < LIGHT_BLUR_PASSES; pass += 1) {
-      smooth = blurGrid3x3(smooth, LIGHT_GRID)
-    }
-    return smooth
-  }) as [Float32Array, Float32Array, Float32Array]
+  let smooth = erodeGrid3x3(dilateGrid3x3(grid, LIGHT_GRID), LIGHT_GRID)
+  for (let pass = 0; pass < LIGHT_BLUR_PASSES; pass += 1) {
+    smooth = blurGrid3x3(smooth, LIGHT_GRID)
+  }
+  return { grid: smooth, paper95 }
 }
 
 function sampleGrid(grid: Float32Array, x: number, y: number, width: number, height: number) {
@@ -398,48 +444,132 @@ function sampleGrid(grid: Float32Array, x: number, y: number, width: number, hei
   return Math.max(1, (a * (1 - tx) + b * tx) * (1 - ty) + (c * (1 - tx) + d * tx) * ty)
 }
 
-/** Divide each channel by the paper-white surface: `norm = clamp((C / bgC) * 255)`. */
-async function flattenRgb(
-  data: Uint8ClampedArray,
+function prefixSums(src: Float32Array, width: number, height: number) {
+  const iw = width + 1
+  const sum = new Float64Array(iw * (height + 1))
+  const sq = new Float64Array(iw * (height + 1))
+  for (let y = 1; y <= height; y += 1) {
+    let row = 0
+    let rowSq = 0
+    const srcRow = (y - 1) * width
+    const prev = (y - 1) * iw
+    const cur = y * iw
+    for (let x = 1; x <= width; x += 1) {
+      const value = src[srcRow + x - 1] ?? 0
+      row += value
+      rowSq += value * value
+      sum[cur + x] = (sum[prev + x] ?? 0) + row
+      sq[cur + x] = (sq[prev + x] ?? 0) + rowSq
+    }
+  }
+  return { sum, sq, iw }
+}
+
+function rectSum(ii: Float64Array, iw: number, x0: number, y0: number, x1: number, y1: number) {
+  return (ii[y1 * iw + x1] ?? 0) - (ii[y0 * iw + x1] ?? 0) - (ii[y1 * iw + x0] ?? 0) + (ii[y0 * iw + x0] ?? 0)
+}
+
+/** 7×7 luminance variance via integral images. */
+function localVariance7(luma: Float32Array, width: number, height: number) {
+  const { sum, sq, iw } = prefixSums(luma, width, height)
+  const out = new Float32Array(width * height)
+  for (let y = 0; y < height; y += 1) {
+    const y0 = Math.max(0, y - VAR_RADIUS)
+    const y1 = Math.min(height, y + VAR_RADIUS + 1)
+    const row = y * width
+    for (let x = 0; x < width; x += 1) {
+      const x0 = Math.max(0, x - VAR_RADIUS)
+      const x1 = Math.min(width, x + VAR_RADIUS + 1)
+      const n = (x1 - x0) * (y1 - y0)
+      if (n < 2) {
+        out[row + x] = 0
+        continue
+      }
+      const mean = rectSum(sum, iw, x0, y0, x1, y1) / n
+      const moment = rectSum(sq, iw, x0, y0, x1, y1) / n
+      const variance = moment - mean * mean
+      out[row + x] = variance > 0 ? variance : 0
+    }
+  }
+  return out
+}
+
+/** Ink crush toward #080808. Asphalt around 30–40 still keeps tone. */
+function inkTone(flatL: number) {
+  const t = clamp01(flatL / INK_L)
+  return INK_OUT + (INK_L - INK_OUT) * t * t
+}
+
+/**
+ * Midtone-centered S-curve (gamma 1.05). Highlights soft-cap near 230–240;
+ * shadows lift so road asphalt sits around 20–40 instead of clipping to 0.
+ */
+function photoTone(flatL: number) {
+  const t = clamp01(flatL / 255)
+  const s =
+    t < 0.5 ? 0.5 * (2 * t) ** PHOTO_GAMMA : 1 - 0.5 * (2 - 2 * t) ** PHOTO_GAMMA
+  const out = s * 255
+  if (out < PHOTO_FLOOR) return PHOTO_FLOOR * 0.7 + out * 0.3
+  if (out > PHOTO_HIGH) return PHOTO_HIGH + (out - PHOTO_HIGH) * 0.15
+  return out
+}
+
+function paperMix(variance: number, flatL: number, sat: number) {
+  if (variance >= VAR_PAPER || flatL <= PAPER_L || sat >= PAPER_S) return 0
+  return (1 - variance / VAR_PAPER) * smoothstep(PAPER_L, PAPER_L + 16, flatL) * (1 - sat / PAPER_S)
+}
+
+function scaleToLuma(r: number, g: number, b: number, origL: number, targetL: number): [number, number, number] {
+  if (origL < 0.5) return [targetL, targetL, targetL]
+  const scale = targetL / origL
+  return [r * scale, g * scale, b * scale]
+}
+
+/**
+ * Flatten luminance against the illumination field.
+ * `bgL = max(bgL, globalPaper95th * 0.85)` so dark photos cannot drag paper white down.
+ * `flatL = clamp((L / bgL) * 255, 0, 255)`
+ */
+async function flattenLuma(
+  luma: Float32Array,
+  grid: Float32Array,
+  paper95: number,
   width: number,
   height: number,
   clock: { last: number },
 ) {
-  const [gridR, gridG, gridB] = illuminationRgb(data, width, height)
-  await yieldBusy(clock)
+  const flatL = new Float32Array(width * height)
+  const floor = paper95 * LIGHT_FLOOR
   for (let y = 0; y < height; y += 1) {
     if (y % 48 === 0) await yieldBusy(clock)
+    const row = y * width
     for (let x = 0; x < width; x += 1) {
-      const i = (y * width + x) * 4
-      const bgR = sampleGrid(gridR, x, y, width, height)
-      const bgG = sampleGrid(gridG, x, y, width, height)
-      const bgB = sampleGrid(gridB, x, y, width, height)
-      data[i] = clamp255(((data[i] ?? 0) / bgR) * FLAT_TARGET)
-      data[i + 1] = clamp255(((data[i + 1] ?? 0) / bgG) * FLAT_TARGET)
-      data[i + 2] = clamp255(((data[i + 2] ?? 0) / bgB) * FLAT_TARGET)
-      data[i + 3] = 255
+      const bgL = Math.max(sampleGrid(grid, x, y, width, height), floor)
+      const flat = ((luma[row + x] ?? 0) / bgL) * FLAT_TARGET
+      flatL[row + x] = flat < 0 ? 0 : flat > 255 ? 255 : flat
     }
   }
+  return flatL
 }
 
-/** Blacks below 85 pull to #0a0a0a; low-sat paper above 195 snaps to #FFFFFF. */
-function punchLuma(normL: number, sat: number) {
-  if (normL < BLACK_LO) {
-    const t = normL / BLACK_LO
-    return BLACK_OUT + (BLACK_LO - BLACK_OUT) * t * t
+function lumaChannel(data: Uint8ClampedArray, width: number, height: number) {
+  const luma = new Float32Array(width * height)
+  for (let p = 0, i = 0; p < luma.length; p += 1, i += 4) {
+    luma[p] = pixelLuma(data[i] ?? 0, data[i + 1] ?? 0, data[i + 2] ?? 0)
   }
-  if (sat <= SAT_KEEP && normL > WHITE_SNAP) {
-    return normL + (255 - normL) * smoothstep(WHITE_SNAP, WHITE_SNAP_FULL, normL)
-  }
-  return normL
+  return luma
 }
 
 /**
- * After RGB flatten: punch blacks, snap paper to #FFFFFF, boost chroma 1.7×
- * when HSV S > 0.06 so pink/blue/yellow/red stay vivid.
+ * Paper (flat + bright + low sat) → #FFFFFF. Ink (flatL < 80) → #080808 crush.
+ * Photos / midtones keep continuous tone via the S-curve — never a white clamp.
+ * Chromatic pixels (S > 0.08) get a 1.5× saturation boost at the same hue.
  */
-async function applyPunchAndColor(
+async function applyToneAndColor(
   data: Uint8ClampedArray,
+  luma: Float32Array,
+  flatL: Float32Array,
+  variance: Float32Array,
   width: number,
   height: number,
   clock: { last: number },
@@ -447,35 +577,40 @@ async function applyPunchAndColor(
   for (let y = 0; y < height; y += 1) {
     if (y % 48 === 0) await yieldBusy(clock)
     let i = y * width * 4
+    const row = y * width
     for (let x = 0; x < width; x += 1, i += 4) {
       let red = data[i] ?? 0
       let green = data[i + 1] ?? 0
       let blue = data[i + 2] ?? 0
-      const normL = pixelLuma(red, green, blue)
-      const chroma = pixelSat(red, green, blue)
-      const nextL = punchLuma(normL, chroma)
-      if (normL > 0.5) {
-        const scale = nextL / normL
-        red *= scale
-        green *= scale
-        blue *= scale
-      } else {
-        red = nextL
-        green = nextL
-        blue = nextL
-      }
+      const p = row + x
+      const origL = luma[p] ?? pixelLuma(red, green, blue)
+      const flat = flatL[p] ?? origL
+      const sat = pixelSat(red, green, blue)
+      const localVar = variance[p] ?? 0
+      const mix = paperMix(localVar, flat, sat)
 
-      if (chroma > SAT_KEEP) {
-        const [hue, , value] = rgbToHsv(red, green, blue)
-        const tone = hsvToRgb(hue, Math.min(1, chroma * SAT_BOOST), value)
+      if (flat < INK_L && localVar < VAR_PAPER) {
+        const tone = scaleToLuma(red, green, blue, origL, inkTone(flat))
         red = tone[0]
         green = tone[1]
         blue = tone[2]
-      } else if (normL > WHITE_SNAP) {
-        const mix = smoothstep(WHITE_SNAP, WHITE_SNAP_FULL, normL)
+      } else if (mix > 0) {
         red += (255 - red) * mix
         green += (255 - green) * mix
         blue += (255 - blue) * mix
+      } else {
+        const tone = scaleToLuma(red, green, blue, origL, photoTone(flat))
+        red = tone[0]
+        green = tone[1]
+        blue = tone[2]
+      }
+
+      if (sat > SAT_KEEP && mix < 0.85) {
+        const [hue, , value] = rgbToHsv(red, green, blue)
+        const chroma = hsvToRgb(hue, Math.min(1, sat * SAT_BOOST), value)
+        red = chroma[0]
+        green = chroma[1]
+        blue = chroma[2]
       }
 
       data[i] = clamp255(red)
@@ -486,7 +621,7 @@ async function applyPunchAndColor(
   }
 }
 
-/** 3×3 unsharp on luminance. Amount 1.35 / threshold 2 for Magic Color; gentler for warp. */
+/** 3×3 unsharp on luminance. Amount 1.25 for Magic Color; gentler for warp. */
 function sharpen3x3(image: ImageData, amount: number, threshold = 1.2) {
   const { data, width, height } = image
   const gray = new Float32Array(width * height)
@@ -498,7 +633,16 @@ function sharpen3x3(image: ImageData, amount: number, threshold = 1.2) {
       const p = y * width + x
       const center = gray[p] ?? 0
       const blur =
-        ((gray[p - 1] ?? 0) + (gray[p + 1] ?? 0) + (gray[p - width] ?? 0) + (gray[p + width] ?? 0)) / 4
+        ((gray[p - width - 1] ?? 0) +
+          (gray[p - width] ?? 0) +
+          (gray[p - width + 1] ?? 0) +
+          (gray[p - 1] ?? 0) +
+          center +
+          (gray[p + 1] ?? 0) +
+          (gray[p + width - 1] ?? 0) +
+          (gray[p + width] ?? 0) +
+          (gray[p + width + 1] ?? 0)) /
+        9
       const delta = center - blur
       if (Math.abs(delta) < threshold) continue
       const next = center + delta * amount
@@ -514,20 +658,35 @@ function sharpen3x3(image: ImageData, amount: number, threshold = 1.2) {
 async function applyMagicColor(image: ImageData) {
   const { data, width, height } = image
   const clock = { last: performance.now() }
-  await flattenRgb(data, width, height, clock)
-  await applyPunchAndColor(data, width, height, clock)
+  const luma = lumaChannel(data, width, height)
+  const { grid, paper95 } = illuminationLuma(luma, width, height)
+  await yieldBusy(clock)
+  const flatL = await flattenLuma(luma, grid, paper95, width, height, clock)
+  const variance = localVariance7(flatL, width, height)
+  await yieldBusy(clock)
+  await applyToneAndColor(data, luma, flatL, variance, width, height, clock)
   sharpen3x3(image, SHARPEN_AMOUNT, SHARPEN_THRESHOLD)
 }
 
 async function applyFastBlackWhite(image: ImageData) {
   const { data, width, height } = image
   const clock = { last: performance.now() }
-  await flattenRgb(data, width, height, clock)
+  const luma = lumaChannel(data, width, height)
+  const { grid, paper95 } = illuminationLuma(luma, width, height)
+  await yieldBusy(clock)
+  const flatL = await flattenLuma(luma, grid, paper95, width, height, clock)
+  const variance = localVariance7(flatL, width, height)
+  await yieldBusy(clock)
   for (let y = 0; y < height; y += 1) {
     if (y % 48 === 0) await yieldBusy(clock)
     let i = y * width * 4
+    const row = y * width
     for (let x = 0; x < width; x += 1, i += 4) {
-      const tone = punchLuma(pixelLuma(data[i] ?? 0, data[i + 1] ?? 0, data[i + 2] ?? 0), 0)
+      const flat = flatL[row + x] ?? 0
+      const localVar = variance[row + x] ?? 0
+      const mix = paperMix(localVar, flat, 0)
+      const tone =
+        flat < INK_L && localVar < VAR_PAPER ? inkTone(flat) : mix > 0.5 ? 255 : photoTone(flat)
       const ink = tone < BW_THRESHOLD ? 0 : 255
       data[i] = ink
       data[i + 1] = ink
@@ -601,12 +760,12 @@ async function processPixels(
   return canvas
 }
 
-/** Magic Color: brilliant paper, punchy ink/photos, 1.7× chroma, razor edges. */
+/** Magic Color: white paper, protected photos, 1.5× chroma, razor edges. */
 export async function applyCanvasMagic(source: HTMLCanvasElement): Promise<HTMLCanvasElement> {
   return processPixels(source, applyMagicColor)
 }
 
-/** Adaptive black and white from the same flatten + punch curve. */
+/** Adaptive black and white from the same illumination flatten and paper/photo gate. */
 export async function applyCanvasBlackWhite(source: HTMLCanvasElement): Promise<HTMLCanvasElement> {
   return processPixels(source, applyFastBlackWhite)
 }
