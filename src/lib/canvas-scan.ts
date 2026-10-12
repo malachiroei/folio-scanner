@@ -47,12 +47,14 @@ const LIGHT_FLOOR = 0.85
 const FLAT_TARGET = 255
 const PAPER_L = 210
 const PAPER_S = 0.12
-const INK_L = 75
-const INK_OUT = 5
 const SAT_KEEP = 0.1
-const SAT_BOOST = 1.4
-const CURVE_CONTRAST = 1.16
-const CURVE_GAMMA = 1.08
+const SAT_BOOST = 1.5
+const PHOTO_BLACK = 50
+const PHOTO_BLACK_LO = 45
+const PHOTO_BLACK_HI = 55
+const PHOTO_WHITE = 252
+const SHADOW_GAMMA = 0.87
+const HIGHLIGHT_POWER = 1.06
 const SHARPEN_AMOUNT = 1.25
 const SHARPEN_THRESHOLD = 1
 const BW_THRESHOLD = 148
@@ -464,19 +466,64 @@ function flattenChannel(value: number, bg: number) {
   return flat < 0 ? 0 : flat > 255 ? 255 : flat
 }
 
-function inkTone(normL: number) {
-  const t = clamp01(normL / INK_L)
-  return INK_OUT + (INK_L - INK_OUT) * t * t
+function clampRange(value: number, lo: number, hi: number) {
+  return value < lo ? lo : value > hi ? hi : value
 }
 
-/** Contrast S-curve on already-neutralized midtones. */
-function midtoneCurve(normL: number) {
-  const pivoted = clamp01((normL / 255 - 0.5) * CURVE_CONTRAST + 0.5)
+/**
+ * Local photo black point: 8th percentile of non-paper luma per 16×16 cell,
+ * clamped to 45–55 so milky asphalt (~70–90) remaps toward 15–25.
+ */
+function photoBlackGrid(data: Uint8ClampedArray, width: number, height: number) {
+  const cells = LIGHT_GRID * LIGHT_GRID
+  const hists = new Uint32Array(cells * 256)
+  const counts = new Uint32Array(cells)
+  for (let y = 0; y < height; y += 1) {
+    const gy = Math.min(LIGHT_GRID - 1, ((y * LIGHT_GRID) / height) | 0)
+    for (let x = 0; x < width; x += 1) {
+      const gx = Math.min(LIGHT_GRID - 1, ((x * LIGHT_GRID) / width) | 0)
+      const i = (y * width + x) * 4
+      const luma = Math.min(255, Math.max(0, Math.round(pixelLuma(data[i] ?? 0, data[i + 1] ?? 0, data[i + 2] ?? 0))))
+      if (luma >= PAPER_L) continue
+      const id = gy * LIGHT_GRID + gx
+      hists[id * 256 + luma] += 1
+      counts[id] += 1
+    }
+  }
+  const grid = new Float32Array(cells)
+  for (let id = 0; id < cells; id += 1) {
+    const n = counts[id] ?? 0
+    if (n < 12) {
+      grid[id] = PHOTO_BLACK
+      continue
+    }
+    grid[id] = clampRange(histPercentile(hists.subarray(id * 256, id * 256 + 256), n, 0.08), PHOTO_BLACK_LO, PHOTO_BLACK_HI)
+  }
+  return blurGrid3x3(grid, LIGHT_GRID)
+}
+
+/** `stretchedL = clamp(((normL - blackPoint) / (whitePoint - blackPoint)) * 255, 0, 255)` */
+function stretchBlack(normL: number, blackPoint: number) {
+  const span = PHOTO_WHITE - blackPoint
+  if (span < 1) return clamp255(normL)
+  const stretched = ((normL - blackPoint) / span) * 255
+  return stretched < 0 ? 0 : stretched > 255 ? 255 : stretched
+}
+
+/**
+ * Steep S-curve after the black-point stretch. Shadows use levels-gamma 0.87
+ * so asphalt and tires go solid; highlights stay short of clipping.
+ */
+function photoCurve(stretchedL: number) {
+  const t = clamp01(stretchedL / 255)
+  const shadowPower = 1 / SHADOW_GAMMA
   const s =
-    pivoted < 0.5
-      ? 0.5 * (2 * pivoted) ** CURVE_GAMMA
-      : 1 - 0.5 * (2 - 2 * pivoted) ** CURVE_GAMMA
+    t < 0.5 ? 0.5 * (2 * t) ** shadowPower : 1 - 0.5 * (2 - 2 * t) ** HIGHLIGHT_POWER
   return s * 255
+}
+
+function photoTone(normL: number, blackPoint: number) {
+  return photoCurve(stretchBlack(normL, blackPoint))
 }
 
 function scaleToLuma(r: number, g: number, b: number, fromL: number, toL: number): [number, number, number] {
@@ -513,8 +560,9 @@ async function whiteBalanceRgb(
 }
 
 /**
- * After white balance: paper → #FFFFFF, ink → #050505, midtones get an S-curve.
- * Chromatic pixels (S > 0.10) keep hue and get a 1.4× saturation boost.
+ * After white balance: paper → #FFFFFF. Everything else gets a photo black-point
+ * stretch and a steep S-curve so asphalt/tires land around 15–25. Chromatic
+ * pixels (S > 0.10) keep hue and get a 1.5× saturation boost.
  */
 async function applyLevelsAndColor(
   data: Uint8ClampedArray,
@@ -522,6 +570,8 @@ async function applyLevelsAndColor(
   height: number,
   clock: { last: number },
 ) {
+  const blackGrid = photoBlackGrid(data, width, height)
+  await yieldBusy(clock)
   for (let y = 0; y < height; y += 1) {
     if (y % 48 === 0) await yieldBusy(clock)
     let i = y * width * 4
@@ -538,13 +588,9 @@ async function applyLevelsAndColor(
         green = 255
         blue = 255
         paper = true
-      } else if (normL < INK_L) {
-        const tone = scaleToLuma(red, green, blue, normL, inkTone(normL))
-        red = tone[0]
-        green = tone[1]
-        blue = tone[2]
       } else {
-        const tone = scaleToLuma(red, green, blue, normL, midtoneCurve(normL))
+        const blackPoint = sampleGrid(blackGrid, x, y, width, height)
+        const tone = scaleToLuma(red, green, blue, normL, photoTone(normL, blackPoint))
         red = tone[0]
         green = tone[1]
         blue = tone[2]
@@ -612,6 +658,8 @@ async function applyFastBlackWhite(image: ImageData) {
   const { data, width, height } = image
   const clock = { last: performance.now() }
   await whiteBalanceRgb(data, width, height, clock)
+  const blackGrid = photoBlackGrid(data, width, height)
+  await yieldBusy(clock)
   for (let y = 0; y < height; y += 1) {
     if (y % 48 === 0) await yieldBusy(clock)
     let i = y * width * 4
@@ -619,7 +667,9 @@ async function applyFastBlackWhite(image: ImageData) {
       const normL = pixelLuma(data[i] ?? 0, data[i + 1] ?? 0, data[i + 2] ?? 0)
       const sat = pixelSat(data[i] ?? 0, data[i + 1] ?? 0, data[i + 2] ?? 0)
       const tone =
-        normL > PAPER_L && sat < PAPER_S ? 255 : normL < INK_L ? inkTone(normL) : midtoneCurve(normL)
+        normL > PAPER_L && sat < PAPER_S
+          ? 255
+          : photoTone(normL, sampleGrid(blackGrid, x, y, width, height))
       const ink = tone < BW_THRESHOLD ? 0 : 255
       data[i] = ink
       data[i + 1] = ink
@@ -693,7 +743,7 @@ async function processPixels(
   return canvas
 }
 
-/** Magic Color: neutralized paper, punchy ink, S-curve photos, 1.4× chroma. */
+/** Magic Color: white paper, stretched photo blacks, 1.5× chroma. */
 export async function applyCanvasMagic(source: HTMLCanvasElement): Promise<HTMLCanvasElement> {
   return processPixels(source, applyMagicColor)
 }
