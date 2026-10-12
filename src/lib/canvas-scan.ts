@@ -47,18 +47,20 @@ const LIGHT_PERCENTILE = 0.95
 const LIGHT_BLUR_PASSES = 4
 const LIGHT_FLOOR = 0.85
 const FLAT_TARGET = 255
-const SAT_BOOST = 1.45
+const SAT_BOOST = 1.4
 const PAPER_LUMA = 205
 const PAPER_SAT = 0.045
 const SNAP_LUMA = 205
-const SNAP_SAT = 0.12
-const SNAP_STD = 12
-const INK_LUMA = 170
-const INK_HARD = 110
-const INK_SAT = 0.12
-const INK_DEFICIT = 7
-const SHADOW_LUMA = 80
-const SHADOW_TARGET = 20
+const SNAP_SAT = 0.1
+const INK_LUMA = 160
+const INK_TARGET = 16
+const INK_SAT = 0.1
+const INK_DEFICIT = 12
+const PHOTO_SAT = 0.1
+const PHOTO_FRAC = 0.3
+const PHOTO_STD = 8
+const SHARPEN_AMOUNT = 1.2
+const SHARPEN_NOISE = 4
 const YIELD_MS = 24
 
 function sourceSize(image: CanvasImageSource): { width: number; height: number } {
@@ -638,10 +640,17 @@ function writeLuma(data: Uint8ClampedArray, i: number, red: number, green: numbe
   data[i + 3] = 255
 }
 
+/** Smooth photo levels: [40–80] → [20–30], midtones unchanged, highlights unclipped. */
+function photoTone(tone: number) {
+  if (tone <= 40) return 18 + (tone / 40) * 2
+  if (tone <= 80) return 20 + ((tone - 40) / 40) * 10
+  if (tone >= 250) return 248
+  return tone
+}
+
 /**
- * Universal Magic Color on every pixel. Photos are never masked, skipped, or erased.
- * Paper snaps to white only when the neighborhood is actually uniform paper.
- * Ink darker than its surroundings is pulled down; photo interiors (close to local mean) stay.
+ * Every pixel is written. Texture/saturation uses a smooth photo curve so car
+ * edges are never crushed as ink. Flat paper/ink get a document curve.
  */
 async function applyMagicCurve(
   data: Uint8ClampedArray,
@@ -650,13 +659,21 @@ async function applyMagicCurve(
   clock: { last: number },
 ) {
   const luma = new Float32Array(width * height)
+  const mid = new Float32Array(width * height)
+  const paper = new Float32Array(width * height)
   for (let p = 0, i = 0; p < luma.length; p += 1, i += 4) {
-    luma[p] = pixelLuma(data[i] ?? 0, data[i + 1] ?? 0, data[i + 2] ?? 0)
+    const tone = pixelLuma(data[i] ?? 0, data[i + 1] ?? 0, data[i + 2] ?? 0)
+    luma[p] = tone
+    mid[p] = tone > 45 && tone <= 220 ? 1 : 0
+    paper[p] = tone > 220 ? 1 : 0
   }
   const sum = integralPlane(luma, width, height, false)
   const sq = integralPlane(luma, width, height, true)
+  const midSum = integralPlane(mid, width, height, false)
+  const paperSum = integralPlane(paper, width, height, false)
   const iw = width + 1
-  const radius = Math.max(5, Math.round(width / 90))
+  const photoRadius = Math.max(10, Math.round(width / 20))
+  const inkRadius = Math.max(4, Math.round(width / 90))
   await yieldBusy(clock)
 
   for (let y = 0; y < height; y += 1) {
@@ -669,27 +686,35 @@ async function applyMagicCurve(
       const blue = data[i + 2] ?? 0
       const tone = luma[row + x] ?? 0
       const sat = pixelSat(red, green, blue)
-      const { mean, std } = neighborhood(sum, sq, iw, x, y, radius, width, height)
-      const ink = sat < INK_SAT && mean - tone >= INK_DEFICIT
+      const wide = neighborhood(sum, sq, iw, x, y, photoRadius, width, height)
+      const local = neighborhood(sum, sq, iw, x, y, inkRadius, width, height)
+      const x0 = Math.max(0, x - photoRadius)
+      const y0 = Math.max(0, y - photoRadius)
+      const x1 = Math.min(width, x + photoRadius + 1)
+      const y1 = Math.min(height, y + photoRadius + 1)
+      const n = (x1 - x0) * (y1 - y0)
+      const frac = n < 1 ? 0 : boxSum(midSum, iw, x0, y0, x1, y1) / n
+      const paperFrac = n < 1 ? 1 : boxSum(paperSum, iw, x0, y0, x1, y1) / n
+      const photo = sat >= PHOTO_SAT || (frac >= PHOTO_FRAC && paperFrac < 0.55 && wide.std >= PHOTO_STD)
       let next = tone
-      if (sat < SNAP_SAT && tone > SNAP_LUMA && std < SNAP_STD) {
+      if (photo) {
+        next = photoTone(tone)
+      } else if (sat < SNAP_SAT && tone > SNAP_LUMA) {
         const t = Math.min(1, (tone - SNAP_LUMA) / (255 - SNAP_LUMA))
         const ease = t * t * (3 - 2 * t)
         next = tone + (255 - tone) * ease
-      } else if (ink && tone < INK_LUMA) {
-        next = tone < INK_HARD ? Math.floor(tone * 0.35) : Math.floor(tone * 0.7)
-      } else if (ink && tone <= SNAP_LUMA) {
-        next = Math.floor(tone * 0.7)
-      } else if (tone < SHADOW_LUMA) {
-        next = SHADOW_TARGET + (tone * 0.25)
+      } else if (sat < INK_SAT && tone < INK_LUMA) {
+        next = INK_TARGET
+      } else if (sat < INK_SAT && tone <= SNAP_LUMA && local.mean - tone >= INK_DEFICIT) {
+        next = INK_TARGET
       }
       writeLuma(data, i, red, green, blue, tone, next)
     }
   }
 }
 
-/** Cross unsharp: center +5, neighbors −1. Every non-white pixel, threshold 0. */
-function sharpenCross(image: ImageData) {
+/** Unsharp mask: skip |L − blur| < 4, boost 1.2, clamp 0–255. */
+function sharpenLuma(image: ImageData) {
   const { data, width, height } = image
   const gray = new Float32Array(width * height)
   for (let i = 0, p = 0; p < gray.length; p += 1, i += 4) {
@@ -699,13 +724,20 @@ function sharpenCross(image: ImageData) {
     for (let x = 1; x < width - 1; x += 1) {
       const p = y * width + x
       const center = gray[p] ?? 0
-      if (center >= 250) continue
-      const sharp =
-        5 * center -
-        (gray[p - width] ?? 0) -
-        (gray[p + width] ?? 0) -
-        (gray[p - 1] ?? 0) -
-        (gray[p + 1] ?? 0)
+      const blur =
+        ((gray[p - width - 1] ?? 0) +
+          (gray[p - width] ?? 0) +
+          (gray[p - width + 1] ?? 0) +
+          (gray[p - 1] ?? 0) +
+          center +
+          (gray[p + 1] ?? 0) +
+          (gray[p + width - 1] ?? 0) +
+          (gray[p + width] ?? 0) +
+          (gray[p + width + 1] ?? 0)) /
+        9
+      const delta = center - blur
+      if (Math.abs(delta) < SHARPEN_NOISE) continue
+      const sharp = clamp255(center + SHARPEN_AMOUNT * delta)
       const lift = center > 1 ? sharp / center : 1
       const i = p * 4
       data[i] = clamp255((data[i] ?? 0) * lift)
@@ -754,7 +786,7 @@ async function applyMagicColor(image: ImageData) {
   const clock = { last: performance.now() }
   await whiteBalanceRgb(data, width, height, clock)
   await applyMagicCurve(data, width, height, clock)
-  sharpenCross(image)
+  sharpenLuma(image)
   await boostNonPaperChroma(data, width, height, clock)
 }
 
@@ -763,7 +795,7 @@ async function applyFastBlackWhite(image: ImageData) {
   const clock = { last: performance.now() }
   await whiteBalanceRgb(data, width, height, clock)
   await applyMagicCurve(data, width, height, clock)
-  sharpenCross(image)
+  sharpenLuma(image)
   desaturatePixels(data)
   await yieldBusy(clock)
 }
