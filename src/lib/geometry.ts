@@ -204,10 +204,10 @@ export function outputSize(corners: Corners): { width: number; height: number } 
 
 /**
  * Maps live-preview corners (unit 0..1 of the video frame) onto the captured photo.
- * Same relative position: photoPoint = { x: nx * photoWidth, y: ny * photoHeight }.
+ * Always: photoPoint = { x: nx * photoWidth, y: ny * photoHeight }. Never rejects.
  */
 export function mapLiveCorners(hint: CaptureHint, width: number, height: number): Corners | null {
-  if (!(hint.aspect > 0) || width < 1 || height < 1) return null
+  if (width < 1 || height < 1) return null
   const place = (point: Point): Point => {
     const nx = hint.mirrored ? 1 - point.x : point.x
     return {
@@ -215,15 +215,13 @@ export function mapLiveCorners(hint: CaptureHint, width: number, height: number)
       y: clamp(point.y * height, 0, height),
     }
   }
+  const tl = place(hint.corners.tl)
+  const tr = place(hint.corners.tr)
+  const br = place(hint.corners.br)
+  const bl = place(hint.corners.bl)
   try {
-    const mapped = orderCorners([
-      place(hint.corners.tl),
-      place(hint.corners.tr),
-      place(hint.corners.br),
-      place(hint.corners.bl),
-    ])
-    return cornersValid(mapped, width, height) ? mapped : null
+    return orderCorners([tl, tr, br, bl])
   } catch {
-    return null
+    return { tl, tr, br, bl }
   }
 }

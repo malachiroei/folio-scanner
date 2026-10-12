@@ -1,5 +1,5 @@
 ﻿import type { Corners, FilterMode, Point } from '../types'
-import { boundingRectCorners, distance, quadIsConvex } from './geometry'
+import { distance } from './geometry'
 import { nextFrame } from './image'
 import { getCv, isOpenCvReady, MatBin } from './opencv'
 
@@ -252,15 +252,9 @@ function paintScaled(
 }
 
 /**
- * Perspective warp onto a full-resolution A4 canvas. Destination cells are mapped through the
- * homography; each triangle is drawn with the browser's high-quality bilinear/bicubic sampler
- * so small Hebrew type is not smeared on a screen-sized canvas.
+ * Perspective warp of the approved crop onto a full A4 canvas.
+ * srcPts = TL, TR, BR, BL → dstPts = [0,0], [W,0], [W,H], [0,H]. No inset, no bounding-rect fallback.
  */
-/** Source quad must stay convex; dest is always the full A4 rectangle. */
-function warpSourceCorners(corners: Corners): Corners {
-  return quadIsConvex(corners) ? corners : boundingRectCorners(corners)
-}
-
 function warpPerspectiveCv(
   source: HTMLCanvasElement,
   corners: Corners,
@@ -287,13 +281,14 @@ function warpPerspectiveCv(
     const to = bin.keep(cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, width, 0, width, height, 0, height]))
     const matrix = bin.keep(cv.getPerspectiveTransform(from, to))
     const dst = bin.keep(new cv.Mat())
+    const border = typeof cv.BORDER_CONSTANT === 'number' ? cv.BORDER_CONSTANT : 0
     cv.warpPerspective(
       src,
       dst,
       matrix,
       new cv.Size(width, height),
       cv.INTER_LINEAR,
-      cv.BORDER_REPLICATE,
+      border,
       new cv.Scalar(255, 255, 255, 255),
     )
     const canvas = document.createElement('canvas')
@@ -321,12 +316,11 @@ async function warpCanvas(
     { x: width, y: height },
     { x: 0, y: height },
   ]
-  const sourceQuad = warpSourceCorners(corners)
-  const cvWarp = warpPerspectiveCv(source, sourceQuad, width, height)
+  const cvWarp = warpPerspectiveCv(source, corners, width, height)
   if (cvWarp) return cvWarp
-  const to = [sourceQuad.tl, sourceQuad.tr, sourceQuad.br, sourceQuad.bl]
+  const to = [corners.tl, corners.tr, corners.br, corners.bl]
   const map = homography(from, to)
-  if (!map) return paintScaled(source, width, height, sourceQuad)
+  if (!map) return paintScaled(source, width, height, corners)
 
   const canvas = document.createElement('canvas')
   canvas.width = width

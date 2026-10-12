@@ -12,9 +12,6 @@ const LIVE_SMOOTH = 0.3
 
 type LiveQuad = { corners: Corners; width: number; height: number; at: number }
 
-/** A live outline older than this no longer matches what the camera sees. */
-const LIVE_MAX_AGE_MS = 900
-
 function blend(from: Corners, to: Corners, amount: number): Corners {
   const mix = (a: { x: number; y: number }, b: { x: number; y: number }) => ({
     x: a.x + (b.x - a.x) * amount,
@@ -208,13 +205,21 @@ export function CameraCapture() {
     }
   }
 
-  /** The outline tracked live at the moment of the tap, as 0..1 fractions of the video frame. */
-  function liveHint(mirrored: boolean): CaptureHint | undefined {
+  /**
+   * Freeze the orange box as unit 0..1 of the video frame. Copied by value before the
+   * (slow) photo so crop-screen pins are exactly the lock the user saw.
+   */
+  function freezeLiveHint(mirrored: boolean): CaptureHint | undefined {
     const live = quadRef.current
-    if (!live || performance.now() - live.at > LIVE_MAX_AGE_MS) return undefined
+    if (!live || live.width < 1 || live.height < 1) return undefined
     const unit = (point: { x: number; y: number }) => ({ x: point.x / live.width, y: point.y / live.height })
     return {
-      corners: { tl: unit(live.corners.tl), tr: unit(live.corners.tr), br: unit(live.corners.br), bl: unit(live.corners.bl) },
+      corners: {
+        tl: unit(live.corners.tl),
+        tr: unit(live.corners.tr),
+        br: unit(live.corners.br),
+        bl: unit(live.corners.bl),
+      },
       aspect: live.width / live.height,
       mirrored,
     }
@@ -223,8 +228,7 @@ export function CameraCapture() {
   async function capture() {
     if (capturing) return
     setCapturing(true)
-    // Taken before the (slow) photo call, so it describes what the user framed when tapping.
-    const hint = liveHint(false)
+    const hint = freezeLiveHint(false)
     try {
       const photo = await takeSensorPhoto()
       if (photo && photo.size > 0) {

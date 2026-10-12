@@ -270,11 +270,10 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     let normalized: { url: string; width: number; height: number } | null = null
     try {
       normalized = await normalizeImage(blob)
-      userAdjustedRef.current = false
-      // The outline already tracked live is reused 1:1; detection only runs when the live view had none.
-      const mapped = hint ? mapLiveCorners(hint, normalized.width, normalized.height) : null
-      const live = mapped && sheetCornersOk(mapped, normalized.width, normalized.height) ? mapped : null
       detectGen.current += 1
+      // Frozen orange-box corners only. Never re-detect or substitute the 10% dummy box.
+      const live = hint ? mapLiveCorners(hint, normalized.width, normalized.height) : null
+      userAdjustedRef.current = live !== null
       const next = {
         sourceUrl: normalized.url,
         width: normalized.width,
@@ -291,7 +290,6 @@ export function ScanProvider({ children }: { children: ReactNode }) {
       setDraft(next)
       setBusy(null)
       setScreen('corners')
-      // Live preview already locked the box — do not re-detect (that jumps the pins onto a fold).
       if (!live) scheduleLocate(normalized.url, normalized.width, normalized.height)
     } catch (error) {
       if (normalized) URL.revokeObjectURL(normalized.url)

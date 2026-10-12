@@ -129,6 +129,7 @@ export type Cv = {
   CV_32FC2: number
   ADAPTIVE_THRESH_GAUSSIAN_C: number
   BORDER_REPLICATE: number
+  BORDER_CONSTANT: number
 }
 
 type BootCv = Partial<Cv> & {
