@@ -55,8 +55,19 @@ const PHOTO_BLACK_HI = 55
 const PHOTO_WHITE = 252
 const SHADOW_GAMMA = 0.87
 const HIGHLIGHT_POWER = 1.06
-const SHARPEN_AMOUNT = 1.25
+const PHOTO_MID_LO = 50
+const PHOTO_MID_HI = 198
+const PHOTO_FRAC = 0.2
+const INK_HARD = 140
+const INK_SOFT = 170
+const INK_EDGE = 240
+const INK_SAT = 0.18
+const INK_DARK = 18
+const EDGE_RANGE = 14
+const SHARPEN_AMOUNT = 1.6
 const SHARPEN_THRESHOLD = 1
+const PHOTO_SHARPEN = 1.2
+const PHOTO_SHARPEN_THRESHOLD = 2
 const BW_THRESHOLD = 148
 const YIELD_MS = 24
 
@@ -445,7 +456,7 @@ function illuminationRgb(data: Uint8ClampedArray, width: number, height: number)
   }
 }
 
-function sampleGrid(grid: Float32Array, x: number, y: number, width: number, height: number) {
+function sampleGridRaw(grid: Float32Array, x: number, y: number, width: number, height: number) {
   const fx = ((x + 0.5) / width) * (LIGHT_GRID - 1)
   const fy = ((y + 0.5) / height) * (LIGHT_GRID - 1)
   const x0 = fx | 0
@@ -454,11 +465,15 @@ function sampleGrid(grid: Float32Array, x: number, y: number, width: number, hei
   const y1 = Math.min(LIGHT_GRID - 1, y0 + 1)
   const tx = fx - x0
   const ty = fy - y0
-  const a = grid[y0 * LIGHT_GRID + x0] ?? 1
-  const b = grid[y0 * LIGHT_GRID + x1] ?? 1
-  const c = grid[y1 * LIGHT_GRID + x0] ?? 1
-  const d = grid[y1 * LIGHT_GRID + x1] ?? 1
-  return Math.max(1, (a * (1 - tx) + b * tx) * (1 - ty) + (c * (1 - tx) + d * tx) * ty)
+  const a = grid[y0 * LIGHT_GRID + x0] ?? 0
+  const b = grid[y0 * LIGHT_GRID + x1] ?? 0
+  const c = grid[y1 * LIGHT_GRID + x0] ?? 0
+  const d = grid[y1 * LIGHT_GRID + x1] ?? 0
+  return (a * (1 - tx) + b * tx) * (1 - ty) + (c * (1 - tx) + d * tx) * ty
+}
+
+function sampleGrid(grid: Float32Array, x: number, y: number, width: number, height: number) {
+  return Math.max(1, sampleGridRaw(grid, x, y, width, height))
 }
 
 function flattenChannel(value: number, bg: number) {
@@ -526,6 +541,72 @@ function photoTone(normL: number, blackPoint: number) {
   return photoCurve(stretchBlack(normL, blackPoint))
 }
 
+function lumaChannel(data: Uint8ClampedArray, width: number, height: number) {
+  const luma = new Float32Array(width * height)
+  for (let p = 0, i = 0; p < luma.length; p += 1, i += 4) {
+    luma[p] = pixelLuma(data[i] ?? 0, data[i + 1] ?? 0, data[i + 2] ?? 0)
+  }
+  return luma
+}
+
+/** Continuous-tone field after flatten. Dilated so fog/sky next to a car stays photo. */
+function photoScoreGrid(luma: Float32Array, width: number, height: number) {
+  const cells = LIGHT_GRID * LIGHT_GRID
+  const mid = new Float32Array(cells)
+  const counts = new Uint32Array(cells)
+  for (let y = 0; y < height; y += 1) {
+    const gy = Math.min(LIGHT_GRID - 1, ((y * LIGHT_GRID) / height) | 0)
+    const row = y * width
+    for (let x = 0; x < width; x += 1) {
+      const gx = Math.min(LIGHT_GRID - 1, ((x * LIGHT_GRID) / width) | 0)
+      const id = gy * LIGHT_GRID + gx
+      const tone = luma[row + x] ?? 0
+      if (tone > PHOTO_MID_LO && tone < PHOTO_MID_HI) mid[id] += 1
+      counts[id] += 1
+    }
+  }
+  const score = new Float32Array(cells)
+  for (let id = 0; id < cells; id += 1) {
+    score[id] = (mid[id] ?? 0) / Math.max(1, counts[id] ?? 1)
+  }
+  return dilateGrid3x3(dilateGrid3x3(score, LIGHT_GRID), LIGHT_GRID)
+}
+
+function lumaRange3x3(luma: Float32Array, x: number, y: number, width: number, height: number) {
+  let minV = 255
+  let maxV = 0
+  for (let dy = -1; dy <= 1; dy += 1) {
+    const yy = y + dy
+    if (yy < 0 || yy >= height) continue
+    const row = yy * width
+    for (let dx = -1; dx <= 1; dx += 1) {
+      const xx = x + dx
+      if (xx < 0 || xx >= width) continue
+      const value = luma[row + xx] ?? 0
+      if (value < minV) minV = value
+      if (value > maxV) maxV = value
+    }
+  }
+  return maxV - minV
+}
+
+/**
+ * Document ink: faint gray strokes (~140–170) and thin table/Hebrew edges
+ * (up to ~240) drop toward #121212 so print reads solid, not bleached.
+ */
+function inkHarden(normL: number) {
+  if (normL <= INK_HARD) {
+    const t = clamp01(normL / INK_HARD)
+    return INK_DARK + (42 - INK_DARK) * t * t * t
+  }
+  if (normL <= INK_SOFT) {
+    const t = (normL - INK_HARD) / (INK_SOFT - INK_HARD)
+    return 42 + 36 * t
+  }
+  const t = clamp01((normL - INK_SOFT) / (INK_EDGE - INK_SOFT))
+  return 78 + 70 * t
+}
+
 function scaleToLuma(r: number, g: number, b: number, fromL: number, toL: number): [number, number, number] {
   if (fromL < 0.5) return [toL, toL, toL]
   const scale = toL / fromL
@@ -560,9 +641,8 @@ async function whiteBalanceRgb(
 }
 
 /**
- * After white balance: paper → #FFFFFF. Everything else gets a photo black-point
- * stretch and a steep S-curve so asphalt/tires land around 15–25. Chromatic
- * pixels (S > 0.10) keep hue and get a 1.5× saturation boost.
+ * After white balance: paper → #FFFFFF, document strokes harden to dense ink,
+ * photos keep the black-point stretch. Chromatic pixels get a 1.5× sat boost.
  */
 async function applyLevelsAndColor(
   data: Uint8ClampedArray,
@@ -570,20 +650,36 @@ async function applyLevelsAndColor(
   height: number,
   clock: { last: number },
 ) {
+  const luma = lumaChannel(data, width, height)
   const blackGrid = photoBlackGrid(data, width, height)
+  const photoGrid = photoScoreGrid(luma, width, height)
   await yieldBusy(clock)
   for (let y = 0; y < height; y += 1) {
     if (y % 48 === 0) await yieldBusy(clock)
     let i = y * width * 4
+    const row = y * width
     for (let x = 0; x < width; x += 1, i += 4) {
       let red = data[i] ?? 0
       let green = data[i + 1] ?? 0
       let blue = data[i + 2] ?? 0
-      const normL = pixelLuma(red, green, blue)
+      const normL = luma[row + x] ?? pixelLuma(red, green, blue)
       const sat = pixelSat(red, green, blue)
+      const isPhoto = sampleGridRaw(photoGrid, x, y, width, height) > PHOTO_FRAC
+      const edge = lumaRange3x3(luma, x, y, width, height) > EDGE_RANGE
       let paper = false
 
-      if (normL > PAPER_L && sat < PAPER_S) {
+      if (isPhoto) {
+        const blackPoint = sampleGrid(blackGrid, x, y, width, height)
+        const tone = scaleToLuma(red, green, blue, normL, photoTone(normL, blackPoint))
+        red = tone[0]
+        green = tone[1]
+        blue = tone[2]
+      } else if (sat < INK_SAT && (normL < INK_SOFT || (edge && normL < INK_EDGE))) {
+        const tone = scaleToLuma(red, green, blue, normL, inkHarden(normL))
+        red = tone[0]
+        green = tone[1]
+        blue = tone[2]
+      } else if (normL > PAPER_L && sat < PAPER_S) {
         red = 255
         green = 255
         blue = 255
@@ -610,10 +706,16 @@ async function applyLevelsAndColor(
       data[i + 3] = 255
     }
   }
+  return photoGrid
 }
 
-/** 3×3 unsharp on luminance. Amount 1.25 for Magic Color; gentler for warp. */
-function sharpen3x3(image: ImageData, amount: number, threshold = 1.2) {
+/** 3×3 unsharp. Text/tables get amount 1.6; photos stay gentler to avoid ringing. */
+function sharpen3x3(
+  image: ImageData,
+  amount: number,
+  threshold = 1.2,
+  photoGrid?: Float32Array,
+) {
   const { data, width, height } = image
   const gray = new Float32Array(width * height)
   for (let i = 0, p = 0; p < gray.length; p += 1, i += 4) {
@@ -634,9 +736,12 @@ function sharpen3x3(image: ImageData, amount: number, threshold = 1.2) {
           (gray[p + width] ?? 0) +
           (gray[p + width + 1] ?? 0)) /
         9
+      const photo = photoGrid ? sampleGridRaw(photoGrid, x, y, width, height) > PHOTO_FRAC : false
+      const useAmount = photo ? PHOTO_SHARPEN : amount
+      const useThreshold = photo ? PHOTO_SHARPEN_THRESHOLD : threshold
       const delta = center - blur
-      if (Math.abs(delta) < threshold) continue
-      const next = center + delta * amount
+      if (Math.abs(delta) < useThreshold) continue
+      const next = center + delta * useAmount
       const lift = center > 1 ? next / center : 1
       const i = p * 4
       data[i] = clamp255((data[i] ?? 0) * lift)
@@ -650,26 +755,32 @@ async function applyMagicColor(image: ImageData) {
   const { data, width, height } = image
   const clock = { last: performance.now() }
   await whiteBalanceRgb(data, width, height, clock)
-  await applyLevelsAndColor(data, width, height, clock)
-  sharpen3x3(image, SHARPEN_AMOUNT, SHARPEN_THRESHOLD)
+  const photoGrid = await applyLevelsAndColor(data, width, height, clock)
+  sharpen3x3(image, SHARPEN_AMOUNT, SHARPEN_THRESHOLD, photoGrid)
 }
 
 async function applyFastBlackWhite(image: ImageData) {
   const { data, width, height } = image
   const clock = { last: performance.now() }
   await whiteBalanceRgb(data, width, height, clock)
+  const luma = lumaChannel(data, width, height)
   const blackGrid = photoBlackGrid(data, width, height)
+  const photoGrid = photoScoreGrid(luma, width, height)
   await yieldBusy(clock)
   for (let y = 0; y < height; y += 1) {
     if (y % 48 === 0) await yieldBusy(clock)
     let i = y * width * 4
+    const row = y * width
     for (let x = 0; x < width; x += 1, i += 4) {
-      const normL = pixelLuma(data[i] ?? 0, data[i + 1] ?? 0, data[i + 2] ?? 0)
+      const normL = luma[row + x] ?? 0
       const sat = pixelSat(data[i] ?? 0, data[i + 1] ?? 0, data[i + 2] ?? 0)
-      const tone =
-        normL > PAPER_L && sat < PAPER_S
-          ? 255
-          : photoTone(normL, sampleGrid(blackGrid, x, y, width, height))
+      const isPhoto = sampleGridRaw(photoGrid, x, y, width, height) > PHOTO_FRAC
+      const edge = lumaRange3x3(luma, x, y, width, height) > EDGE_RANGE
+      let tone = normL
+      if (isPhoto) tone = photoTone(normL, sampleGrid(blackGrid, x, y, width, height))
+      else if (sat < INK_SAT && (normL < INK_SOFT || (edge && normL < INK_EDGE))) tone = inkHarden(normL)
+      else if (normL > PAPER_L && sat < PAPER_S) tone = 255
+      else tone = photoTone(normL, sampleGrid(blackGrid, x, y, width, height))
       const ink = tone < BW_THRESHOLD ? 0 : 255
       data[i] = ink
       data[i + 1] = ink
@@ -743,7 +854,7 @@ async function processPixels(
   return canvas
 }
 
-/** Magic Color: white paper, stretched photo blacks, 1.5× chroma. */
+/** Magic Color: white paper, hardened text, stretched photos, 1.5× chroma. */
 export async function applyCanvasMagic(source: HTMLCanvasElement): Promise<HTMLCanvasElement> {
   return processPixels(source, applyMagicColor)
 }
