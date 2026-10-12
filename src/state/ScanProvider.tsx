@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { detectDocumentCorners, refineToPaper, sheetCornersOk } from '../lib/detect'
-import { cornersValid, defaultCorners, fullFrameCorners, mapLiveCorners } from '../lib/geometry'
+import { cornersValid, fullFrameCorners, mapLiveCorners } from '../lib/geometry'
 import { isOpenCvReady, loadOpenCv } from '../lib/opencv'
 import {
   canvasToJpegBlob,
@@ -356,7 +356,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     userAdjustedRef.current = true
     const next = {
       ...current,
-      corners: defaultCorners(current.width, current.height, 0.015),
+      corners: fullFrameCorners(current.width, current.height),
       detected: true,
       detecting: false,
     }

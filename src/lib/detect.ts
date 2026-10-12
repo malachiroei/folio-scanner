@@ -9,27 +9,22 @@ import {
   quadAngles,
   quadIsConvex,
 } from './geometry'
+import { getCv, isOpenCvReady, MatBin } from './opencv'
 
 /**
- * Pure canvas detection. No OpenCV, no WebAssembly, no script download:
- * the whole pass works on a ~360px copy and takes a few milliseconds, so the corner
- * screen can never freeze after a photo.
+ * Paper hull on a ~480px copy: Canny → largest external contour → 4-gon.
+ * OpenCV when loaded; otherwise a canvas Sobel/Canny stand-in. Never freezes the corner screen.
  */
-const DETECT_MAX = 360
-const MIN_AREA = 0.65
+const DETECT_MAX = 480
+const MIN_AREA = 0.3
 const MAX_AREA = 0.95
 const A4_ASPECT = Math.SQRT2
 const CLOSE_RADIUS = 2
 const OPEN_RADIUS = 4
-/** A4 long/short ≈ 1.414. A diagonal fold-crop is usually outside this. */
-const SHEET_ASPECT_MIN = 1.25
-const SHEET_ASPECT_MAX = 1.65
 const ANGLE_GOOD_MIN = 70
 const ANGLE_GOOD_MAX = 110
-const ANGLE_HARD_MIN = 65
-const ANGLE_HARD_MAX = 115
 
-type Sample = { data: Uint8ClampedArray; width: number; height: number }
+type Sample = { data: Uint8ClampedArray; width: number; height: number; canvas: HTMLCanvasElement }
 
 type Candidate = { points: Point[]; score: number; touching: number }
 
@@ -56,7 +51,7 @@ function takeSample(image: CanvasImageSource, maxEdge: number): Sample | null {
   const context = canvas.getContext('2d', { willReadFrequently: true })
   if (!context) return null
   context.drawImage(image, 0, 0, w, h)
-  return { data: context.getImageData(0, 0, w, h).data, width: w, height: h }
+  return { data: context.getImageData(0, 0, w, h).data, width: w, height: h, canvas }
 }
 
 /** Bright, low-saturation pixels (V > minValue, S < maxSaturation on a 0–255 scale). */
@@ -178,14 +173,13 @@ function angleFit(corners: Corners): number {
   return score
 }
 
-/** Convex A4-like quad covering ≥65% of the frame. Rejects folds, bows, and half-page crops. */
+/** Convex 4-gon covering 30–95% of the frame. No aspect-ratio straitjacket. */
 function quadLooksLikeSheet(corners: Corners, width: number, height: number): boolean {
   if (!cornersValid(corners, width, height) || !quadIsConvex(corners)) return false
   const view = width * height
-  if (view < 1 || polygonArea([corners.tl, corners.tr, corners.br, corners.bl]) < view * MIN_AREA) return false
-  const aspect = pageAspect(corners)
-  if (aspect < SHEET_ASPECT_MIN || aspect > SHEET_ASPECT_MAX) return false
-  return quadAngles(corners).every((angle) => angle >= ANGLE_HARD_MIN && angle <= ANGLE_HARD_MAX)
+  if (view < 1) return false
+  const frac = polygonArea([corners.tl, corners.tr, corners.br, corners.bl]) / view
+  return frac >= MIN_AREA && frac <= MAX_AREA
 }
 
 function fallbackFrame(width: number, height: number): Corners {
@@ -194,6 +188,198 @@ function fallbackFrame(width: number, height: number): Corners {
 
 export function sheetCornersOk(corners: Corners, width: number, height: number): boolean {
   return quadLooksLikeSheet(corners, width, height)
+}
+
+function cross(o: Point, a: Point, b: Point) {
+  return (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
+}
+
+function convexHull(points: Point[]): Point[] {
+  if (points.length < 4) return points
+  const pts = [...points].sort((a, b) => a.x - b.x || a.y - b.y)
+  const lower: Point[] = []
+  for (const point of pts) {
+    while (lower.length >= 2 && cross(lower[lower.length - 2]!, lower[lower.length - 1]!, point) <= 0) lower.pop()
+    lower.push(point)
+  }
+  const upper: Point[] = []
+  for (let i = pts.length - 1; i >= 0; i -= 1) {
+    const point = pts[i]
+    if (!point) continue
+    while (upper.length >= 2 && cross(upper[upper.length - 2]!, upper[upper.length - 1]!, point) <= 0) upper.pop()
+    upper.push(point)
+  }
+  lower.pop()
+  upper.pop()
+  return [...lower, ...upper]
+}
+
+function pointLineDistance(point: Point, a: Point, b: Point) {
+  const dx = b.x - a.x
+  const dy = b.y - a.y
+  const length = Math.hypot(dx, dy) || 1
+  return Math.abs(dy * point.x - dx * point.y + b.x * a.y - b.y * a.x) / length
+}
+
+function rdp(points: Point[], epsilon: number): Point[] {
+  if (points.length < 3) return points
+  const first = points[0]
+  const last = points[points.length - 1]
+  if (!first || !last) return points
+  let maxDist = 0
+  let index = 0
+  for (let i = 1; i < points.length - 1; i += 1) {
+    const dist = pointLineDistance(points[i]!, first, last)
+    if (dist > maxDist) {
+      maxDist = dist
+      index = i
+    }
+  }
+  if (maxDist <= epsilon) return [first, last]
+  const left = rdp(points.slice(0, index + 1), epsilon)
+  const right = rdp(points.slice(index), epsilon)
+  return [...left.slice(0, -1), ...right]
+}
+
+function hullPerimeter(points: Point[]) {
+  let length = 0
+  for (let i = 0; i < points.length; i += 1) {
+    const a = points[i]
+    const b = points[(i + 1) % points.length]
+    if (a && b) length += distance(a, b)
+  }
+  return length
+}
+
+/** Convex hull → approxPolyDP (ε = 2% of perimeter). Accept only a 4-gon. */
+function approxQuad(points: Point[]): Point[] | null {
+  const hull = convexHull(points)
+  if (hull.length < 4) return null
+  const peri = hullPerimeter(hull)
+  if (peri < 8) return null
+  const closed = hull[0] && hull[hull.length - 1] && distance(hull[0], hull[hull.length - 1]) > 1 ? [...hull, hull[0]] : hull
+  for (const scale of [0.02, 0.03, 0.015, 0.04, 0.01]) {
+    const approx = rdp(closed, peri * scale)
+    const ring = approx.length > 1 && approx[0] && approx[approx.length - 1] && distance(approx[0], approx[approx.length - 1]) < 2
+      ? approx.slice(0, -1)
+      : approx
+    if (ring.length === 4) return ring
+  }
+  return null
+}
+
+function matPoints(mat: { rows: number; data32S: Int32Array }): Point[] {
+  const points: Point[] = []
+  const data = mat.data32S
+  for (let i = 0; i < mat.rows; i += 1) {
+    points.push({ x: data[i * 2] ?? 0, y: data[i * 2 + 1] ?? 0 })
+  }
+  return points
+}
+
+function acceptSampleQuad(points: Point[], width: number, height: number): Point[] | null {
+  if (points.length !== 4) return null
+  const corners = orderCorners(points)
+  return quadLooksLikeSheet(corners, width, height) ? [corners.tl, corners.tr, corners.br, corners.bl] : null
+}
+
+function findCannyQuadCv(sample: Sample): Point[] | null {
+  const cv = getCv()
+  const bin = new MatBin()
+  try {
+    const src = bin.keep(cv.imread(sample.canvas))
+    const gray = bin.keep(new cv.Mat())
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY)
+    const blur = bin.keep(new cv.Mat())
+    cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0)
+    const edges = bin.keep(new cv.Mat())
+    cv.Canny(blur, edges, 50, 150)
+    const kernel = bin.keep(cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3)))
+    const thick = bin.keep(new cv.Mat())
+    cv.dilate(edges, thick, kernel)
+    const contours = bin.keep(new cv.MatVector())
+    const hierarchy = bin.keep(new cv.Mat())
+    cv.findContours(thick, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+    const frame = sample.width * sample.height
+    let best: Point[] | null = null
+    let bestArea = 0
+    for (let i = 0; i < contours.size(); i += 1) {
+      const contour = contours.get(i)
+      const area = cv.contourArea(contour)
+      if (area < frame * MIN_AREA || area > frame * MAX_AREA || area <= bestArea) continue
+      const hull = bin.keep(new cv.Mat())
+      cv.convexHull(contour, hull, false, true)
+      const peri = cv.arcLength(hull, true)
+      const approx = bin.keep(new cv.Mat())
+      cv.approxPolyDP(hull, approx, 0.02 * peri, true)
+      const accepted = acceptSampleQuad(matPoints(approx), sample.width, sample.height)
+      if (!accepted) continue
+      best = accepted
+      bestArea = area
+    }
+    return best
+  } catch (error) {
+    console.error(error)
+    return null
+  } finally {
+    bin.release()
+  }
+}
+
+function findCannyQuadCanvas(sample: Sample): Point[] | null {
+  const { width, height } = sample
+  const gray = lumaOf(sample)
+  const smooth = boxBlur(boxBlur(gray, width, height, 2), width, height, 1)
+  const magnitude = new Float32Array(width * height)
+  const bins = new Uint32Array(400)
+  let counted = 0
+  for (let y = 1; y < height - 1; y += 1) {
+    for (let x = 1; x < width - 1; x += 1) {
+      const at = (dx: number, dy: number) => smooth[(y + dy) * width + x + dx] ?? 0
+      const gx = (at(1, -1) + 2 * at(1, 0) + at(1, 1) - at(-1, -1) - 2 * at(-1, 0) - at(-1, 1)) / 8
+      const gy = (at(-1, 1) + 2 * at(0, 1) + at(1, 1) - at(-1, -1) - 2 * at(0, -1) - at(1, -1)) / 8
+      const value = Math.hypot(gx, gy)
+      magnitude[y * width + x] = value
+      const bin = Math.min(399, Math.floor(value * 20))
+      bins[bin] = (bins[bin] ?? 0) + 1
+      counted += 1
+    }
+  }
+  let seen = 0
+  let high = 8
+  for (let bin = 399; bin >= 0; bin -= 1) {
+    seen += bins[bin] ?? 0
+    if (seen >= counted * 0.08) {
+      high = Math.max(2, bin / 20)
+      break
+    }
+  }
+  const low = high * 0.4
+  const edges = new Uint8Array(width * height)
+  for (let i = 0; i < edges.length; i += 1) edges[i] = (magnitude[i] ?? 0) >= high ? 1 : 0
+  for (let y = 1; y < height - 1; y += 1) {
+    for (let x = 1; x < width - 1; x += 1) {
+      const i = y * width + x
+      if (edges[i] || (magnitude[i] ?? 0) < low) continue
+      if (edges[i - 1] || edges[i + 1] || edges[i - width] || edges[i + width]) edges[i] = 1
+    }
+  }
+  const thick = morph(edges, width, height, 2, false)
+  const regions = new Uint8Array(thick.length)
+  for (let i = 0; i < regions.length; i += 1) regions[i] = thick[i] ? 0 : 1
+  const openRadius = Math.max(2, Math.round((Math.min(width, height) / 480) * 3))
+  const mask = morph(morph(regions, width, height, openRadius, true), width, height, openRadius, false)
+  const blobs = rankBlobs(mask, width, height, gray)
+  const chosen = blobs.find((blob) => blob.touching < 3) ?? blobs[0]
+  return chosen?.points ?? null
+}
+
+function findCannyQuad(sample: Sample): Point[] | null {
+  if (isOpenCvReady()) {
+    const found = findCannyQuadCv(sample)
+    if (found) return found
+  }
+  return findCannyQuadCanvas(sample)
 }
 
 type Line = { slope: number; offset: number }
@@ -338,14 +524,6 @@ function rankBlobs(mask: Uint8Array, width: number, height: number, gray: Float3
     top += 1
     seen[start] = 1
     let count = 0
-    let tl = start
-    let tr = start
-    let br = start
-    let bl = start
-    let minSum = Number.POSITIVE_INFINITY
-    let maxSum = Number.NEGATIVE_INFINITY
-    let minDiff = Number.POSITIVE_INFINITY
-    let maxDiff = Number.NEGATIVE_INFINITY
     let minX = width
     let maxX = 0
     let minY = height
@@ -362,24 +540,6 @@ function rankBlobs(mask: Uint8Array, width: number, height: number, gray: Float3
       if (x > maxX) maxX = x
       if (y < minY) minY = y
       if (y > maxY) maxY = y
-      const sum = x + y
-      const diff = x - y
-      if (sum < minSum) {
-        minSum = sum
-        tl = index
-      }
-      if (sum > maxSum) {
-        maxSum = sum
-        br = index
-      }
-      if (diff > maxDiff) {
-        maxDiff = diff
-        tr = index
-      }
-      if (diff < minDiff) {
-        minDiff = diff
-        bl = index
-      }
       if (x > 0 && mask[index - 1] && !seen[index - 1]) {
         seen[index - 1] = 1
         stack[top] = index - 1
@@ -405,14 +565,11 @@ function rankBlobs(mask: Uint8Array, width: number, height: number, gray: Float3
     const ratio = count / area
     if (ratio < MIN_AREA || ratio > MAX_AREA) continue
 
-    const at = (index: number): Point => ({ x: index % width, y: Math.floor(index / width) })
-    const extremes = [at(tl), at(tr), at(br), at(bl)]
-    let points = extremes
+    let points: Point[] | null = null
     const fitted = fitSides(members, count, width, height)
     if (fitted) {
       const fittedCorners = orderCorners(fitted)
       const fittedArea = polygonArea([fittedCorners.tl, fittedCorners.tr, fittedCorners.br, fittedCorners.bl])
-      // Outer side-fit only: skip fold-snapped extremes when the four sides look like a page.
       if (
         quadLooksLikeSheet(fittedCorners, width, height) &&
         fittedArea > count * 0.8 &&
@@ -421,6 +578,32 @@ function rankBlobs(mask: Uint8Array, width: number, height: number, gray: Float3
         points = [fittedCorners.tl, fittedCorners.tr, fittedCorners.br, fittedCorners.bl]
       }
     }
+    if (!points) {
+      const ring: Point[] = []
+      for (let n = 0; n < count; n += 1) {
+        const index = members[n] ?? 0
+        const x = index % width
+        const y = (index - x) / width
+        const edge =
+          x <= 0 ||
+          y <= 0 ||
+          x >= width - 1 ||
+          y >= height - 1 ||
+          !mask[index - 1] ||
+          !mask[index + 1] ||
+          !mask[index - width] ||
+          !mask[index + width]
+        if (edge) ring.push({ x, y })
+      }
+      const hullQuad = approxQuad(ring)
+      if (hullQuad) {
+        const hullCorners = orderCorners(hullQuad)
+        if (quadLooksLikeSheet(hullCorners, width, height)) {
+          points = [hullCorners.tl, hullCorners.tr, hullCorners.br, hullCorners.bl]
+        }
+      }
+    }
+    if (!points) continue
     const quadArea = polygonArea(points)
     if (quadArea < 1) continue
     const fill = Math.min(1, count / quadArea)
@@ -799,16 +982,15 @@ function tightenQuad(sample: Sample, points: Point[]): Point[] {
 }
 
 export type DetectOptions = {
-  /** Longest edge of the analysis copy. 360 for a photo, 240 for the live camera. */
+  /** Longest edge of the analysis copy. 480 for a photo and the live camera. */
   maxEdge?: number
   /** Live preview: only the three white-paper passes (no Otsu fallback). */
   live?: boolean
 }
 
 /**
- * Snaps to the bright, low-saturation sheet (white paper on a colored board or clear tray).
- * Falls back to a looser color pass, then to an Otsu brightness split.
- * Corners are returned top-left, top-right, bottom-right, bottom-left.
+ * Canny outer hull first (4 vertices, 30–95% of the frame). Then paper-blob
+ * passes. If nothing looks like a sheet, a 10% inset rectangle — never the raw frame.
  */
 export function detectDocumentCorners(
   image: CanvasImageSource,
@@ -821,6 +1003,11 @@ export function detectDocumentCorners(
     const maxEdge = options.maxEdge ?? DETECT_MAX
     const sample = takeSample(image, maxEdge)
     if (!sample) return missed
+    const canny = findCannyQuad(sample)
+    if (canny) {
+      const corners = orderCorners(canny.map((point) => scaleUp(point, sample.width, sample.height, width, height)))
+      if (quadLooksLikeSheet(corners, width, height)) return { corners, detected: true }
+    }
     const gray = lumaOf(sample)
     const scale = maxEdge / DETECT_MAX
     // Strictest first: bright white paper, then looser passes. A passing blob must not run

@@ -1,14 +1,14 @@
 import { Images, SwitchCamera, X } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { detectDocumentCorners } from '../lib/detect'
-import { distance } from '../lib/geometry'
 import { useScan } from '../state/scan-context'
 import type { CaptureHint, Corners } from '../types'
 
-/** Live detection runs about every 140ms on a 240px copy of the video frame. */
+/** Live detection runs about every 140ms on a 480px copy of the video frame. */
 const LIVE_INTERVAL_MS = 140
-const LIVE_EDGE = 240
+const LIVE_EDGE = 480
 const LIVE_MISSES_BEFORE_CLEAR = 5
+const LIVE_SMOOTH = 0.3
 
 type LiveQuad = { corners: Corners; width: number; height: number; at: number }
 
@@ -78,10 +78,11 @@ export function CameraCapture() {
         const found = detectDocumentCorners(video, width, height, { maxEdge: LIVE_EDGE, live: true })
         if (found.detected) {
           misses = 0
-          const jump = distance(found.corners.tl, current?.corners.tl ?? found.corners.tl)
-          const smooth = current && current.width === width && jump < width * 0.25
           current = {
-            corners: smooth && current ? blend(current.corners, found.corners, 0.55) : found.corners,
+            corners:
+              current && current.width === width
+                ? blend(current.corners, found.corners, LIVE_SMOOTH)
+                : found.corners,
             width,
             height,
             at: performance.now(),

@@ -132,11 +132,17 @@ export function defaultCorners(width: number, height: number, inset = 0.08): Cor
   }
 }
 
-/** Centered rectangle at 5% / 95% of the frame (90% coverage). Safe crop when detection fails. */
-export const FULL_FRAME_INSET = 0.05
-
+/**
+ * Centered portrait document box with ~10% side margins. Never the raw viewfinder
+ * edge, which would include a keyboard or desk around the sheet.
+ */
 export function fullFrameCorners(width: number, height: number): Corners {
-  return defaultCorners(width, height, FULL_FRAME_INSET)
+  return {
+    tl: { x: width * 0.1, y: height * 0.08 },
+    tr: { x: width * 0.9, y: height * 0.08 },
+    br: { x: width * 0.9, y: height * 0.92 },
+    bl: { x: width * 0.1, y: height * 0.92 },
+  }
 }
 
 /**

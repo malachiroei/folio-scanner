@@ -60,6 +60,7 @@ export type Cv = {
   contourArea: (contour: CvMat) => number
   arcLength: (contour: CvMat, closed: boolean) => number
   approxPolyDP: (curve: CvMat, approx: CvMat, epsilon: number, closed: boolean) => void
+  convexHull: (src: CvMat, dst: CvMat, clockwise?: boolean, returnPoints?: boolean) => void
   isContourConvex: (contour: CvMat) => boolean
   minAreaRect: (points: CvMat) => {
     center: { x: number; y: number }
