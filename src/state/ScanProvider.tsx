@@ -369,6 +369,8 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     canvas.height = image.naturalHeight || image.height
     const context = canvas.getContext('2d')
     if (!context) throw new Error('לא ניתן להכין את התמונה.')
+    context.imageSmoothingEnabled = true
+    context.imageSmoothingQuality = 'high'
     context.drawImage(image, 0, 0)
     return canvas
   }

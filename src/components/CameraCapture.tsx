@@ -247,6 +247,8 @@ export function CameraCapture() {
     canvas.height = height
     const context = canvas.getContext('2d')
     if (!context) return
+    context.imageSmoothingEnabled = true
+    context.imageSmoothingQuality = 'high'
     if (facing === 'user') {
       context.translate(width, 0)
       context.scale(-1, 1)

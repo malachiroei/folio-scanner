@@ -2,8 +2,8 @@ import { Blend, Contrast, Image as ImageIcon, Sparkles } from 'lucide-react'
 import type { FilterMode } from '../types'
 
 const FILTERS: { id: FilterMode; label: string; hint: string; icon: typeof Sparkles }[] = [
-  { id: 'magic', label: 'סריקת קסם', hint: 'נייר לבן, טקסט חד וצבעים נשמרים', icon: Sparkles },
-  { id: 'bw', label: 'שחור לבן', hint: 'מסמך שחור-לבן חד בלי רעש נייר', icon: Contrast },
+  { id: 'magic', label: 'סריקת קסם', hint: 'נייר לבן, טקסט חד, תמונות נשארות חדות', icon: Sparkles },
+  { id: 'bw', label: 'שחור לבן', hint: 'גווני אפור חדים בלי רעש נייר', icon: Contrast },
   { id: 'gray', label: 'גווני אפור', hint: 'ללא צבע, אחרי יישור', icon: Blend },
   { id: 'original', label: 'מקורי', hint: 'צבע מקורי, אחרי יישור', icon: ImageIcon },
 ]

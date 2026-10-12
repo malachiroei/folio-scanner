@@ -32,30 +32,29 @@ function isLandscape(corners: Corners): boolean {
 
 /**
  * Long edge of the straightened page: never below 2800px (about 240 DPI on A4), up to full A4 at
- * 300 DPI (3508x2480 landscape, 2480x3508 portrait). Smaller quads are enlarged with bilinear
- * sampling, but never more than 3x, so a tiny source does not blow up memory for nothing.
+ * 300 DPI (3508x2480 landscape, 2480x3508 portrait). Smaller quads are enlarged with high-quality
+ * interpolation, but never more than 3x, so a tiny source does not blow up memory for nothing.
  */
 const MIN_EDGE = 2800
 const MAX_EDGE = 3508
 const MAX_UPSCALE = 3
+/** Destination mesh density: piecewise affine cells approximate the homography without seams. */
+const WARP_GRID = 24
 
-/** CamScanner Magic Color: RGB white balance + Bradley-Roth adaptive threshold. */
+/** CamScanner Magic Color: continuous-tone color. Never a 1-bit binary threshold. */
 const LIGHT_GRID = 16
 const LIGHT_PERCENTILE = 0.95
 const LIGHT_BLUR_PASSES = 4
 const LIGHT_FLOOR = 0.85
 const FLAT_TARGET = 255
-const BRADLEY_T = 0.14
-const BRADLEY_WINDOW = 40
-const PHOTO_STD = 26
-const PHOTO_MEAN_LO = 58
-const PHOTO_MEAN_HI = 188
-const SAT_KEEP = 0.08
-const SAT_BOOST = 1.5
-const INK_OUT = 5
-const SHARPEN_AMOUNT = 0.9
-const SHARPEN_THRESHOLD = 1
+const WHITE_KNEE = 215
+const SAT_BOOST = 1.4
+const PAPER_LUMA = 210
+const PAPER_SAT = 0.045
+const SHARPEN_AMOUNT = 1.5
 const YIELD_MS = 24
+
+const TONE_LUT = buildToneLut()
 
 function sourceSize(image: CanvasImageSource): { width: number; height: number } {
   if (image instanceof HTMLImageElement) {
@@ -70,13 +69,19 @@ function sourceSize(image: CanvasImageSource): { width: number; height: number }
   return { width: 0, height: 0 }
 }
 
+function highQuality(context: CanvasRenderingContext2D) {
+  context.imageSmoothingEnabled = true
+  context.imageSmoothingQuality = 'high'
+}
+
 function drawSource(image: CanvasImageSource): HTMLCanvasElement {
   const { width, height } = sourceSize(image)
   const canvas = document.createElement('canvas')
   canvas.width = Math.max(1, width)
   canvas.height = Math.max(1, height)
-  const context = canvas.getContext('2d', { willReadFrequently: true })
+  const context = canvas.getContext('2d')
   if (!context) throw new Error('לא ניתן להכין את התמונה.')
+  highQuality(context)
   context.drawImage(image, 0, 0, canvas.width, canvas.height)
   return canvas
 }
@@ -129,7 +134,104 @@ function homography(from: Point[], to: Point[]): number[] | null {
   return [...solved, 1]
 }
 
-/** Fast fallback when the time budget runs out: the corners' bounding box, scaled to the page size. */
+function mapHomography(h: number[], x: number, y: number): Point {
+  const w = (h[6] ?? 0) * x + (h[7] ?? 0) * y + (h[8] ?? 1)
+  const safe = Math.abs(w) < 1e-6 ? 1e-6 : w
+  return {
+    x: ((h[0] ?? 1) * x + (h[1] ?? 0) * y + (h[2] ?? 0)) / safe,
+    y: ((h[3] ?? 0) * x + (h[4] ?? 1) * y + (h[5] ?? 0)) / safe,
+  }
+}
+
+function invert3(m: number[]): number[] | null {
+  const a = m[0] ?? 0
+  const b = m[1] ?? 0
+  const c = m[2] ?? 0
+  const d = m[3] ?? 0
+  const e = m[4] ?? 0
+  const f = m[5] ?? 0
+  const g = m[6] ?? 0
+  const h = m[7] ?? 0
+  const i = m[8] ?? 0
+  const det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+  if (Math.abs(det) < 1e-12) return null
+  const id = 1 / det
+  return [
+    (e * i - f * h) * id,
+    (c * h - b * i) * id,
+    (b * f - c * e) * id,
+    (f * g - d * i) * id,
+    (a * i - c * g) * id,
+    (c * d - a * f) * id,
+    (d * h - e * g) * id,
+    (b * g - a * h) * id,
+    (a * e - b * d) * id,
+  ]
+}
+
+function mul3(left: number[], right: number[]): number[] {
+  const out = new Array<number>(9)
+  for (let row = 0; row < 3; row += 1) {
+    for (let col = 0; col < 3; col += 1) {
+      out[row * 3 + col] =
+        (left[row * 3] ?? 0) * (right[col] ?? 0) +
+        (left[row * 3 + 1] ?? 0) * (right[3 + col] ?? 0) +
+        (left[row * 3 + 2] ?? 0) * (right[6 + col] ?? 0)
+    }
+  }
+  return out
+}
+
+/** Affine matrix mapping source triangle → dest, as canvas setTransform(a, b, c, d, e, f). */
+function triangleTransform(s0: Point, s1: Point, s2: Point, d0: Point, d1: Point, d2: Point) {
+  const source = [s0.x, s1.x, s2.x, s0.y, s1.y, s2.y, 1, 1, 1]
+  const dest = [d0.x, d1.x, d2.x, d0.y, d1.y, d2.y, 1, 1, 1]
+  const inverse = invert3(source)
+  if (!inverse) return null
+  const mapped = mul3(dest, inverse)
+  return {
+    a: mapped[0] ?? 1,
+    b: mapped[3] ?? 0,
+    c: mapped[1] ?? 0,
+    d: mapped[4] ?? 1,
+    e: mapped[2] ?? 0,
+    f: mapped[5] ?? 0,
+  }
+}
+
+function drawTexturedTriangle(
+  context: CanvasRenderingContext2D,
+  source: HTMLCanvasElement,
+  s0: Point,
+  s1: Point,
+  s2: Point,
+  d0: Point,
+  d1: Point,
+  d2: Point,
+) {
+  const matrix = triangleTransform(s0, s1, s2, d0, d1, d2)
+  if (!matrix) return
+  const minX = Math.max(0, Math.floor(Math.min(s0.x, s1.x, s2.x)) - 2)
+  const minY = Math.max(0, Math.floor(Math.min(s0.y, s1.y, s2.y)) - 2)
+  const maxX = Math.min(source.width, Math.ceil(Math.max(s0.x, s1.x, s2.x)) + 2)
+  const maxY = Math.min(source.height, Math.ceil(Math.max(s0.y, s1.y, s2.y)) + 2)
+  const sw = maxX - minX
+  const sh = maxY - minY
+  if (sw < 1 || sh < 1) return
+
+  context.save()
+  context.beginPath()
+  context.moveTo(d0.x, d0.y)
+  context.lineTo(d1.x, d1.y)
+  context.lineTo(d2.x, d2.y)
+  context.closePath()
+  context.clip()
+  context.setTransform(matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f)
+  context.drawImage(source, minX, minY, sw, sh, minX, minY, sw, sh)
+  context.restore()
+}
+
+/** Fast fallback when the homography cannot be solved: the corners' bounding box, scaled to the page. */
 function paintScaled(
   source: HTMLCanvasElement,
   width: number,
@@ -141,6 +243,9 @@ function paintScaled(
   canvas.height = height
   const context = canvas.getContext('2d')
   if (!context) return canvas
+  highQuality(context)
+  context.fillStyle = '#ffffff'
+  context.fillRect(0, 0, width, height)
   if (corners) {
     const xs = [corners.tl.x, corners.tr.x, corners.br.x, corners.bl.x]
     const ys = [corners.tl.y, corners.tr.y, corners.br.y, corners.bl.y]
@@ -157,17 +262,17 @@ function paintScaled(
   return canvas
 }
 
+/**
+ * Perspective warp onto a full-resolution A4 canvas. Destination cells are mapped through the
+ * homography; each triangle is drawn with the browser's high-quality bilinear/bicubic sampler
+ * so small Hebrew type is not smeared on a screen-sized canvas.
+ */
 async function warpCanvas(
   source: HTMLCanvasElement,
   corners: Corners,
   width: number,
   height: number,
-  deadlineAt = Number.POSITIVE_INFINITY,
 ): Promise<HTMLCanvasElement> {
-  if (performance.now() > deadlineAt) return paintScaled(source, width, height, corners)
-  const context = source.getContext('2d', { willReadFrequently: true })
-  if (!context) throw new Error('לא ניתן לקרוא את התמונה.')
-  const pixels = context.getImageData(0, 0, source.width, source.height)
   const from = [
     { x: 0, y: 0 },
     { x: width, y: 0 },
@@ -176,70 +281,46 @@ async function warpCanvas(
   ]
   const to = [corners.tl, corners.tr, corners.br, corners.bl]
   const map = homography(from, to)
+  if (!map) return paintScaled(source, width, height, corners)
+
   const canvas = document.createElement('canvas')
   canvas.width = width
   canvas.height = height
-  const output = canvas.getContext('2d', { willReadFrequently: true })
-  if (!output) throw new Error('לא ניתן ליישר את העמוד.')
-  if (!map) {
-    output.drawImage(source, 0, 0, width, height)
-    return canvas
-  }
+  const context = canvas.getContext('2d')
+  if (!context) throw new Error('לא ניתן ליישר את העמוד.')
+  highQuality(context)
+  context.fillStyle = '#ffffff'
+  context.fillRect(0, 0, width, height)
 
-  if (performance.now() > deadlineAt) return paintScaled(source, width, height, corners)
-
-  const dest = output.createImageData(width, height)
-  const data = dest.data
-  const src = pixels.data
-  const sw = source.width
-  const sh = source.height
-  const [h0 = 1, h1 = 0, h2 = 0, h3 = 0, h4 = 1, h5 = 0, h6 = 0, h7 = 0, h8 = 1] = map
-  const maxX = sw - 1
-  const maxY = sh - 1
-  for (let y = 0; y < height; y += 1) {
-    if (y % 32 === 0) {
-      await nextFrame()
-      if (performance.now() > deadlineAt) return paintScaled(source, width, height, corners)
-    }
-    let out = y * width * 4
-    for (let x = 0; x < width; x += 1) {
-      const w = h6 * x + h7 * y + h8
-      const safe = Math.abs(w) < 1e-6 ? 1e-6 : w
-      let px = (h0 * x + h1 * y + h2) / safe
-      let py = (h3 * x + h4 * y + h5) / safe
-      if (px < 0) px = 0
-      else if (px > maxX) px = maxX
-      if (py < 0) py = 0
-      else if (py > maxY) py = maxY
-      const x0 = px | 0
-      const y0 = py | 0
-      const x1 = x0 < maxX ? x0 + 1 : x0
-      const y1 = y0 < maxY ? y0 + 1 : y0
-      const dx = px - x0
-      const dy = py - y0
-      const i00 = (y0 * sw + x0) * 4
-      const i10 = (y0 * sw + x1) * 4
-      const i01 = (y1 * sw + x0) * 4
-      const i11 = (y1 * sw + x1) * 4
-      const w00 = (1 - dx) * (1 - dy)
-      const w10 = dx * (1 - dy)
-      const w01 = (1 - dx) * dy
-      const w11 = dx * dy
-      data[out] = (src[i00] ?? 0) * w00 + (src[i10] ?? 0) * w10 + (src[i01] ?? 0) * w01 + (src[i11] ?? 0) * w11
-      data[out + 1] =
-        (src[i00 + 1] ?? 0) * w00 + (src[i10 + 1] ?? 0) * w10 + (src[i01 + 1] ?? 0) * w01 + (src[i11 + 1] ?? 0) * w11
-      data[out + 2] =
-        (src[i00 + 2] ?? 0) * w00 + (src[i10 + 2] ?? 0) * w10 + (src[i01 + 2] ?? 0) * w01 + (src[i11 + 2] ?? 0) * w11
-      data[out + 3] = 255
-      out += 4
+  const padX = 0.75
+  const padY = 0.75
+  for (let gy = 0; gy < WARP_GRID; gy += 1) {
+    if (gy % 4 === 0) await nextFrame()
+    const y0 = (gy / WARP_GRID) * height
+    const y1 = ((gy + 1) / WARP_GRID) * height
+    const dy0 = gy === 0 ? y0 : y0 - padY
+    const dy1 = gy === WARP_GRID - 1 ? y1 : y1 + padY
+    for (let gx = 0; gx < WARP_GRID; gx += 1) {
+      const x0 = (gx / WARP_GRID) * width
+      const x1 = ((gx + 1) / WARP_GRID) * width
+      const dx0 = gx === 0 ? x0 : x0 - padX
+      const dx1 = gx === WARP_GRID - 1 ? x1 : x1 + padX
+      const d00 = { x: dx0, y: dy0 }
+      const d10 = { x: dx1, y: dy0 }
+      const d11 = { x: dx1, y: dy1 }
+      const d01 = { x: dx0, y: dy1 }
+      const s00 = mapHomography(map, d00.x, d00.y)
+      const s10 = mapHomography(map, d10.x, d10.y)
+      const s11 = mapHomography(map, d11.x, d11.y)
+      const s01 = mapHomography(map, d01.x, d01.y)
+      drawTexturedTriangle(context, source, s00, s10, s11, d00, d10, d11)
+      drawTexturedTriangle(context, source, s00, s11, s01, d00, d11, d01)
     }
   }
-  sharpen3x3(dest, 0.35)
-  output.putImageData(dest, 0, 0)
   return canvas
 }
 
-/* ---------- Magic Color: RGB white balance → Bradley-Roth threshold → photo composite ---------- */
+/* ---------- Magic Color: flat-field → levels → unsharp → chroma. Continuous tone, never 1-bit. ---------- */
 
 async function yieldBusy(clock: { last: number }) {
   if (performance.now() - clock.last < YIELD_MS) return
@@ -463,49 +544,40 @@ function flattenChannel(value: number, bg: number) {
   return flat < 0 ? 0 : flat > 255 ? 255 : flat
 }
 
-function lumaChannel(data: Uint8ClampedArray, width: number, height: number) {
-  const luma = new Float32Array(width * height)
-  for (let p = 0, i = 0; p < luma.length; p += 1, i += 4) {
-    luma[p] = pixelLuma(data[i] ?? 0, data[i + 1] ?? 0, data[i + 2] ?? 0)
-  }
-  return luma
-}
-
-function integralPlane(src: Float32Array, width: number, height: number, square: boolean) {
-  const iw = width + 1
-  const out = new Float64Array(iw * (height + 1))
-  for (let y = 1; y <= height; y += 1) {
-    let run = 0
-    const srcRow = (y - 1) * width
-    const prev = (y - 1) * iw
-    const cur = y * iw
-    for (let x = 1; x <= width; x += 1) {
-      const value = src[srcRow + x - 1] ?? 0
-      run += square ? value * value : value
-      out[cur + x] = (out[prev + x] ?? 0) + run
-    }
-  }
-  return out
-}
-
-function boxSum(ii: Float64Array, iw: number, x0: number, y0: number, x1: number, y1: number) {
-  return (ii[y1 * iw + x1] ?? 0) - (ii[y0 * iw + x1] ?? 0) - (ii[y1 * iw + x0] ?? 0) + (ii[y0 * iw + x0] ?? 0)
-}
-
 function scaleToLuma(r: number, g: number, b: number, fromL: number, toL: number): [number, number, number] {
   if (fromL < 0.5) return [toL, toL, toL]
   const scale = toL / fromL
   return [r * scale, g * scale, b * scale]
 }
 
-/** Local contrast stretch so photo shadows land below 35 without clipping highlights. */
-function photoStretch(luma: number, mean: number, std: number) {
-  const lo = Math.max(0, mean - 1.7 * std)
-  const hi = Math.min(255, mean + 1.55 * std)
-  if (hi - lo < 8) return luma
-  let out = ((luma - lo) / (hi - lo)) * 255
-  if (out < 50) out *= 0.7
-  return out < 0 ? 0 : out > 255 ? 255 : out
+/**
+ * Continuous-tone levels: shadows below 70 pull toward ~15, highlights stretch to paper white,
+ * mild S-curve on midtones. Every output stays in 0..255 — never snapped to 0 or 255 by a threshold.
+ */
+function buildToneLut() {
+  const knots: [number, number][] = [
+    [0, 0],
+    [70, 15],
+    [128, 120],
+    [220, 250],
+    [255, 255],
+  ]
+  const lut = new Float32Array(256)
+  for (let x = 0; x < 256; x += 1) {
+    let y = x
+    for (let i = 1; i < knots.length; i += 1) {
+      const [x1, y1] = knots[i] ?? [255, 255]
+      const [x0, y0] = knots[i - 1] ?? [0, 0]
+      if (x <= x1) {
+        const t = (x - x0) / Math.max(1, x1 - x0)
+        const s = t * t * (3 - 2 * t)
+        y = y0 + (y1 - y0) * (0.65 * t + 0.35 * s)
+        break
+      }
+    }
+    lut[x] = y
+  }
+  return lut
 }
 
 function boostSat(r: number, g: number, b: number, sat: number): [number, number, number] {
@@ -540,88 +612,46 @@ async function whiteBalanceRgb(
   }
 }
 
-/**
- * Bradley-Roth adaptive threshold on the full-resolution page.
- * `threshold = localMean * (1 - T)`, window ≈ width/40, via integral images.
- * Photos (high local std + chroma/midtones) are contrast-stretched, not binarized.
- * Chromatic paper (pink voucher, blue stamps) keeps tint; ink on it still goes black.
- */
-async function applyBradleyDocument(
+/** Soft knee to #FFFFFF when luminance > 215, then the continuous-tone contrast LUT. */
+async function applyLevelsAndKnee(
   data: Uint8ClampedArray,
   width: number,
   height: number,
   clock: { last: number },
-  binaryOnly: boolean,
 ) {
-  const luma = lumaChannel(data, width, height)
-  const sum = integralPlane(luma, width, height, false)
-  const sq = integralPlane(luma, width, height, true)
-  const iw = width + 1
-  const radius = Math.max(7, Math.round(width / (BRADLEY_WINDOW * 2)))
-  await yieldBusy(clock)
-
+  const span = 255 - WHITE_KNEE
   for (let y = 0; y < height; y += 1) {
-    if (y % 32 === 0) await yieldBusy(clock)
-    const y0 = Math.max(0, y - radius)
-    const y1 = Math.min(height, y + radius + 1)
+    if (y % 48 === 0) await yieldBusy(clock)
     let i = y * width * 4
-    const row = y * width
     for (let x = 0; x < width; x += 1, i += 4) {
-      const x0 = Math.max(0, x - radius)
-      const x1 = Math.min(width, x + radius + 1)
-      const n = (x1 - x0) * (y1 - y0)
-      const mean = n > 0 ? boxSum(sum, iw, x0, y0, x1, y1) / n : 255
-      const moment = n > 0 ? boxSum(sq, iw, x0, y0, x1, y1) / n : 0
-      const variance = moment - mean * mean
-      const std = Math.sqrt(variance > 0 ? variance : 0)
-      const threshold = mean * (1 - BRADLEY_T)
-      const tone = luma[row + x] ?? 0
       let red = data[i] ?? 0
       let green = data[i + 1] ?? 0
       let blue = data[i + 2] ?? 0
-      const sat = pixelSat(red, green, blue)
-      const isPhoto = !binaryOnly && std > PHOTO_STD && (sat > SAT_KEEP || (mean > PHOTO_MEAN_LO && mean < PHOTO_MEAN_HI))
-
-      if (isPhoto) {
-        const next = scaleToLuma(red, green, blue, tone, photoStretch(tone, mean, std))
-        red = next[0]
-        green = next[1]
-        blue = next[2]
-        if (sat > SAT_KEEP) {
-          const chroma = boostSat(red, green, blue, sat)
-          red = chroma[0]
-          green = chroma[1]
-          blue = chroma[2]
-        }
-      } else if (tone < threshold) {
-        red = INK_OUT
-        green = INK_OUT
-        blue = INK_OUT
-      } else if (!binaryOnly && sat > SAT_KEEP) {
-        const chroma = boostSat(red, green, blue, sat)
-        red = chroma[0]
-        green = chroma[1]
-        blue = chroma[2]
-      } else {
-        red = 255
-        green = 255
-        blue = 255
+      let luma = pixelLuma(red, green, blue)
+      if (luma > WHITE_KNEE) {
+        const t = (luma - WHITE_KNEE) / span
+        const ease = t * t * (3 - 2 * t)
+        red += (255 - red) * ease
+        green += (255 - green) * ease
+        blue += (255 - blue) * ease
+        luma = pixelLuma(red, green, blue)
       }
-
-      data[i] = clamp255(red)
-      data[i + 1] = clamp255(green)
-      data[i + 2] = clamp255(blue)
+      const mapped = TONE_LUT[Math.round(luma)] ?? luma
+      const next = scaleToLuma(red, green, blue, luma, mapped)
+      data[i] = clamp255(next[0])
+      data[i + 1] = clamp255(next[1])
+      data[i + 2] = clamp255(next[2])
       data[i + 3] = 255
     }
   }
 }
 
-/** 3×3 unsharp on luminance, before adaptive threshold so thin strokes fall below the local mean. */
-function sharpen3x3(image: ImageData, amount: number, threshold = 1.2) {
+/** 3×3 unsharp on luminance: `sharpL = L + 1.5 * (L - blurredL)`, then RGB is scaled to match. */
+function sharpenLuma(image: ImageData, amount: number) {
   const { data, width, height } = image
   const gray = new Float32Array(width * height)
   for (let i = 0, p = 0; p < gray.length; p += 1, i += 4) {
-    gray[p] = 0.299 * (data[i] ?? 0) + 0.587 * (data[i + 1] ?? 0) + 0.114 * (data[i + 2] ?? 0)
+    gray[p] = pixelLuma(data[i] ?? 0, data[i + 1] ?? 0, data[i + 2] ?? 0)
   }
   for (let y = 1; y < height - 1; y += 1) {
     for (let x = 1; x < width - 1; x += 1) {
@@ -638,10 +668,8 @@ function sharpen3x3(image: ImageData, amount: number, threshold = 1.2) {
           (gray[p + width] ?? 0) +
           (gray[p + width + 1] ?? 0)) /
         9
-      const delta = center - blur
-      if (Math.abs(delta) < threshold) continue
-      const next = center + delta * amount
-      const lift = center > 1 ? next / center : 1
+      const sharp = center + amount * (center - blur)
+      const lift = center > 1 ? sharp / center : 1
       const i = p * 4
       data[i] = clamp255((data[i] ?? 0) * lift)
       data[i + 1] = clamp255((data[i + 1] ?? 0) * lift)
@@ -650,33 +678,64 @@ function sharpen3x3(image: ImageData, amount: number, threshold = 1.2) {
   }
 }
 
+/** 1.4× HSV saturation on non-paper pixels so stamps, vouchers, and plates stay vivid. */
+async function boostNonPaperChroma(
+  data: Uint8ClampedArray,
+  width: number,
+  height: number,
+  clock: { last: number },
+) {
+  for (let y = 0; y < height; y += 1) {
+    if (y % 48 === 0) await yieldBusy(clock)
+    let i = y * width * 4
+    for (let x = 0; x < width; x += 1, i += 4) {
+      const red = data[i] ?? 0
+      const green = data[i + 1] ?? 0
+      const blue = data[i + 2] ?? 0
+      const luma = pixelLuma(red, green, blue)
+      const sat = pixelSat(red, green, blue)
+      if (luma >= PAPER_LUMA || sat < PAPER_SAT) continue
+      const chroma = boostSat(red, green, blue, sat)
+      data[i] = clamp255(chroma[0])
+      data[i + 1] = clamp255(chroma[1])
+      data[i + 2] = clamp255(chroma[2])
+    }
+  }
+}
+
+function desaturatePixels(data: Uint8ClampedArray) {
+  for (let i = 0; i < data.length; i += 4) {
+    const tone = Math.round(pixelLuma(data[i] ?? 0, data[i + 1] ?? 0, data[i + 2] ?? 0))
+    data[i] = tone
+    data[i + 1] = tone
+    data[i + 2] = tone
+  }
+}
+
 async function applyMagicColor(image: ImageData) {
   const { data, width, height } = image
   const clock = { last: performance.now() }
   await whiteBalanceRgb(data, width, height, clock)
-  sharpen3x3(image, SHARPEN_AMOUNT, SHARPEN_THRESHOLD)
-  await applyBradleyDocument(data, width, height, clock, false)
+  await applyLevelsAndKnee(data, width, height, clock)
+  sharpenLuma(image, SHARPEN_AMOUNT)
+  await boostNonPaperChroma(data, width, height, clock)
 }
 
 async function applyFastBlackWhite(image: ImageData) {
   const { data, width, height } = image
   const clock = { last: performance.now() }
   await whiteBalanceRgb(data, width, height, clock)
-  sharpen3x3(image, SHARPEN_AMOUNT, SHARPEN_THRESHOLD)
-  await applyBradleyDocument(data, width, height, clock, true)
+  await applyLevelsAndKnee(data, width, height, clock)
+  sharpenLuma(image, SHARPEN_AMOUNT)
+  desaturatePixels(data)
+  await yieldBusy(clock)
 }
 
 export function desaturateCanvas(canvas: HTMLCanvasElement): HTMLCanvasElement {
   const context = canvas.getContext('2d', { willReadFrequently: true })
   if (!context) return canvas
   const image = context.getImageData(0, 0, canvas.width, canvas.height)
-  const { data } = image
-  for (let i = 0; i < data.length; i += 4) {
-    const tone = Math.round(0.2126 * (data[i] ?? 0) + 0.7152 * (data[i + 1] ?? 0) + 0.0722 * (data[i + 2] ?? 0))
-    data[i] = tone
-    data[i + 1] = tone
-    data[i + 2] = tone
-  }
+  desaturatePixels(image.data)
   context.putImageData(image, 0, 0)
   return canvas
 }
@@ -698,7 +757,6 @@ function insetCorners(corners: Corners, amount = 0.001): Corners {
 export async function straightenCanvas(
   image: CanvasImageSource,
   corners: Corners,
-  deadlineAt = Number.POSITIVE_INFINITY,
 ): Promise<HTMLCanvasElement> {
   const fitted = a4Size(outputSize(corners), isLandscape(corners))
   const longEdge = Math.max(fitted.width, fitted.height, 1)
@@ -707,7 +765,7 @@ export async function straightenCanvas(
   const height = Math.max(32, Math.round(fitted.height * scale))
   const copy = drawSource(image)
   try {
-    return await warpCanvas(copy, insetCorners(corners), width, height, deadlineAt)
+    return await warpCanvas(copy, insetCorners(corners), width, height)
   } finally {
     copy.width = 0
     copy.height = 0
@@ -723,6 +781,7 @@ async function processPixels(
   canvas.height = source.height
   const context = canvas.getContext('2d', { willReadFrequently: true })
   if (!context) return source
+  highQuality(context)
   context.drawImage(source, 0, 0)
   const pixels = context.getImageData(0, 0, canvas.width, canvas.height)
   await run(pixels)
@@ -730,12 +789,12 @@ async function processPixels(
   return canvas
 }
 
-/** Magic Color: white-balanced paper, Bradley-Roth text, protected photos. */
+/** Magic Color: white paper, crisp text, continuous-tone photos. Never 1-bit. */
 export async function applyCanvasMagic(source: HTMLCanvasElement): Promise<HTMLCanvasElement> {
   return processPixels(source, applyMagicColor)
 }
 
-/** Adaptive black and white from Bradley-Roth on the white-balanced page. */
+/** High-contrast grayscale of the same continuous-tone page (no binary threshold). */
 export async function applyCanvasBlackWhite(source: HTMLCanvasElement): Promise<HTMLCanvasElement> {
   return processPixels(source, applyFastBlackWhite)
 }
@@ -756,6 +815,10 @@ function copyCanvas(source: HTMLCanvasElement): HTMLCanvasElement {
   const canvas = document.createElement('canvas')
   canvas.width = source.width
   canvas.height = source.height
-  canvas.getContext('2d')?.drawImage(source, 0, 0)
+  const context = canvas.getContext('2d')
+  if (context) {
+    highQuality(context)
+    context.drawImage(source, 0, 0)
+  }
   return canvas
 }

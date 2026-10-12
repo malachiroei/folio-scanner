@@ -86,7 +86,7 @@ async function decodeFitted(blob: Blob, width: number, height: number): Promise<
     imageOrientation: 'from-image',
     resizeWidth: fitted.width,
     resizeHeight: fitted.height,
-    resizeQuality: 'medium',
+    resizeQuality: 'high',
   })
   return bitmap
 }
@@ -135,6 +135,8 @@ export async function normalizeImage(blob: Blob): Promise<{ url: string; width: 
     bitmap.close()
     throw new Error('לא ניתן להכין את התמונה.')
   }
+  context.imageSmoothingEnabled = true
+  context.imageSmoothingQuality = 'high'
   context.fillStyle = '#ffffff'
   context.fillRect(0, 0, width, height)
   context.drawImage(bitmap, 0, 0, width, height)

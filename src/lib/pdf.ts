@@ -72,6 +72,8 @@ async function encodePage(url: string, maxEdge: number, quality: number): Promis
   canvas.height = Math.max(1, Math.round(sourceHeight * scale))
   const context = canvas.getContext('2d')
   if (!context) throw new Error('לא ניתן לקרוא עמוד לקובץ ה-PDF.')
+  context.imageSmoothingEnabled = true
+  context.imageSmoothingQuality = 'high'
   context.fillStyle = '#ffffff'
   context.fillRect(0, 0, canvas.width, canvas.height)
   context.drawImage(image, 0, 0, canvas.width, canvas.height)

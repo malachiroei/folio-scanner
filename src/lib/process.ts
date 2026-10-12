@@ -7,8 +7,6 @@ import {
   straightenCanvas,
 } from './canvas-scan'
 
-const PROCESS_BUDGET_MS = 45_000
-
 function yieldToBrowser(): Promise<void> {
   return new Promise((resolve) => {
     window.setTimeout(resolve, 0)
@@ -30,7 +28,7 @@ export async function straightenDocument(
   corners: Corners,
 ): Promise<HTMLCanvasElement> {
   await yieldToBrowser()
-  return straightenCanvas(image, corners, performance.now() + PROCESS_BUDGET_MS)
+  return straightenCanvas(image, corners)
 }
 
 /** Instant grayscale through the 2D context filter. */
@@ -46,13 +44,13 @@ export function paintFastFilter(source: HTMLCanvasElement): HTMLCanvasElement {
   return canvas
 }
 
-/** Magic scan: white balance + Bradley-Roth text, protected photos. Yields to the UI while it runs. */
+/** Magic scan: continuous-tone color (flat-field, levels, unsharp). Yields to the UI while it runs. */
 export async function renderMagic(source: HTMLCanvasElement): Promise<HTMLCanvasElement> {
   await yieldToBrowser()
   return await applyCanvasMagic(source)
 }
 
-/** Adaptive black and white document. Yields to the UI while it runs. */
+/** High-contrast grayscale of the same continuous-tone page. Yields to the UI while it runs. */
 export async function renderBlackWhite(source: HTMLCanvasElement): Promise<HTMLCanvasElement> {
   await yieldToBrowser()
   return await applyCanvasBlackWhite(source)
