@@ -18,7 +18,10 @@ import { getCv, isOpenCvReady, MatBin, type Cv, type CvMat } from './opencv'
 const DETECT_MAX = 480
 const MIN_AREA = 0.12
 const MAX_AREA = 0.98
-const PAPER_LUMA_MIN = 130
+const PAPER_LUMA_MIN = 140
+const SHEET_MIN_AREA = 0.2
+const KEYBOARD_LUMA = 50
+const SHEET_CLOSE = 15
 const A4_ASPECT = Math.SQRT2
 const CLOSE_RADIUS = 2
 const OPEN_RADIUS = 4
@@ -29,8 +32,6 @@ const FOLD_ASPECT_MAX = 1.15
 const PORTRAIT_MIN_ASPECT = 1.2
 const A4_ASPECT_LO = 1.35
 const A4_ASPECT_HI = 1.55
-/** Push the quad out from its center so inner grid lines / margins are not clipped. */
-const OUTER_EXPAND = 0.03
 /** Vertical close kernel (1×15) that bridges a horizontal fold before contour extraction. */
 const FOLD_BRIDGE = 15
 
@@ -52,7 +53,7 @@ function sourceSize(image: CanvasImageSource): { width: number; height: number }
 function takeSample(image: CanvasImageSource, maxEdge: number): Sample | null {
   const { width, height } = sourceSize(image)
   if (width < 1 || height < 1) return null
-  const scale = Math.min(1, maxEdge / Math.max(width, height))
+  const scale = Math.min(1, maxEdge / width)
   const w = Math.max(1, Math.round(width * scale))
   const h = Math.max(1, Math.round(height * scale))
   const canvas = document.createElement('canvas')
@@ -489,26 +490,6 @@ function isFoldHalf(points: Point[]): boolean {
   }
 }
 
-function expandQuad(points: Point[], width: number, height: number, amount = OUTER_EXPAND): Point[] {
-  if (points.length !== 4) return points
-  const cx = points.reduce((sum, point) => sum + point.x, 0) / 4
-  const cy = points.reduce((sum, point) => sum + point.y, 0) / 4
-  const expanded = points.map((point) =>
-    clampPoint(
-      { x: point.x + (point.x - cx) * amount, y: point.y + (point.y - cy) * amount },
-      width,
-      height,
-    ),
-  )
-  try {
-    const corners = orderCorners(expanded)
-    if (!quadIsConvex(corners) || !cornersValid(corners, width, height)) return points
-    return [corners.tl, corners.tr, corners.br, corners.bl]
-  } catch {
-    return points
-  }
-}
-
 /**
  * Prefer the outermost sheet. Drop square fold-halves when a taller portrait contour exists.
  * Landscape tables win by area so the header and outer column borders stay inside.
@@ -552,8 +533,7 @@ function chooseOuterQuad(candidates: Point[][], width: number, height: number): 
 }
 
 function pickOuterQuad(candidates: Point[][], width: number, height: number): Point[] | null {
-  const chosen = chooseOuterQuad(candidates, width, height)
-  return chosen ? expandQuad(chosen, width, height) : null
+  return chooseOuterQuad(candidates, width, height)
 }
 
 function quadsFromBinaryCv(cv: Cv, bin: MatBin, binary: CvMat, sample: Sample): Point[][] {
@@ -579,6 +559,128 @@ function bridgeFoldsCv(cv: Cv, bin: MatBin, binary: CvMat): CvMat {
   const bridged = bin.keep(new cv.Mat())
   cv.morphologyEx(binary, bridged, cv.MORPH_CLOSE, vertical)
   return bridged
+}
+
+/** Bottom of the black keyboard band at the top of the frame, or 0 if none. */
+function keyboardFloor(gray: Float32Array, width: number, height: number): number {
+  const limit = Math.floor(height * 0.45)
+  let floor = 0
+  for (let y = 0; y < limit; y += 1) {
+    let dark = 0
+    let sum = 0
+    const row = y * width
+    for (let x = 0; x < width; x += 1) {
+      const value = gray[row + x] ?? 0
+      sum += value
+      if (value < KEYBOARD_LUMA) dark += 1
+    }
+    if (dark / width > 0.35 && sum / width < 70) floor = y + 1
+    else if (floor > 8 && y > floor + 8) break
+  }
+  return floor
+}
+
+function sheetStats(gray: Float32Array, width: number, height: number, points: Point[]) {
+  const xs = points.map((point) => point.x)
+  const ys = points.map((point) => point.y)
+  const minX = Math.max(0, Math.floor(Math.min(...xs)))
+  const maxX = Math.min(width - 1, Math.ceil(Math.max(...xs)))
+  const minY = Math.max(0, Math.floor(Math.min(...ys)))
+  const maxY = Math.min(height - 1, Math.ceil(Math.max(...ys)))
+  const stride = Math.max(1, Math.round(Math.min(width, height) / 80))
+  let ink = 0
+  let bright = 0
+  let dark = 0
+  let count = 0
+  for (let y = minY; y <= maxY; y += stride) {
+    for (let x = minX; x <= maxX; x += stride) {
+      if (!insideQuad(points, x, y)) continue
+      const luma = gray[y * width + x] ?? 0
+      count += 1
+      if (luma > 180) bright += 1
+      else if (luma > 25 && luma < PAPER_LUMA_MIN) ink += 1
+      if (luma < KEYBOARD_LUMA) dark += 1
+    }
+  }
+  return {
+    ink: count ? ink / count : 0,
+    bright: count ? bright / count : 0,
+    dark: count ? dark / count : 0,
+    minY,
+    maxY,
+    minX,
+    maxX,
+  }
+}
+
+function scorePaperSheet(
+  points: Point[],
+  gray: Float32Array,
+  width: number, height: number,
+  keyboardY: number,
+): number {
+  let corners: ReturnType<typeof orderCorners>
+  try {
+    corners = orderCorners(points)
+  } catch {
+    return -1
+  }
+  if (!quadLooksLikeSheet(corners, width, height)) return -1
+  const area = polygonArea([corners.tl, corners.tr, corners.br, corners.bl])
+  const frac = area / (width * height)
+  if (frac < SHEET_MIN_AREA || frac > 0.95) return -1
+  const stats = sheetStats(gray, width, height, [corners.tl, corners.tr, corners.br, corners.bl])
+  if (keyboardY > 8 && stats.minY < keyboardY * 0.7) return -1
+  if (stats.dark > 0.22) return -1
+  if (stats.bright < 0.28) return -1
+  const touching =
+    Number(stats.minX <= 1) + Number(stats.minY <= 1) + Number(stats.maxX >= width - 2) + Number(stats.maxY >= height - 2)
+  if (touching >= 3) return -1
+  const size = quadSize([corners.tl, corners.tr, corners.br, corners.bl])
+  const belowKeyboard = keyboardY < 8 || stats.minY >= keyboardY - 6 ? 1.6 : 0.25
+  const tall = size.height > size.width * PORTRAIT_MIN_ASPECT ? 1.35 : 1
+  return area * (0.4 + stats.ink * 4) * (0.5 + stats.bright) * belowKeyboard * tall * (touching === 0 ? 1.3 : 1)
+}
+
+function pickPaperSheet(quads: Point[][], gray: Float32Array, width: number, height: number): Point[] | null {
+  const keyboardY = keyboardFloor(gray, width, height)
+  let best: Point[] | null = null
+  let bestScore = 0
+  for (const points of quads) {
+    if (points.length !== 4) continue
+    const score = scorePaperSheet(points, gray, width, height, keyboardY)
+    if (score <= bestScore) continue
+    bestScore = score
+    best = points
+  }
+  return best
+}
+
+/**
+ * CamScanner-style sheet: luma > 140, 15×15 close, external hull extrema.
+ * Black keyboard (luma < 50) never enters the mask.
+ */
+function findPaperSheetCv(sample: Sample): Point[] | null {
+  const cv = getCv()
+  const bin = new MatBin()
+  try {
+    const src = bin.keep(cv.imread(sample.canvas))
+    const gray = bin.keep(new cv.Mat())
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY)
+    const binary = bin.keep(new cv.Mat())
+    cv.threshold(gray, binary, PAPER_LUMA_MIN, 255, cv.THRESH_BINARY)
+    const closeKernel = bin.keep(cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(SHEET_CLOSE, SHEET_CLOSE)))
+    const closed = bin.keep(new cv.Mat())
+    cv.morphologyEx(binary, closed, cv.MORPH_CLOSE, closeKernel)
+    const bridged = bridgeFoldsCv(cv, bin, closed)
+    const quads = quadsFromBinaryCv(cv, bin, bridged, sample)
+    return pickPaperSheet(quads, lumaOf(sample), sample.width, sample.height)
+  } catch (error) {
+    console.error(error)
+    return null
+  } finally {
+    bin.release()
+  }
 }
 
 /**
@@ -731,7 +833,7 @@ function lumaPaperMask(sample: Sample): Uint8Array {
   return mask
 }
 
-function largestHullQuadFromMask(mask: Uint8Array, width: number, height: number): Point[] | null {
+function collectHullQuadsFromMask(mask: Uint8Array, width: number, height: number): Point[][] {
   const area = width * height
   const seen = new Uint8Array(mask.length)
   const stack = new Int32Array(mask.length)
@@ -788,7 +890,29 @@ function largestHullQuadFromMask(mask: Uint8Array, width: number, height: number
     if (!accepted) continue
     quads.push(accepted)
   }
-  return chooseOuterQuad(quads, width, height)
+  return quads
+}
+
+function largestHullQuadFromMask(mask: Uint8Array, width: number, height: number): Point[] | null {
+  return chooseOuterQuad(collectHullQuadsFromMask(mask, width, height), width, height)
+}
+
+function findPaperSheetCanvas(sample: Sample): Point[] | null {
+  const radius = Math.max(1, Math.round(SHEET_CLOSE / 2))
+  const closed = morph(
+    morph(lumaPaperMask(sample), sample.width, sample.height, radius, false),
+    sample.width,
+    sample.height,
+    radius,
+    true,
+  )
+  const bridged = bridgeFolds(closed, sample.width, sample.height)
+  return pickPaperSheet(
+    collectHullQuadsFromMask(bridged, sample.width, sample.height),
+    lumaOf(sample),
+    sample.width,
+    sample.height,
+  )
 }
 
 function findBrightHullCanvas(sample: Sample): Point[] | null {
@@ -920,22 +1044,33 @@ function findGradientHullCanvas(sample: Sample): Point[] | null {
 }
 
 function findPaperQuad(sample: Sample): Point[] | null {
+  if (isOpenCvReady()) {
+    const sheet = findPaperSheetCv(sample)
+    if (sheet) return sheet
+  }
+  const canvasSheet = findPaperSheetCanvas(sample)
+  if (canvasSheet) return canvasSheet
   const collected: Point[][] = []
   const take = (found: Point[] | null) => {
     if (found) collected.push(found)
   }
   if (isOpenCvReady()) {
-    take(findGradientHullCv(sample))
     take(findBrightHullCv(sample))
     take(findThresholdQuadCv(sample))
     take(findCannyQuadCv(sample))
+    if (!collected.length) take(findGradientHullCv(sample))
   } else {
-    take(findGradientHullCanvas(sample))
     take(findBrightHullCanvas(sample))
     take(findThresholdQuadCanvas(sample))
     take(findCannyQuadCanvas(sample))
+    if (!collected.length) take(findGradientHullCanvas(sample))
   }
-  return pickOuterQuad(collected, sample.width, sample.height)
+  const fallback = pickOuterQuad(collected, sample.width, sample.height)
+  if (!fallback) return null
+  const gray = lumaOf(sample)
+  const keyboardY = keyboardFloor(gray, sample.width, sample.height)
+  if (scorePaperSheet(fallback, gray, sample.width, sample.height, keyboardY) < 0) return null
+  return fallback
 }
 
 type Line = { slope: number; offset: number }
@@ -1543,16 +1678,15 @@ function tightenQuad(sample: Sample, points: Point[]): Point[] {
 }
 
 export type DetectOptions = {
-  /** Longest edge of the analysis copy. 480 for a photo and the live camera. */
+  /** Target width of the analysis copy. 480 for a photo and the live camera. */
   maxEdge?: number
   /** Live preview: only the three white-paper passes (no Otsu fallback). */
   live?: boolean
 }
 
 /**
- * Bright paper (luma > 130) → largest contour → convex hull → 4 extrema.
- * Folded sheets are 5–8-gons after approxPolyDP; extrema still snap to the paper
- * and cut out a black keyboard. Fallback is a 10% inset, never the viewfinder edge.
+ * White sheet (luma > 140) vs black keyboard. 15×15 close, external hull extrema.
+ * Gradient ranking is not used first — it snaps to keys and desk edges.
  */
 export function detectDocumentCorners(
   image: CanvasImageSource,
@@ -1608,8 +1742,6 @@ export function detectDocumentCorners(
     if (!points && fallback) points = fallback.points
     if (points) {
       const raw = orderCorners(points.map((point) => scaleUp(point, sample.width, sample.height, width, height)))
-      const outer = orderCorners(expandQuad([raw.tl, raw.tr, raw.br, raw.bl], width, height))
-      if (sheetCornersOk(outer, width, height)) return { corners: outer, detected: true }
       if (sheetCornersOk(raw, width, height)) return { corners: raw, detected: true }
     }
     return missed

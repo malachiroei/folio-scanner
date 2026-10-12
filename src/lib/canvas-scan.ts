@@ -278,7 +278,11 @@ function warpPerspectiveCv(
         corners.bl.y,
       ]),
     )
-    const to = bin.keep(cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, width, 0, width, height, 0, height]))
+    const destW = width
+    const destH = height
+    const to = bin.keep(
+      cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, destW, 0, destW, destH, 0, destH]),
+    )
     const matrix = bin.keep(cv.getPerspectiveTransform(from, to))
     const dst = bin.keep(new cv.Mat())
     const border = typeof cv.BORDER_CONSTANT === 'number' ? cv.BORDER_CONSTANT : 0
