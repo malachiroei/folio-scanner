@@ -26,8 +26,13 @@ const ANGLE_GOOD_MIN = 70
 const ANGLE_GOOD_MAX = 110
 /** Half an A4 across a fold looks ~square. Full portrait A4 is ~1.41. */
 const FOLD_ASPECT_MAX = 1.15
+const PORTRAIT_MIN_ASPECT = 1.2
 const A4_ASPECT_LO = 1.35
 const A4_ASPECT_HI = 1.55
+/** Push the quad out from its center so inner grid lines / margins are not clipped. */
+const OUTER_EXPAND = 0.03
+/** Vertical close kernel (1×15) that bridges a horizontal fold before contour extraction. */
+const FOLD_BRIDGE = 15
 
 type Sample = { data: Uint8ClampedArray; width: number; height: number; canvas: HTMLCanvasElement }
 
@@ -465,9 +470,115 @@ function approxFourCv(cv: Cv, bin: MatBin, hull: CvMat, width: number, height: n
   return acceptHullQuad(matPoints(hull), width, height)
 }
 
-function scoreBrightQuad(points: Point[], area: number): number {
-  const fit = a4AspectScore(pageAspect(orderCorners(points)))
-  return area * (fit < 0 ? 0.35 : fit)
+function quadSize(points: Point[]): { width: number; height: number } {
+  const corners = orderCorners(points)
+  return {
+    width: (distance(corners.tl, corners.tr) + distance(corners.bl, corners.br)) / 2,
+    height: (distance(corners.tl, corners.bl) + distance(corners.tr, corners.br)) / 2,
+  }
+}
+
+/** Portrait half-page: about as wide as it is tall (fold used as the bottom edge). */
+function isFoldHalf(points: Point[]): boolean {
+  try {
+    const { width, height } = quadSize(points)
+    if (height >= width && height / Math.max(width, 1) < PORTRAIT_MIN_ASPECT) return true
+    return pageAspect(orderCorners(points)) < FOLD_ASPECT_MAX
+  } catch {
+    return true
+  }
+}
+
+function expandQuad(points: Point[], width: number, height: number, amount = OUTER_EXPAND): Point[] {
+  if (points.length !== 4) return points
+  const cx = points.reduce((sum, point) => sum + point.x, 0) / 4
+  const cy = points.reduce((sum, point) => sum + point.y, 0) / 4
+  const expanded = points.map((point) =>
+    clampPoint(
+      { x: point.x + (point.x - cx) * amount, y: point.y + (point.y - cy) * amount },
+      width,
+      height,
+    ),
+  )
+  try {
+    const corners = orderCorners(expanded)
+    if (!quadIsConvex(corners) || !cornersValid(corners, width, height)) return points
+    return [corners.tl, corners.tr, corners.br, corners.bl]
+  } catch {
+    return points
+  }
+}
+
+/**
+ * Prefer the outermost sheet. Drop square fold-halves when a taller portrait contour exists.
+ * Landscape tables win by area so the header and outer column borders stay inside.
+ */
+function chooseOuterQuad(candidates: Point[][], width: number, height: number): Point[] | null {
+  const quads: Point[][] = []
+  for (const points of candidates) {
+    if (points.length !== 4) continue
+    try {
+      const corners = orderCorners(points)
+      if (!quadLooksLikeSheet(corners, width, height)) continue
+      quads.push([corners.tl, corners.tr, corners.br, corners.bl])
+    } catch {
+      // skip a degenerate ring
+    }
+  }
+  if (!quads.length) return null
+
+  const hasTallPortrait = quads.some((quad) => {
+    const size = quadSize(quad)
+    return size.height > size.width * PORTRAIT_MIN_ASPECT
+  })
+  const pool = hasTallPortrait ? quads.filter((quad) => !isFoldHalf(quad)) : quads
+  const use = pool.length ? pool : quads
+
+  let best: Point[] | null = null
+  let bestScore = Number.NEGATIVE_INFINITY
+  for (const quad of use) {
+    const area = polygonArea(quad)
+    const ordered = orderCorners(quad)
+    const fit = a4AspectScore(pageAspect(ordered))
+    const size = quadSize(quad)
+    const tallBonus = size.height > size.width * PORTRAIT_MIN_ASPECT ? size.height : 0
+    const score = area * (1.5 + (fit < 0 ? 0 : fit)) + tallBonus
+    if (score > bestScore) {
+      bestScore = score
+      best = quad
+    }
+  }
+  return best
+}
+
+function pickOuterQuad(candidates: Point[][], width: number, height: number): Point[] | null {
+  const chosen = chooseOuterQuad(candidates, width, height)
+  return chosen ? expandQuad(chosen, width, height) : null
+}
+
+function quadsFromBinaryCv(cv: Cv, bin: MatBin, binary: CvMat, sample: Sample): Point[][] {
+  const contours = bin.keep(new cv.MatVector())
+  const hierarchy = bin.keep(new cv.Mat())
+  cv.findContours(binary, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+  const frame = sample.width * sample.height
+  const quads: Point[][] = []
+  for (let i = 0; i < contours.size(); i += 1) {
+    const contour = contours.get(i)
+    const hull = bin.keep(new cv.Mat())
+    cv.convexHull(contour, hull, false, true)
+    const area = cv.contourArea(hull)
+    if (area < frame * MIN_AREA || area > frame * MAX_AREA) continue
+    const accepted = acceptHullQuad(matPoints(hull), sample.width, sample.height)
+    if (accepted) quads.push(accepted)
+  }
+  return quads
+}
+
+function bridgeFoldsCv(cv: Cv, bin: MatBin, binary: CvMat): CvMat {
+  const vertical = bin.keep(cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(1, FOLD_BRIDGE)))
+  const bridged = bin.keep(new cv.Mat())
+  cv.morphologyEx(binary, bridged, cv.MORPH_CLOSE, vertical)
+  return bridged
 }
 
 /**
@@ -488,28 +599,10 @@ function findGradientHullCv(sample: Sample): Point[] | null {
     cv.morphologyEx(blur, grad, cv.MORPH_GRADIENT, kernel)
     const edges = bin.keep(new cv.Mat())
     cv.threshold(grad, edges, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
+    const bridged = bridgeFoldsCv(cv, bin, edges)
     const thick = bin.keep(new cv.Mat())
-    cv.dilate(edges, thick, kernel)
-    const contours = bin.keep(new cv.MatVector())
-    const hierarchy = bin.keep(new cv.Mat())
-    cv.findContours(thick, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-    const frame = sample.width * sample.height
-    let best: Point[] | null = null
-    let bestScore = 0
-    for (let i = 0; i < contours.size(); i += 1) {
-      const contour = contours.get(i)
-      const hull = bin.keep(new cv.Mat())
-      cv.convexHull(contour, hull, false, true)
-      const area = cv.contourArea(hull)
-      if (area < frame * MIN_AREA || area > frame * MAX_AREA) continue
-      const accepted = acceptHullQuad(matPoints(hull), sample.width, sample.height)
-      if (!accepted) continue
-      const score = scoreBrightQuad(accepted, area)
-      if (score <= bestScore) continue
-      best = accepted
-      bestScore = score
-    }
-    return best
+    cv.dilate(bridged, thick, kernel)
+    return chooseOuterQuad(quadsFromBinaryCv(cv, bin, thick, sample), sample.width, sample.height)
   } catch (error) {
     console.error(error)
     return null
@@ -530,29 +623,11 @@ function findBrightHullCv(sample: Sample): Point[] | null {
     cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0)
     const binary = bin.keep(new cv.Mat())
     cv.threshold(blur, binary, PAPER_LUMA_MIN, 255, cv.THRESH_BINARY)
+    const bridged = bridgeFoldsCv(cv, bin, binary)
     const kernel = bin.keep(cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(7, 7)))
     const closed = bin.keep(new cv.Mat())
-    cv.morphologyEx(binary, closed, cv.MORPH_CLOSE, kernel)
-    const contours = bin.keep(new cv.MatVector())
-    const hierarchy = bin.keep(new cv.Mat())
-    cv.findContours(closed, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-    const frame = sample.width * sample.height
-    let best: Point[] | null = null
-    let bestScore = 0
-    for (let i = 0; i < contours.size(); i += 1) {
-      const contour = contours.get(i)
-      const area = cv.contourArea(contour)
-      if (area < frame * MIN_AREA || area > frame * MAX_AREA) continue
-      const hull = bin.keep(new cv.Mat())
-      cv.convexHull(contour, hull, false, true)
-      const accepted = acceptHullQuad(matPoints(hull), sample.width, sample.height)
-      if (!accepted) continue
-      const score = scoreBrightQuad(accepted, area)
-      if (score <= bestScore) continue
-      best = accepted
-      bestScore = score
-    }
-    return best
+    cv.morphologyEx(bridged, closed, cv.MORPH_CLOSE, kernel)
+    return chooseOuterQuad(quadsFromBinaryCv(cv, bin, closed, sample), sample.width, sample.height)
   } catch (error) {
     console.error(error)
     return null
@@ -564,15 +639,15 @@ function findBrightHullCv(sample: Sample): Point[] | null {
 function bestQuadFromBinaryCv(cv: Cv, binary: CvMat, sample: Sample): Point[] | null {
   const bin = new MatBin()
   try {
+    const bridged = bridgeFoldsCv(cv, bin, binary)
     const kernel = bin.keep(cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(5, 5)))
     const closed = bin.keep(new cv.Mat())
-    cv.morphologyEx(binary, closed, cv.MORPH_CLOSE, kernel)
+    cv.morphologyEx(bridged, closed, cv.MORPH_CLOSE, kernel)
     const contours = bin.keep(new cv.MatVector())
     const hierarchy = bin.keep(new cv.Mat())
     cv.findContours(closed, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
     const frame = sample.width * sample.height
-    let best: Point[] | null = null
-    let bestScore = 0
+    const quads: Point[][] = []
     for (let i = 0; i < contours.size(); i += 1) {
       const contour = contours.get(i)
       const area = cv.contourArea(contour)
@@ -580,16 +655,9 @@ function bestQuadFromBinaryCv(cv: Cv, binary: CvMat, sample: Sample): Point[] | 
       const hull = bin.keep(new cv.Mat())
       cv.convexHull(contour, hull, false, true)
       const accepted = approxFourCv(cv, bin, hull, sample.width, sample.height)
-      if (!accepted) continue
-      const aspect = pageAspect(orderCorners(accepted))
-      const fit = a4AspectScore(aspect)
-      if (fit < 0) continue
-      const score = area * fit
-      if (score <= bestScore) continue
-      best = accepted
-      bestScore = score
+      if (accepted) quads.push(accepted)
     }
-    return best
+    return chooseOuterQuad(quads, sample.width, sample.height)
   } catch (error) {
     console.error(error)
     return null
@@ -667,8 +735,7 @@ function largestHullQuadFromMask(mask: Uint8Array, width: number, height: number
   const area = width * height
   const seen = new Uint8Array(mask.length)
   const stack = new Int32Array(mask.length)
-  let best: Point[] | null = null
-  let bestScore = 0
+  const quads: Point[][] = []
 
   for (let start = 0; start < mask.length; start += 1) {
     if (!mask[start] || seen[start]) continue
@@ -719,16 +786,14 @@ function largestHullQuadFromMask(mask: Uint8Array, width: number, height: number
     if (ratio < MIN_AREA || ratio > MAX_AREA) continue
     const accepted = acceptHullQuad(convexHull(ring), width, height)
     if (!accepted) continue
-    const score = scoreBrightQuad(accepted, count)
-    if (score <= bestScore) continue
-    best = accepted
-    bestScore = score
+    quads.push(accepted)
   }
-  return best
+  return chooseOuterQuad(quads, width, height)
 }
 
 function findBrightHullCanvas(sample: Sample): Point[] | null {
-  return largestHullQuadFromMask(close(lumaPaperMask(sample), sample.width, sample.height, 1), sample.width, sample.height)
+  const filled = close(lumaPaperMask(sample), sample.width, sample.height, 1)
+  return largestHullQuadFromMask(bridgeFolds(filled, sample.width, sample.height), sample.width, sample.height)
 }
 
 function morphGradient(gray: Float32Array, width: number, height: number): Float32Array {
@@ -778,8 +843,7 @@ function largestHullFromEdgeMask(mask: Uint8Array, width: number, height: number
   const frame = width * height
   const seen = new Uint8Array(mask.length)
   const stack = new Int32Array(mask.length)
-  let best: Point[] | null = null
-  let bestScore = 0
+  const quads: Point[][] = []
 
   for (let start = 0; start < mask.length; start += 1) {
     if (!mask[start] || seen[start]) continue
@@ -819,33 +883,59 @@ function largestHullFromEdgeMask(mask: Uint8Array, width: number, height: number
     if (!accepted) continue
     const area = polygonArea(accepted)
     if (area < frame * MIN_AREA || area > frame * MAX_AREA) continue
-    const score = scoreBrightQuad(accepted, area)
-    if (score <= bestScore) continue
-    best = accepted
-    bestScore = score
+    quads.push(accepted)
   }
-  return best
+  return chooseOuterQuad(quads, width, height)
+}
+
+function morphVertical(source: Uint8Array, width: number, height: number, radius: number, erode: boolean): Uint8Array {
+  const output = new Uint8Array(source.length)
+  for (let x = 0; x < width; x += 1) {
+    for (let y = 0; y < height; y += 1) {
+      let hit = erode ? 1 : 0
+      for (let k = -radius; k <= radius; k += 1) {
+        const ny = y + k
+        const value = ny < 0 || ny >= height ? (erode ? 1 : 0) : (source[ny * width + x] ?? 0)
+        if (erode ? value === 0 : value === 1) {
+          hit = erode ? 0 : 1
+          break
+        }
+      }
+      output[y * width + x] = hit
+    }
+  }
+  return output
+}
+
+function bridgeFolds(mask: Uint8Array, width: number, height: number): Uint8Array {
+  const radius = Math.max(1, Math.floor(FOLD_BRIDGE / 2))
+  return morphVertical(morphVertical(mask, width, height, radius, false), width, height, radius, true)
 }
 
 function findGradientHullCanvas(sample: Sample): Point[] | null {
   const gray = lumaOf(sample)
   const grad = morphGradient(gray, sample.width, sample.height)
-  const edges = morph(thresholdGradient(grad), sample.width, sample.height, 1, false)
+  const edges = bridgeFolds(morph(thresholdGradient(grad), sample.width, sample.height, 1, false), sample.width, sample.height)
   return largestHullFromEdgeMask(edges, sample.width, sample.height)
 }
 
 function findPaperQuad(sample: Sample): Point[] | null {
-  if (isOpenCvReady()) {
-    const found =
-      findGradientHullCv(sample) ?? findBrightHullCv(sample) ?? findThresholdQuadCv(sample) ?? findCannyQuadCv(sample)
-    if (found) return found
+  const collected: Point[][] = []
+  const take = (found: Point[] | null) => {
+    if (found) collected.push(found)
   }
-  return (
-    findGradientHullCanvas(sample) ??
-    findBrightHullCanvas(sample) ??
-    findThresholdQuadCanvas(sample) ??
-    findCannyQuadCanvas(sample)
-  )
+  if (isOpenCvReady()) {
+    take(findGradientHullCv(sample))
+    take(findBrightHullCv(sample))
+    take(findThresholdQuadCv(sample))
+    take(findCannyQuadCv(sample))
+  } else {
+    take(findGradientHullCanvas(sample))
+    take(findBrightHullCanvas(sample))
+    take(findThresholdQuadCanvas(sample))
+    take(findCannyQuadCanvas(sample))
+  }
+  return pickOuterQuad(collected, sample.width, sample.height)
 }
 
 type Line = { slope: number; offset: number }
@@ -1518,10 +1608,8 @@ export function detectDocumentCorners(
     if (!points && fallback) points = fallback.points
     if (points) {
       const raw = orderCorners(points.map((point) => scaleUp(point, sample.width, sample.height, width, height)))
-      const tightened = orderCorners(
-        tightenQuad(sample, points).map((point) => scaleUp(point, sample.width, sample.height, width, height)),
-      )
-      if (sheetCornersOk(tightened, width, height)) return { corners: tightened, detected: true }
+      const outer = orderCorners(expandQuad([raw.tl, raw.tr, raw.br, raw.bl], width, height))
+      if (sheetCornersOk(outer, width, height)) return { corners: outer, detected: true }
       if (sheetCornersOk(raw, width, height)) return { corners: raw, detected: true }
     }
     return missed
