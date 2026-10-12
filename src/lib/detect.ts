@@ -470,6 +470,54 @@ function scoreBrightQuad(points: Point[], area: number): number {
   return area * (fit < 0 ? 0.35 : fit)
 }
 
+/**
+ * Morphological gradient (dilate − erode, 3×3) finds the paper border when the desk
+ * is almost as bright as the sheet. Hull area, not thin-ring pixel count, is the gate.
+ */
+function findGradientHullCv(sample: Sample): Point[] | null {
+  const cv = getCv()
+  const bin = new MatBin()
+  try {
+    const src = bin.keep(cv.imread(sample.canvas))
+    const gray = bin.keep(new cv.Mat())
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY)
+    const blur = bin.keep(new cv.Mat())
+    cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0)
+    const kernel = bin.keep(cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3)))
+    const grad = bin.keep(new cv.Mat())
+    cv.morphologyEx(blur, grad, cv.MORPH_GRADIENT, kernel)
+    const edges = bin.keep(new cv.Mat())
+    cv.threshold(grad, edges, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
+    const thick = bin.keep(new cv.Mat())
+    cv.dilate(edges, thick, kernel)
+    const contours = bin.keep(new cv.MatVector())
+    const hierarchy = bin.keep(new cv.Mat())
+    cv.findContours(thick, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+    const frame = sample.width * sample.height
+    let best: Point[] | null = null
+    let bestScore = 0
+    for (let i = 0; i < contours.size(); i += 1) {
+      const contour = contours.get(i)
+      const hull = bin.keep(new cv.Mat())
+      cv.convexHull(contour, hull, false, true)
+      const area = cv.contourArea(hull)
+      if (area < frame * MIN_AREA || area > frame * MAX_AREA) continue
+      const accepted = acceptHullQuad(matPoints(hull), sample.width, sample.height)
+      if (!accepted) continue
+      const score = scoreBrightQuad(accepted, area)
+      if (score <= bestScore) continue
+      best = accepted
+      bestScore = score
+    }
+    return best
+  } catch (error) {
+    console.error(error)
+    return null
+  } finally {
+    bin.release()
+  }
+}
+
 /** Paper luma > 130 vs black keyboard/desk. Largest hull, four extrema — never requires a 4-gon. */
 function findBrightHullCv(sample: Sample): Point[] | null {
   const cv = getCv()
@@ -683,12 +731,121 @@ function findBrightHullCanvas(sample: Sample): Point[] | null {
   return largestHullQuadFromMask(close(lumaPaperMask(sample), sample.width, sample.height, 1), sample.width, sample.height)
 }
 
+function morphGradient(gray: Float32Array, width: number, height: number): Float32Array {
+  const dilated = rankFilter(gray, width, height, 1, true)
+  const eroded = rankFilter(gray, width, height, 1, false)
+  const out = new Float32Array(gray.length)
+  for (let i = 0; i < gray.length; i += 1) out[i] = (dilated[i] ?? 0) - (eroded[i] ?? 0)
+  return out
+}
+
+function thresholdGradient(grad: Float32Array): Uint8Array {
+  const histogram = new Float64Array(256)
+  for (let i = 0; i < grad.length; i += 1) {
+    const value = Math.max(0, Math.min(255, Math.round(grad[i] ?? 0)))
+    histogram[value] += 1
+  }
+  const total = grad.length
+  let sumAll = 0
+  for (let level = 0; level < 256; level += 1) sumAll += level * (histogram[level] ?? 0)
+  let weightBack = 0
+  let sumBack = 0
+  let best = -1
+  let threshold = 16
+  for (let level = 0; level < 256; level += 1) {
+    weightBack += histogram[level] ?? 0
+    if (weightBack === 0) continue
+    const weightFront = total - weightBack
+    if (weightFront === 0) break
+    sumBack += level * (histogram[level] ?? 0)
+    const meanBack = sumBack / weightBack
+    const meanFront = (sumAll - sumBack) / weightFront
+    const between = weightBack * weightFront * (meanBack - meanFront) ** 2
+    if (between > best) {
+      best = between
+      threshold = level
+    }
+  }
+  const mask = new Uint8Array(grad.length)
+  for (let i = 0; i < grad.length; i += 1) {
+    if ((grad[i] ?? 0) > threshold) mask[i] = 1
+  }
+  return mask
+}
+
+/** Edge-ring blobs: gate on hull area, not the thin stroke's pixel count. */
+function largestHullFromEdgeMask(mask: Uint8Array, width: number, height: number): Point[] | null {
+  const frame = width * height
+  const seen = new Uint8Array(mask.length)
+  const stack = new Int32Array(mask.length)
+  let best: Point[] | null = null
+  let bestScore = 0
+
+  for (let start = 0; start < mask.length; start += 1) {
+    if (!mask[start] || seen[start]) continue
+    let top = 0
+    stack[top] = start
+    top += 1
+    seen[start] = 1
+    const ring: Point[] = []
+    while (top > 0) {
+      top -= 1
+      const index = stack[top] ?? 0
+      const x = index % width
+      const y = (index - x) / width
+      ring.push({ x, y })
+      if (x > 0 && mask[index - 1] && !seen[index - 1]) {
+        seen[index - 1] = 1
+        stack[top] = index - 1
+        top += 1
+      }
+      if (x < width - 1 && mask[index + 1] && !seen[index + 1]) {
+        seen[index + 1] = 1
+        stack[top] = index + 1
+        top += 1
+      }
+      if (y > 0 && mask[index - width] && !seen[index - width]) {
+        seen[index - width] = 1
+        stack[top] = index - width
+        top += 1
+      }
+      if (y < height - 1 && mask[index + width] && !seen[index + width]) {
+        seen[index + width] = 1
+        stack[top] = index + width
+        top += 1
+      }
+    }
+    const accepted = acceptHullQuad(convexHull(ring), width, height)
+    if (!accepted) continue
+    const area = polygonArea(accepted)
+    if (area < frame * MIN_AREA || area > frame * MAX_AREA) continue
+    const score = scoreBrightQuad(accepted, area)
+    if (score <= bestScore) continue
+    best = accepted
+    bestScore = score
+  }
+  return best
+}
+
+function findGradientHullCanvas(sample: Sample): Point[] | null {
+  const gray = lumaOf(sample)
+  const grad = morphGradient(gray, sample.width, sample.height)
+  const edges = morph(thresholdGradient(grad), sample.width, sample.height, 1, false)
+  return largestHullFromEdgeMask(edges, sample.width, sample.height)
+}
+
 function findPaperQuad(sample: Sample): Point[] | null {
   if (isOpenCvReady()) {
-    const found = findBrightHullCv(sample) ?? findThresholdQuadCv(sample) ?? findCannyQuadCv(sample)
+    const found =
+      findGradientHullCv(sample) ?? findBrightHullCv(sample) ?? findThresholdQuadCv(sample) ?? findCannyQuadCv(sample)
     if (found) return found
   }
-  return findBrightHullCanvas(sample) ?? findThresholdQuadCanvas(sample) ?? findCannyQuadCanvas(sample)
+  return (
+    findGradientHullCanvas(sample) ??
+    findBrightHullCanvas(sample) ??
+    findThresholdQuadCanvas(sample) ??
+    findCannyQuadCanvas(sample)
+  )
 }
 
 type Line = { slope: number; offset: number }

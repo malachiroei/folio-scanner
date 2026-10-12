@@ -203,16 +203,34 @@ export function outputSize(corners: Corners): { width: number; height: number } 
 }
 
 /**
- * Maps live-preview corners (unit 0..1 of the video frame) onto the captured photo.
- * Always: photoPoint = { x: nx * photoWidth, y: ny * photoHeight }. Never rejects.
+ * Maps live-preview corners (unit 0..1 of the rendered video frame) onto the photo.
+ * When the still is a different aspect (full-sensor 4:3 vs 16:9 preview), the video
+ * is treated as a center crop of the photo so the orange box does not expand.
  */
 export function mapLiveCorners(hint: CaptureHint, width: number, height: number): Corners | null {
   if (width < 1 || height < 1) return null
+  const videoAspect = hint.aspect > 0 ? hint.aspect : width / Math.max(1, height)
+  const photoAspect = width / height
+  let originX = 0
+  let originY = 0
+  let scaleW = width
+  let scaleH = height
+  if (Math.abs(photoAspect - videoAspect) > 0.04) {
+    if (photoAspect > videoAspect) {
+      scaleH = height
+      scaleW = height * videoAspect
+      originX = (width - scaleW) / 2
+    } else {
+      scaleW = width
+      scaleH = width / videoAspect
+      originY = (height - scaleH) / 2
+    }
+  }
   const place = (point: Point): Point => {
     const nx = hint.mirrored ? 1 - point.x : point.x
     return {
-      x: clamp(nx * width, 0, width),
-      y: clamp(point.y * height, 0, height),
+      x: clamp(originX + nx * scaleW, 0, width),
+      y: clamp(originY + point.y * scaleH, 0, height),
     }
   }
   const tl = place(hint.corners.tl)

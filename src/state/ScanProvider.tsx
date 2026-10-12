@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { detectDocumentCorners, refineToPaper, sheetCornersOk } from '../lib/detect'
 import { cornersValid, fullFrameCorners, mapLiveCorners } from '../lib/geometry'
+import { clearLiveLock, consumeLiveLock } from '../lib/live-lock'
 import { isOpenCvReady, loadOpenCv } from '../lib/opencv'
 import {
   canvasToJpegBlob,
@@ -271,8 +272,10 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     try {
       normalized = await normalizeImage(blob)
       detectGen.current += 1
-      // Frozen orange-box corners only. Never re-detect or substitute the 10% dummy box.
-      const live = hint ? mapLiveCorners(hint, normalized.width, normalized.height) : null
+      const frozen = hint ?? consumeLiveLock()
+      if (hint) consumeLiveLock()
+      console.log('Passing corners to crop screen:', frozen?.corners ?? null)
+      const live = frozen ? mapLiveCorners(frozen, normalized.width, normalized.height) : null
       userAdjustedRef.current = live !== null
       const next = {
         sourceUrl: normalized.url,
@@ -305,6 +308,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
       setToast('בחר תמונת JPEG, PNG או WebP.')
       return
     }
+    clearLiveLock()
     void ingestBlob(file)
   }
 
@@ -1083,8 +1087,14 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     draft,
     preview,
     selectedId,
-    openCamera: () => setScreen('camera'),
-    closeCamera: () => setScreen('home'),
+    openCamera: () => {
+      clearLiveLock()
+      setScreen('camera')
+    },
+    closeCamera: () => {
+      clearLiveLock()
+      setScreen('home')
+    },
     ingestFile,
     ingestBlob,
     updateCorners,

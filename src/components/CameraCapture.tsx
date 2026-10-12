@@ -1,6 +1,7 @@
 import { Images, SwitchCamera, X } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { detectDocumentCorners } from '../lib/detect'
+import { peekLiveLock, rememberLiveLock } from '../lib/live-lock'
 import { useScan } from '../state/scan-context'
 import type { CaptureHint, Corners } from '../types'
 
@@ -86,6 +87,7 @@ export function CameraCapture() {
           }
           quadRef.current = current
           setQuad(current)
+          rememberLiveLock(unitHintFromLive(current, false))
         } else {
           misses += 1
           if (misses >= LIVE_MISSES_BEFORE_CLEAR && current) {
@@ -205,14 +207,11 @@ export function CameraCapture() {
     }
   }
 
-  /**
-   * Freeze the orange box as unit 0..1 of the video frame. Copied by value before the
-   * (slow) photo so crop-screen pins are exactly the lock the user saw.
-   */
-  function freezeLiveHint(mirrored: boolean): CaptureHint | undefined {
-    const live = quadRef.current
-    if (!live || live.width < 1 || live.height < 1) return undefined
-    const unit = (point: { x: number; y: number }) => ({ x: point.x / live.width, y: point.y / live.height })
+  function unitHintFromLive(live: LiveQuad, mirrored: boolean): CaptureHint {
+    const unit = (point: { x: number; y: number }) => ({
+      x: point.x / live.width,
+      y: point.y / live.height,
+    })
     return {
       corners: {
         tl: unit(live.corners.tl),
@@ -225,17 +224,38 @@ export function CameraCapture() {
     }
   }
 
+  /**
+   * Freeze the orange box as unit 0..1 of the video frame. Copied by value before the
+   * photo so crop-screen pins are exactly the lock the user saw.
+   */
+  function freezeLiveHint(mirrored: boolean): CaptureHint | undefined {
+    const live = quadRef.current
+    const hint = live && live.width > 0 && live.height > 0 ? unitHintFromLive(live, mirrored) : (peekLiveLock() ?? undefined)
+    if (hint) {
+      rememberLiveLock(hint)
+      console.log('Passing corners to crop screen:', hint.corners)
+    } else {
+      console.warn('Passing corners to crop screen:', null)
+    }
+    return hint
+  }
+
   async function capture() {
     if (capturing) return
     setCapturing(true)
     const hint = freezeLiveHint(false)
     try {
-      const photo = await takeSensorPhoto()
-      if (photo && photo.size > 0) {
-        ingestBlob(photo, hint)
+      if (hint) {
+        // Same pixels as the orange box so crop pins cannot miss the lock.
+        captureFrame(facing === 'user' ? { ...hint, mirrored: true } : hint)
         return
       }
-      captureFrame(hint && facing === 'user' ? { ...hint, mirrored: true } : hint)
+      const photo = await takeSensorPhoto()
+      if (photo && photo.size > 0) {
+        ingestBlob(photo)
+        return
+      }
+      captureFrame()
     } finally {
       setCapturing(false)
     }

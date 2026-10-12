@@ -1,6 +1,6 @@
 import { ChevronLeft, ChevronRight, Expand, RotateCcw } from 'lucide-react'
 import { useEffect, useLayoutEffect, useRef, useState, type PointerEvent } from 'react'
-import { CORNER_KEYS, cornersValid, defaultCorners, lerpCorners } from '../lib/geometry'
+import { CORNER_KEYS, cornersValid, lerpCorners } from '../lib/geometry'
 import { useScan } from '../state/scan-context'
 import type { CornerKey, Corners, Point } from '../types'
 import { Button } from './Button'
@@ -40,15 +40,15 @@ export function CornerEditor() {
   const frameRef = useRef<HTMLDivElement>(null)
   const imageRef = useRef<HTMLImageElement>(null)
   const loupeCanvasRef = useRef<HTMLCanvasElement>(null)
-  const cornersRef = useRef<Corners | null>(null)
-  const visualRef = useRef<Corners | null>(null)
+  const cornersRef = useRef<Corners | null>(draft?.corners ?? null)
+  const visualRef = useRef<Corners | null>(draft?.corners ?? null)
   const dragKey = useRef<CornerKey | null>(null)
   const dragged = useRef(false)
   const seenSnap = useRef(0)
   const pageRef = useRef(draft)
   const animRef = useRef(0)
   const animSettled = useRef(false)
-  const [visual, setVisual] = useState<Corners | null>(null)
+  const [visual, setVisual] = useState<Corners | null>(draft?.corners ?? null)
   const [stage, setStage] = useState({ w: 0, h: 0 })
   const [active, setActive] = useState<CornerKey | null>(null)
   const [loupe, setLoupe] = useState<Loupe | null>(null)
@@ -59,7 +59,8 @@ export function CornerEditor() {
 
   useLayoutEffect(() => {
     pageRef.current = draft
-    if (!draft?.corners || draft.snapToken !== seenSnap.current || dragKey.current) return
+    if (!draft?.corners || dragKey.current) return
+    if (draft.snapToken !== 0 && draft.snapToken !== seenSnap.current) return
     cancelAnimationFrame(animRef.current)
     animRef.current = 0
     animSettled.current = true
@@ -82,7 +83,7 @@ export function CornerEditor() {
       return
     }
     animSettled.current = false
-    const from = visualRef.current ?? defaultCorners(page.width, page.height, 0.1)
+    const from = visualRef.current ?? page.corners
     visualRef.current = from
     cornersRef.current = from
     setVisual(from)
