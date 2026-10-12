@@ -39,7 +39,7 @@ const MIN_EDGE = 2800
 const MAX_EDGE = 3508
 const MAX_UPSCALE = 3
 /** Destination mesh density: piecewise affine cells approximate the homography without seams. */
-const WARP_GRID = 40
+const WARP_GRID = 48
 
 /** CamScanner Magic Color: continuous-tone color. Never a 1-bit binary threshold. */
 const LIGHT_GRID = 16
@@ -47,23 +47,27 @@ const LIGHT_PERCENTILE = 0.95
 const LIGHT_BLUR_PASSES = 4
 const LIGHT_FLOOR = 0.85
 const FLAT_TARGET = 255
-const WHITE_KNEE = 224
-const SAT_BOOST = 1.4
+const WHITE_KNEE = 232
+const SAT_BOOST = 1.45
 const PAPER_LUMA = 210
 const PAPER_SAT = 0.045
-const SHARPEN_AMOUNT = 1.35
-const PHOTO_SHARP = 1.2
-const PHOTO_WINDOW = 160
-const PHOTO_MEAN_LO = 48
-const PHOTO_MEAN_HI = 198
-const PHOTO_STD = 14
-/** Large-window ink pull: faint table type vs local paper. Already-dark ink is left alone. */
-const INK_WINDOW = 32
+const SHARPEN_AMOUNT = 1.55
+const SHARPEN_NOISE = 0.85
+const PHOTO_SHARP = 1.7
+const PHOTO_SHADOW = 1.28
+const PHOTO_WINDOW = 140
+const PHOTO_MEAN_LO = 28
+const PHOTO_MEAN_HI = 244
+const PHOTO_STD = 8
+const PHOTO_FRAC = 0.32
+const PHOTO_FLAT = 0.4
+const INK_WINDOW = 28
 const INK_GATE = 12
-const INK_GAIN_FAINT = 2.3
-const INK_GAIN_SOLID = 1.05
-const INK_DARK_SKIP = 92
-const INK_PAPER_MEAN = 214
+const INK_GAIN = 1.72
+const INK_DARK_SKIP = 88
+const INK_STD_GAIN = 1.25
+const INK_PAPER_LIFT = 12
+const INK_PHOTO_FRAC = 0.36
 const INK_MAX_SAT = 0.16
 const YIELD_MS = 24
 
@@ -628,6 +632,8 @@ async function whiteBalanceRgb(
 ) {
   const fields = illuminationRgb(data, width, height)
   await yieldBusy(clock)
+  const planes = buildPhotoPlanes(data, width, height)
+  const radius = Math.max(12, Math.round(width / 18))
   const floorR = fields.paperR * LIGHT_FLOOR
   const floorG = fields.paperG * LIGHT_FLOOR
   const floorB = fields.paperB * LIGHT_FLOOR
@@ -638,9 +644,21 @@ async function whiteBalanceRgb(
       const bgR = Math.max(sampleGrid(fields.gridR, x, y, width, height), floorR)
       const bgG = Math.max(sampleGrid(fields.gridG, x, y, width, height), floorG)
       const bgB = Math.max(sampleGrid(fields.gridB, x, y, width, height), floorB)
-      data[i] = flattenChannel(data[i] ?? 0, bgR)
-      data[i + 1] = flattenChannel(data[i + 1] ?? 0, bgG)
-      data[i + 2] = flattenChannel(data[i + 2] ?? 0, bgB)
+      const flatR = flattenChannel(data[i] ?? 0, bgR)
+      const flatG = flattenChannel(data[i + 1] ?? 0, bgG)
+      const flatB = flattenChannel(data[i + 2] ?? 0, bgB)
+      const { std } = neighborhood(planes.sum, planes.sq, planes.iw, x, y, radius, width, height)
+      const frac = boxFraction(planes.mid, planes.iw, x, y, radius, width, height)
+      if (isPhotoRegion(frac, std)) {
+        const keep = 1 - PHOTO_FLAT
+        data[i] = clamp255((data[i] ?? 0) * keep + flatR * PHOTO_FLAT)
+        data[i + 1] = clamp255((data[i + 1] ?? 0) * keep + flatG * PHOTO_FLAT)
+        data[i + 2] = clamp255((data[i + 2] ?? 0) * keep + flatB * PHOTO_FLAT)
+      } else {
+        data[i] = flatR
+        data[i + 1] = flatG
+        data[i + 2] = flatB
+      }
       data[i + 3] = 255
     }
   }
@@ -661,11 +679,51 @@ function neighborhood(
   const x1 = Math.min(width, x + radius + 1)
   const y1 = Math.min(height, y + radius + 1)
   const n = (x1 - x0) * (y1 - y0)
-  if (n < 1) return { mean: 255, std: 0 }
+  if (n < 1) return { mean: 255, std: 0, n: 0 }
   const mean = boxSum(sum, iw, x0, y0, x1, y1) / n
   const moment = boxSum(sq, iw, x0, y0, x1, y1) / n
   const variance = moment - mean * mean
-  return { mean, std: Math.sqrt(variance > 0 ? variance : 0) }
+  return { mean, std: Math.sqrt(variance > 0 ? variance : 0), n }
+}
+
+function boxFraction(
+  flags: Float64Array,
+  iw: number,
+  x: number,
+  y: number,
+  radius: number,
+  width: number,
+  height: number,
+) {
+  const x0 = Math.max(0, x - radius)
+  const y0 = Math.max(0, y - radius)
+  const x1 = Math.min(width, x + radius + 1)
+  const y1 = Math.min(height, y + radius + 1)
+  const n = (x1 - x0) * (y1 - y0)
+  if (n < 1) return 0
+  return boxSum(flags, iw, x0, y0, x1, y1) / n
+}
+
+/** Midtone occupancy in a large window: photos are mostly 50–220; type on paper is not. */
+function buildPhotoPlanes(data: Uint8ClampedArray, width: number, height: number) {
+  const luma = new Float32Array(width * height)
+  const mid = new Float32Array(width * height)
+  for (let p = 0, i = 0; p < luma.length; p += 1, i += 4) {
+    const tone = pixelLuma(data[i] ?? 0, data[i + 1] ?? 0, data[i + 2] ?? 0)
+    luma[p] = tone
+    mid[p] = tone > 50 && tone < 220 ? 1 : 0
+  }
+  return {
+    luma,
+    sum: integralPlane(luma, width, height, false),
+    sq: integralPlane(luma, width, height, true),
+    mid: integralPlane(mid, width, height, false),
+    iw: width + 1,
+  }
+}
+
+function isPhotoRegion(frac: number, std: number, threshold = PHOTO_FRAC) {
+  return frac >= threshold && std >= PHOTO_STD
 }
 
 function writeLuma(data: Uint8ClampedArray, i: number, red: number, green: number, blue: number, fromL: number, toL: number) {
@@ -683,14 +741,9 @@ async function punchPhotos(
   height: number,
   clock: { last: number },
 ) {
-  const luma = new Float32Array(width * height)
-  for (let p = 0, i = 0; p < luma.length; p += 1, i += 4) {
-    luma[p] = pixelLuma(data[i] ?? 0, data[i + 1] ?? 0, data[i + 2] ?? 0)
-  }
-  const sum = integralPlane(luma, width, height, false)
-  const sq = integralPlane(luma, width, height, true)
-  const iw = width + 1
+  const planes = buildPhotoPlanes(data, width, height)
   const radius = Math.max(4, Math.round(width / PHOTO_WINDOW))
+  const photoRadius = Math.max(14, Math.round(width / 18))
   await yieldBusy(clock)
 
   for (let y = 0; y < height; y += 1) {
@@ -698,10 +751,17 @@ async function punchPhotos(
     const row = y * width
     let i = row * 4
     for (let x = 0; x < width; x += 1, i += 4) {
-      const { mean, std } = neighborhood(sum, sq, iw, x, y, radius, width, height)
-      if (mean < PHOTO_MEAN_LO || mean > PHOTO_MEAN_HI || std < PHOTO_STD) continue
-      const tone = luma[row + x] ?? 0
-      const next = tone + PHOTO_SHARP * (tone - mean)
+      const local = neighborhood(planes.sum, planes.sq, planes.iw, x, y, radius, width, height)
+      const wide = neighborhood(planes.sum, planes.sq, planes.iw, x, y, photoRadius, width, height)
+      const frac = boxFraction(planes.mid, planes.iw, x, y, photoRadius, width, height)
+      const photo = isPhotoRegion(frac, wide.std)
+      const range =
+        local.mean >= PHOTO_MEAN_LO && local.mean <= PHOTO_MEAN_HI && local.std >= PHOTO_STD
+      if (!photo && !range) continue
+      const tone = planes.luma[row + x] ?? 0
+      const delta = tone - local.mean
+      const amount = delta < 0 ? PHOTO_SHARP * PHOTO_SHADOW : PHOTO_SHARP
+      const next = tone + amount * delta
       writeLuma(data, i, data[i] ?? 0, data[i + 1] ?? 0, data[i + 2] ?? 0, tone, next)
     }
   }
@@ -709,7 +769,7 @@ async function punchPhotos(
 
 /**
  * Darken only *faint* printed ink vs local paper. Already-dark body text is skipped so
- * strokes do not blob. Photos and yellow plates are skipped.
+ * strokes do not blob. Photos, yellow plates, and gray table fills are skipped.
  */
 async function boostPrintedInk(
   data: Uint8ClampedArray,
@@ -717,13 +777,9 @@ async function boostPrintedInk(
   height: number,
   clock: { last: number },
 ) {
-  const luma = new Float32Array(width * height)
-  for (let p = 0, i = 0; p < luma.length; p += 1, i += 4) {
-    luma[p] = pixelLuma(data[i] ?? 0, data[i + 1] ?? 0, data[i + 2] ?? 0)
-  }
-  const sum = integralPlane(luma, width, height, false)
-  const iw = width + 1
+  const planes = buildPhotoPlanes(data, width, height)
   const radius = Math.max(9, Math.round(width / INK_WINDOW))
+  const photoRadius = Math.max(14, Math.round(width / 18))
   await yieldBusy(clock)
 
   for (let y = 0; y < height; y += 1) {
@@ -734,22 +790,17 @@ async function boostPrintedInk(
       const red = data[i] ?? 0
       const green = data[i + 1] ?? 0
       const blue = data[i + 2] ?? 0
-      const tone = luma[row + x] ?? 0
+      const tone = planes.luma[row + x] ?? 0
       if (tone < INK_DARK_SKIP) continue
       if (pixelSat(red, green, blue) > INK_MAX_SAT) continue
-      const x0 = Math.max(0, x - radius)
-      const y0 = Math.max(0, y - radius)
-      const x1 = Math.min(width, x + radius + 1)
-      const y1 = Math.min(height, y + radius + 1)
-      const n = (x1 - x0) * (y1 - y0)
-      if (n < 1) continue
-      const mean = boxSum(sum, iw, x0, y0, x1, y1) / n
-      if (mean < INK_PAPER_MEAN) continue
-      const deficit = mean - tone
+      const { mean, std } = neighborhood(planes.sum, planes.sq, planes.iw, x, y, radius, width, height)
+      if (mean - tone < 6) continue
+      const frac = boxFraction(planes.mid, planes.iw, x, y, photoRadius, width, height)
+      if (isPhotoRegion(frac, std, INK_PHOTO_FRAC)) continue
+      const paper = Math.min(255, mean + Math.max(INK_PAPER_LIFT, INK_STD_GAIN * std))
+      const deficit = paper - tone
       if (deficit < INK_GATE) continue
-      const t = deficit > 55 ? 1 : Math.max(0, (deficit - INK_GATE) / (55 - INK_GATE))
-      const gain = INK_GAIN_FAINT * (1 - t) + INK_GAIN_SOLID * t
-      const next = Math.max(24, tone - gain * deficit)
+      const next = Math.max(26, tone - INK_GAIN * deficit)
       writeLuma(data, i, red, green, blue, tone, next)
     }
   }
@@ -762,6 +813,8 @@ async function applyLevelsAndKnee(
   height: number,
   clock: { last: number },
 ) {
+  const planes = buildPhotoPlanes(data, width, height)
+  const photoRadius = Math.max(14, Math.round(width / 18))
   const span = 255 - WHITE_KNEE
   for (let y = 0; y < height; y += 1) {
     if (y % 48 === 0) await yieldBusy(clock)
@@ -770,8 +823,11 @@ async function applyLevelsAndKnee(
       let red = data[i] ?? 0
       let green = data[i + 1] ?? 0
       let blue = data[i + 2] ?? 0
-      let luma = pixelLuma(red, green, blue)
-      if (luma > WHITE_KNEE) {
+      let luma = planes.luma[y * width + x] ?? pixelLuma(red, green, blue)
+      const { std } = neighborhood(planes.sum, planes.sq, planes.iw, x, y, photoRadius, width, height)
+      const frac = boxFraction(planes.mid, planes.iw, x, y, photoRadius, width, height)
+      const photo = isPhotoRegion(frac, std)
+      if (!photo && luma > WHITE_KNEE) {
         const t = (luma - WHITE_KNEE) / span
         const ease = t * t * (3 - 2 * t)
         red += (255 - red) * ease
@@ -779,7 +835,7 @@ async function applyLevelsAndKnee(
         blue += (255 - blue) * ease
         luma = pixelLuma(red, green, blue)
       }
-      const mapped = TONE_LUT[Math.round(luma)] ?? luma
+      const mapped = photo ? luma : (TONE_LUT[Math.round(luma)] ?? luma)
       const next = scaleToLuma(red, green, blue, luma, mapped)
       data[i] = clamp255(next[0])
       data[i + 1] = clamp255(next[1])
@@ -811,7 +867,9 @@ function sharpenLuma(image: ImageData, amount: number) {
           (gray[p + width] ?? 0) +
           (gray[p + width + 1] ?? 0)) /
         9
-      const sharp = center + amount * (center - blur)
+      const delta = center - blur
+      if (Math.abs(delta) < SHARPEN_NOISE) continue
+      const sharp = center + amount * delta
       const lift = center > 1 ? sharp / center : 1
       const i = p * 4
       data[i] = clamp255((data[i] ?? 0) * lift)
