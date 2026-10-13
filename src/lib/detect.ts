@@ -1,9 +1,12 @@
 import type { Corners, Point } from '../types'
+import { cornersArea, orderCorners, quadIsConvex } from './geometry'
 
 const DETECT_WIDTH = 240
+const SNAP_WIDTH = 320
 const MIN_AREA = 0.08
 const MAX_AREA = 0.88
 const MARGIN = 0.06
+const DARK_ROW = 85
 
 const sample = document.createElement('canvas')
 const sampleCtx = sample.getContext('2d', { willReadFrequently: true })
@@ -16,16 +19,21 @@ function sourceSize(source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElem
   return { width: source.width, height: source.height }
 }
 
-function grabFrame(source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElement): ImageData | null {
+function grabFrame(
+  source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElement,
+  maxWidth = DETECT_WIDTH,
+  smooth = false,
+): ImageData | null {
   if (!sampleCtx) return null
   const { width: sw, height: sh } = sourceSize(source)
   if (sw < 8 || sh < 8) return null
-  const scale = Math.min(1, DETECT_WIDTH / sw)
+  const scale = Math.min(1, maxWidth / sw)
   const width = Math.max(1, Math.round(sw * scale))
   const height = Math.max(1, Math.round(sh * scale))
   if (sample.width !== width) sample.width = width
   if (sample.height !== height) sample.height = height
-  sampleCtx.imageSmoothingEnabled = false
+  sampleCtx.imageSmoothingEnabled = smooth
+  if (smooth) sampleCtx.imageSmoothingQuality = 'high'
   sampleCtx.drawImage(source, 0, 0, width, height)
   return sampleCtx.getImageData(0, 0, width, height)
 }
@@ -204,6 +212,211 @@ export function detectDocumentCorners(
     return toUnit(expand(blob.corners, width, height, MARGIN), width, height)
   } catch (err) {
     console.warn('Detection failed:', err)
+    return null
+  }
+}
+
+type Box = { minX: number; minY: number; maxX: number; maxY: number }
+
+function seedBox(seed: Corners, width: number, height: number): Box {
+  const xs = [seed.tl.x, seed.tr.x, seed.br.x, seed.bl.x]
+  const ys = [seed.tl.y, seed.tr.y, seed.br.y, seed.bl.y]
+  const padX = Math.max(2, (Math.max(...xs) - Math.min(...xs)) * 0.02)
+  const padY = Math.max(2, (Math.max(...ys) - Math.min(...ys)) * 0.02)
+  return {
+    minX: Math.max(0, Math.floor(Math.min(...xs) - padX)),
+    minY: Math.max(0, Math.floor(Math.min(...ys) - padY)),
+    maxX: Math.min(width - 1, Math.ceil(Math.max(...xs) + padX)),
+    maxY: Math.min(height - 1, Math.ceil(Math.max(...ys) + padY)),
+  }
+}
+
+function blurGray(gray: Uint8Array, width: number, height: number): Uint8Array {
+  const out = new Uint8Array(gray.length)
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      let sum = 0
+      let count = 0
+      for (let dy = -1; dy <= 1; dy += 1) {
+        const yy = y + dy
+        if (yy < 0 || yy >= height) continue
+        const row = yy * width
+        for (let dx = -1; dx <= 1; dx += 1) {
+          const xx = x + dx
+          if (xx < 0 || xx >= width) continue
+          sum += gray[row + xx] ?? 0
+          count += 1
+        }
+      }
+      out[y * width + x] = count ? (sum / count) | 0 : (gray[y * width + x] ?? 0)
+    }
+  }
+  return out
+}
+
+function fitLinear(indep: number[], dep: number[]): { a: number; b: number } | null {
+  const fit = (idx: number[]) => {
+    const n = idx.length
+    if (n < 8) return null
+    let sumX = 0
+    let sumY = 0
+    let sumXX = 0
+    let sumXY = 0
+    for (const i of idx) {
+      const x = indep[i] ?? 0
+      const y = dep[i] ?? 0
+      sumX += x
+      sumY += y
+      sumXX += x * x
+      sumXY += x * y
+    }
+    const denom = n * sumXX - sumX * sumX
+    if (Math.abs(denom) < 1e-6) return { a: 0, b: sumY / n }
+    const a = (n * sumXY - sumX * sumY) / denom
+    return { a, b: (sumY - a * sumX) / n }
+  }
+  const all = indep.map((_, i) => i)
+  const first = fit(all)
+  if (!first) return null
+  const ranked = all
+    .map((i) => ({ i, e: Math.abs((dep[i] ?? 0) - (first.a * (indep[i] ?? 0) + first.b)) }))
+    .sort((a, b) => a.e - b.e)
+  const keep = ranked.slice(0, Math.max(8, Math.floor(ranked.length * 0.8))).map((item) => item.i)
+  return fit(keep) ?? first
+}
+
+function intersectEdge(vert: { a: number; b: number }, horz: { a: number; b: number }): Point | null {
+  const denom = 1 - vert.a * horz.a
+  if (Math.abs(denom) < 1e-6) return null
+  const x = (vert.a * horz.b + vert.b) / denom
+  const y = horz.a * x + horz.b
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null
+  return { x, y }
+}
+
+/**
+ * White-sheet edges inside the crop pins (not ink). Their trapezoid is what the warp
+ * stretches until the page faces the camera — without cutting to handwriting.
+ */
+export function snapToPaperCorners(
+  source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElement,
+  seed: Corners,
+): Corners | null {
+  try {
+    const { width: sw, height: sh } = sourceSize(source)
+    if (sw < 8 || sh < 8) return null
+    const image = grabFrame(source, SNAP_WIDTH, true)
+    if (!image) return null
+    const { width, height, data } = image
+    const raw = new Uint8Array(width * height)
+    for (let i = 0, p = 0; i < raw.length; i += 1, p += 4) {
+      raw[i] = (0.299 * (data[p] ?? 0) + 0.587 * (data[p + 1] ?? 0) + 0.114 * (data[p + 2] ?? 0)) | 0
+    }
+    const gray = blurGray(raw, width, height)
+    const seedPx = toUnit(seed, sw, sh)
+    const roi = seedBox(cornersFromUnit(seedPx, width, height), width, height)
+    const roiW = roi.maxX - roi.minX + 1
+    const roiH = roi.maxY - roi.minY + 1
+    if (roiW < 24 || roiH < 24) return null
+    const threshold = Math.min(210, Math.max(145, otsu(gray)))
+    const minSpanX = Math.max(8, roiW * 0.28)
+    const minSpanY = Math.max(8, roiH * 0.28)
+
+    const leftX: number[] = []
+    const leftY: number[] = []
+    const rightX: number[] = []
+    const rightY: number[] = []
+    for (let y = roi.minY; y <= roi.maxY; y += 1) {
+      const row = y * width
+      let luma = 0
+      let lo = -1
+      let hi = -1
+      let bright = 0
+      for (let x = roi.minX; x <= roi.maxX; x += 1) {
+        const g = gray[row + x] ?? 0
+        luma += g
+        if (g <= threshold) continue
+        if (lo < 0) lo = x
+        hi = x
+        bright += 1
+      }
+      if (bright < minSpanX || luma / roiW < DARK_ROW || lo < 0) continue
+      leftX.push(lo)
+      leftY.push(y)
+      rightX.push(hi)
+      rightY.push(y)
+    }
+
+    const topX: number[] = []
+    const topY: number[] = []
+    const botX: number[] = []
+    const botY: number[] = []
+    for (let x = roi.minX; x <= roi.maxX; x += 1) {
+      let lo = -1
+      let hi = -1
+      let bright = 0
+      for (let y = roi.minY; y <= roi.maxY; y += 1) {
+        const g = gray[y * width + x] ?? 0
+        if (g <= threshold) continue
+        if (lo < 0) lo = y
+        hi = y
+        bright += 1
+      }
+      if (bright < minSpanY || lo < 0) continue
+      topX.push(x)
+      topY.push(lo)
+      botX.push(x)
+      botY.push(hi)
+    }
+
+    const left = fitLinear(leftY, leftX)
+    const right = fitLinear(rightY, rightX)
+    const top = fitLinear(topX, topY)
+    const bottom = fitLinear(botX, botY)
+    if (!left || !right) return null
+
+    const atY = (edge: { a: number; b: number }, y: number) => ({ x: edge.a * y + edge.b, y })
+    let tl: Point | null = null
+    let tr: Point | null = null
+    let br: Point | null = null
+    let bl: Point | null = null
+    if (top && bottom) {
+      tl = intersectEdge(left, top)
+      tr = intersectEdge(right, top)
+      br = intersectEdge(right, bottom)
+      bl = intersectEdge(left, bottom)
+    }
+    if (!tl || !tr || !br || !bl) {
+      const y0 = leftY[Math.floor(leftY.length * 0.04)] ?? roi.minY
+      const y1 = leftY[Math.floor(leftY.length * 0.96)] ?? roi.maxY
+      tl = atY(left, y0)
+      tr = atY(right, y0)
+      br = atY(right, y1)
+      bl = atY(left, y1)
+    }
+
+    let ordered: Corners
+    try {
+      ordered = orderCorners([tl, tr, br, bl])
+    } catch {
+      return null
+    }
+    if (!quadIsConvex(ordered)) return null
+    const seedArea = cornersArea(cornersFromUnit(seedPx, width, height))
+    const area = cornersArea(ordered)
+    if (area < seedArea * 0.55 || area > seedArea * 1.2) return null
+    const xs = [ordered.tl.x, ordered.tr.x, ordered.br.x, ordered.bl.x]
+    const ys = [ordered.tl.y, ordered.tr.y, ordered.br.y, ordered.bl.y]
+    if (
+      xs.some((x) => x < roi.minX - roiW * 0.08 || x > roi.maxX + roiW * 0.08) ||
+      ys.some((y) => y < roi.minY - roiH * 0.08 || y > roi.maxY + roiH * 0.08)
+    ) {
+      return null
+    }
+    const grown = expand(ordered, width, height, 0.02)
+    return cornersFromUnit(toUnit(grown, width, height), sw, sh)
+  } catch (err) {
+    console.warn('Paper snap failed:', err)
     return null
   }
 }
