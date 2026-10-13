@@ -1,5 +1,5 @@
 import type { Corners, Point } from '../types'
-import { cornersArea, orderCorners, quadIsConvex } from './geometry'
+import { cornersArea, orderCorners, quadIsConvex, quadKeystone } from './geometry'
 
 const DETECT_WIDTH = 240
 const SNAP_WIDTH = 320
@@ -206,8 +206,9 @@ export function detectDocumentCorners(
       sum += value
     }
     if (sum / gray.length < 12) return null
-    const threshold = Math.min(210, Math.max(130, otsu(gray)))
-    const blob = largestBrightBlob(gray, width, height, threshold)
+    const otsuT = Math.min(210, Math.max(130, otsu(gray)))
+    const paperT = Math.max(otsuT, 162)
+    const blob = largestBrightBlob(gray, width, height, paperT) ?? largestBrightBlob(gray, width, height, otsuT)
     if (!blob) return null
     return toUnit(expand(blob.corners, width, height, MARGIN), width, height)
   } catch (err) {
@@ -314,11 +315,13 @@ export function snapToPaperCorners(
     }
     const gray = blurGray(raw, width, height)
     const seedPx = toUnit(seed, sw, sh)
-    const roi = seedBox(cornersFromUnit(seedPx, width, height), width, height)
+    const seedQuad = cornersFromUnit(seedPx, width, height)
+    const seedKeystone = quadKeystone(seedQuad)
+    const roi = seedBox(seedQuad, width, height)
     const roiW = roi.maxX - roi.minX + 1
     const roiH = roi.maxY - roi.minY + 1
     if (roiW < 24 || roiH < 24) return null
-    const threshold = Math.min(210, Math.max(145, otsu(gray)))
+    const threshold = Math.min(210, Math.max(162, otsu(gray)))
     const minSpanX = Math.max(8, roiW * 0.28)
     const minSpanY = Math.max(8, roiH * 0.28)
 
@@ -402,9 +405,10 @@ export function snapToPaperCorners(
       return null
     }
     if (!quadIsConvex(ordered)) return null
-    const seedArea = cornersArea(cornersFromUnit(seedPx, width, height))
+    const seedArea = cornersArea(seedQuad)
     const area = cornersArea(ordered)
     if (area < seedArea * 0.55 || area > seedArea * 1.2) return null
+    if (quadKeystone(ordered) + 0.02 < seedKeystone) return null
     const xs = [ordered.tl.x, ordered.tr.x, ordered.br.x, ordered.bl.x]
     const ys = [ordered.tl.y, ordered.tr.y, ordered.br.y, ordered.bl.y]
     if (

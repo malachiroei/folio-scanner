@@ -30,6 +30,19 @@ export function cornersArea(corners: Corners): number {
   return polygonArea([corners.tl, corners.tr, corners.br, corners.bl])
 }
 
+/** How far a quad is from a rectangle. 1 = no keystone; a desk photo is often 1.1–1.6. */
+export function quadKeystone(corners: Corners): number {
+  const ratio = (a: number, b: number) => {
+    const lo = Math.min(a, b)
+    const hi = Math.max(a, b)
+    return lo < 1 ? 1 : hi / lo
+  }
+  return Math.max(
+    ratio(distance(corners.tl, corners.tr), distance(corners.bl, corners.br)),
+    ratio(distance(corners.tl, corners.bl), distance(corners.tr, corners.br)),
+  )
+}
+
 function segmentsIntersect(a: Point, b: Point, c: Point, d: Point): boolean {
   const abx = b.x - a.x
   const aby = b.y - a.y

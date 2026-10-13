@@ -1,6 +1,6 @@
 ﻿import type { Corners, FilterMode, Point } from '../types'
 import { snapToPaperCorners } from './detect'
-import { distance } from './geometry'
+import { distance, quadKeystone } from './geometry'
 import { nextFrame } from './image'
 
 /** Fast A4-shaped page. Full 300 DPI (3508) freezes phones during warp. */
@@ -82,7 +82,7 @@ function solveLinear(matrix: number[][], values: number[]): number[] | null {
     }
     const pivotRow = rows[pivot]
     const colRow = rows[col]
-    if (!pivotRow || !colRow || Math.abs(pivotRow[col] ?? 0) < 1e-8) return null
+    if (!pivotRow || !colRow || Math.abs(pivotRow[col] ?? 0) < 1e-10) return null
     rows[col] = pivotRow
     rows[pivot] = colRow
     const divisor = rows[col]?.[col] ?? 1
@@ -103,21 +103,85 @@ function solveLinear(matrix: number[][], values: number[]): number[] | null {
   return rows.map((row) => row[size] ?? 0)
 }
 
+function similarity(points: Point[]): { scale: number; cx: number; cy: number } | null {
+  const n = points.length
+  if (n < 4) return null
+  let cx = 0
+  let cy = 0
+  for (const point of points) {
+    cx += point.x
+    cy += point.y
+  }
+  cx /= n
+  cy /= n
+  let mean = 0
+  for (const point of points) mean += Math.hypot(point.x - cx, point.y - cy)
+  mean /= n
+  if (mean < 1e-6) return null
+  return { scale: Math.SQRT2 / mean, cx, cy }
+}
+
+function applySimilarity(point: Point, t: { scale: number; cx: number; cy: number }): Point {
+  return { x: (point.x - t.cx) * t.scale, y: (point.y - t.cy) * t.scale }
+}
+
 function homography(from: Point[], to: Point[]): number[] | null {
+  const srcT = similarity(from)
+  const dstT = similarity(to)
+  if (!srcT || !dstT) return null
   const matrix: number[][] = []
   const values: number[] = []
   for (let i = 0; i < 4; i += 1) {
     const src = from[i]
     const dst = to[i]
     if (!src || !dst) return null
-    matrix.push([src.x, src.y, 1, 0, 0, 0, -dst.x * src.x, -dst.x * src.y])
-    values.push(dst.x)
-    matrix.push([0, 0, 0, src.x, src.y, 1, -dst.y * src.x, -dst.y * src.y])
-    values.push(dst.y)
+    const s = applySimilarity(src, srcT)
+    const d = applySimilarity(dst, dstT)
+    matrix.push([s.x, s.y, 1, 0, 0, 0, -d.x * s.x, -d.x * s.y])
+    values.push(d.x)
+    matrix.push([0, 0, 0, s.x, s.y, 1, -d.y * s.x, -d.y * s.y])
+    values.push(d.y)
   }
   const solved = solveLinear(matrix, values)
   if (!solved) return null
-  return [...solved, 1]
+  const hn = [...solved, 1]
+  const Hn = [
+    [hn[0] ?? 0, hn[1] ?? 0, hn[2] ?? 0],
+    [hn[3] ?? 0, hn[4] ?? 0, hn[5] ?? 0],
+    [hn[6] ?? 0, hn[7] ?? 0, hn[8] ?? 1],
+  ]
+  const Tsrc = [
+    [srcT.scale, 0, -srcT.scale * srcT.cx],
+    [0, srcT.scale, -srcT.scale * srcT.cy],
+    [0, 0, 1],
+  ]
+  const TdstInv = [
+    [1 / dstT.scale, 0, dstT.cx],
+    [0, 1 / dstT.scale, dstT.cy],
+    [0, 0, 1],
+  ]
+  const mul = (a: number[][], b: number[][]) =>
+    a.map((row) =>
+      [0, 1, 2].map((c) => (row[0] ?? 0) * (b[0]?.[c] ?? 0) + (row[1] ?? 0) * (b[1]?.[c] ?? 0) + (row[2] ?? 0) * (b[2]?.[c] ?? 0)),
+    )
+  const H = mul(TdstInv, mul(Hn, Tsrc))
+  const row0 = H[0]
+  const row1 = H[1]
+  const row2 = H[2]
+  if (!row0 || !row1 || !row2) return null
+  const w = row2[2] ?? 1
+  const safe = Math.abs(w) < 1e-12 ? 1 : w
+  return [
+    (row0[0] ?? 0) / safe,
+    (row0[1] ?? 0) / safe,
+    (row0[2] ?? 0) / safe,
+    (row1[0] ?? 0) / safe,
+    (row1[1] ?? 0) / safe,
+    (row1[2] ?? 0) / safe,
+    (row2[0] ?? 0) / safe,
+    (row2[1] ?? 0) / safe,
+    1,
+  ]
 }
 
 function mapHomography(h: number[], x: number, y: number): Point {
@@ -658,7 +722,8 @@ export async function straightenCanvas(
   corners: Corners,
 ): Promise<HTMLCanvasElement> {
   const copy = drawSource(image)
-  const page = snapToPaperCorners(copy, corners) ?? corners
+  const page =
+    quadKeystone(corners) >= 1.08 ? corners : (snapToPaperCorners(copy, corners) ?? corners)
   const { width, height } = a4Page(isLandscape(page))
   try {
     return await warpCanvas(copy, page, width, height)
