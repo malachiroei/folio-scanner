@@ -1,4 +1,5 @@
 ﻿import type { Corners, FilterMode, Point } from '../types'
+import { refineDocumentCorners } from './detect'
 import { distance } from './geometry'
 import { nextFrame } from './image'
 
@@ -209,7 +210,8 @@ function paintScaled(
 }
 
 /**
- * Map the orange-box quad onto a flat page. Inverse homography + bilinear sample.
+ * Map the paper trapezoid onto a flat A4. Inverse homography + bilinear sample.
+ * Stretching the shorter far edge is what lifts the page to face the camera.
  * No OpenCV — loading WASM here froze the phone after shutter.
  */
 async function warpCanvas(
@@ -656,9 +658,10 @@ export async function straightenCanvas(
   corners: Corners,
 ): Promise<HTMLCanvasElement> {
   const copy = drawSource(image)
-  const { width, height } = a4Page(isLandscape(corners))
+  const refined = refineDocumentCorners(copy, corners) ?? corners
+  const { width, height } = a4Page(isLandscape(refined))
   try {
-    return await warpCanvas(copy, corners, width, height)
+    return await warpCanvas(copy, refined, width, height)
   } finally {
     copy.width = 0
     copy.height = 0

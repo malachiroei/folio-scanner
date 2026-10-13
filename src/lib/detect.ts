@@ -1,9 +1,12 @@
 import type { Corners, Point } from '../types'
+import { orderCorners, quadIsConvex } from './geometry'
 
 const DETECT_WIDTH = 240
+const REFINE_WIDTH = 420
 const MIN_AREA = 0.08
 const MAX_AREA = 0.88
-const MARGIN = 0.12
+const MARGIN = 0.05
+const DARK_ROW = 70
 
 const sample = document.createElement('canvas')
 const sampleCtx = sample.getContext('2d', { willReadFrequently: true })
@@ -16,11 +19,14 @@ function sourceSize(source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElem
   return { width: source.width, height: source.height }
 }
 
-function grabFrame(source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElement): ImageData | null {
+function grabFrame(
+  source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElement,
+  maxWidth: number,
+): ImageData | null {
   if (!sampleCtx) return null
   const { width: sw, height: sh } = sourceSize(source)
   if (sw < 8 || sh < 8) return null
-  const scale = Math.min(1, DETECT_WIDTH / sw)
+  const scale = Math.min(1, maxWidth / sw)
   const width = Math.max(1, Math.round(sw * scale))
   const height = Math.max(1, Math.round(sh * scale))
   if (sample.width !== width) sample.width = width
@@ -86,6 +92,8 @@ type BlobHit = {
   corners: Corners
 }
 
+type Box = { minX: number; minY: number; maxX: number; maxY: number }
+
 function extrema() {
   return {
     tl: { x: 0, y: 0 },
@@ -130,113 +138,308 @@ function addPoint(acc: ReturnType<typeof extrema>, x: number, y: number) {
   }
 }
 
-function largestBrightBlob(gray: Uint8Array, width: number, height: number, threshold: number): BlobHit | null {
+function unitBox(seed: Corners | undefined, width: number, height: number): Box {
+  if (!seed) return { minX: 0, minY: 0, maxX: width - 1, maxY: height - 1 }
+  const xs = [seed.tl.x, seed.tr.x, seed.br.x, seed.bl.x].map((x) => x * width)
+  const ys = [seed.tl.y, seed.tr.y, seed.br.y, seed.bl.y].map((y) => y * height)
+  const padX = Math.max(2, (Math.max(...xs) - Math.min(...xs)) * 0.04)
+  const padY = Math.max(2, (Math.max(...ys) - Math.min(...ys)) * 0.04)
+  return {
+    minX: Math.max(0, Math.floor(Math.min(...xs) - padX)),
+    minY: Math.max(0, Math.floor(Math.min(...ys) - padY)),
+    maxX: Math.min(width - 1, Math.ceil(Math.max(...xs) + padX)),
+    maxY: Math.min(height - 1, Math.ceil(Math.max(...ys) + padY)),
+  }
+}
+
+function largestBrightBlob(
+  gray: Uint8Array,
+  width: number,
+  height: number,
+  threshold: number,
+  roi: Box,
+): BlobHit | null {
   const frame = width * height
   const seen = new Uint8Array(gray.length)
   const stack = new Int32Array(gray.length)
   let best: BlobHit | null = null
 
-  for (let start = 0; start < gray.length; start += 1) {
-    if ((gray[start] ?? 0) <= threshold || seen[start]) continue
-    let top = 0
-    stack[top] = start
-    top += 1
-    seen[start] = 1
-    const acc = extrema()
-    while (top > 0) {
-      top -= 1
-      const index = stack[top] ?? 0
-      const x = index % width
-      const y = (index - x) / width
-      addPoint(acc, x, y)
-      if (x > 0 && !seen[index - 1] && (gray[index - 1] ?? 0) > threshold) {
-        seen[index - 1] = 1
-        stack[top] = index - 1
-        top += 1
+  for (let y = roi.minY; y <= roi.maxY; y += 1) {
+    const row = y * width
+    for (let x = roi.minX; x <= roi.maxX; x += 1) {
+      const start = row + x
+      if ((gray[start] ?? 0) <= threshold || seen[start]) continue
+      let top = 0
+      stack[top] = start
+      top += 1
+      seen[start] = 1
+      const acc = extrema()
+      while (top > 0) {
+        top -= 1
+        const index = stack[top] ?? 0
+        const px = index % width
+        const py = (index - px) / width
+        addPoint(acc, px, py)
+        const tryPush = (nx: number, ny: number) => {
+          if (nx < roi.minX || nx > roi.maxX || ny < roi.minY || ny > roi.maxY) return
+          const next = ny * width + nx
+          if (seen[next] || (gray[next] ?? 0) <= threshold) return
+          seen[next] = 1
+          stack[top] = next
+          top += 1
+        }
+        tryPush(px - 1, py)
+        tryPush(px + 1, py)
+        tryPush(px, py - 1)
+        tryPush(px, py + 1)
       }
-      if (x < width - 1 && !seen[index + 1] && (gray[index + 1] ?? 0) > threshold) {
-        seen[index + 1] = 1
-        stack[top] = index + 1
-        top += 1
+      const frac = acc.count / frame
+      if (frac < MIN_AREA || frac > MAX_AREA || (best && acc.count <= best.count)) continue
+      const touch =
+        Number(acc.minX <= 1) + Number(acc.minY <= 1) + Number(acc.maxX >= width - 2) + Number(acc.maxY >= height - 2)
+      if (touch >= 4) continue
+      best = {
+        count: acc.count,
+        minX: acc.minX,
+        minY: acc.minY,
+        maxX: acc.maxX,
+        maxY: acc.maxY,
+        corners: { tl: acc.tl, tr: acc.tr, br: acc.br, bl: acc.bl },
       }
-      if (y > 0 && !seen[index - width] && (gray[index - width] ?? 0) > threshold) {
-        seen[index - width] = 1
-        stack[top] = index - width
-        top += 1
-      }
-      if (y < height - 1 && !seen[index + width] && (gray[index + width] ?? 0) > threshold) {
-        seen[index + width] = 1
-        stack[top] = index + width
-        top += 1
-      }
-    }
-    const frac = acc.count / frame
-    if (frac < MIN_AREA || frac > MAX_AREA || (best && acc.count <= best.count)) continue
-    const touch =
-      Number(acc.minX <= 1) + Number(acc.minY <= 1) + Number(acc.maxX >= width - 2) + Number(acc.maxY >= height - 2)
-    if (touch >= 4) continue
-    best = {
-      count: acc.count,
-      minX: acc.minX,
-      minY: acc.minY,
-      maxX: acc.maxX,
-      maxY: acc.maxY,
-      corners: { tl: acc.tl, tr: acc.tr, br: acc.br, bl: acc.bl },
     }
   }
   return best
 }
 
-function inkCorners(
+function isInk(
   gray: Uint8Array,
   width: number,
   height: number,
-  blob: BlobHit,
-  paperThreshold: number,
-): Corners | null {
-  const darkCut = Math.min(paperThreshold - 6, 170)
-  const acc = extrema()
-  for (let y = blob.minY; y <= blob.maxY; y += 1) {
-    const row = y * width
-    for (let x = blob.minX; x <= blob.maxX; x += 1) {
-      const g = gray[row + x] ?? 0
-      if (g < 48 || g > darkCut) continue
-      const right = x < width - 1 ? (gray[row + x + 1] ?? g) : g
-      const down = y < height - 1 ? (gray[row + width + x] ?? g) : g
-      if (Math.abs(g - right) < 10 && Math.abs(g - down) < 10) continue
-      addPoint(acc, x, y)
+  x: number,
+  y: number,
+  darkCut: number,
+): boolean {
+  const g = gray[y * width + x] ?? 0
+  if (g < 48 || g > darkCut) return false
+  const right = x < width - 1 ? (gray[y * width + x + 1] ?? g) : g
+  const down = y < height - 1 ? (gray[(y + 1) * width + x] ?? g) : g
+  return Math.abs(g - right) >= 10 || Math.abs(g - down) >= 10
+}
+
+function fitLinear(indep: number[], dep: number[]): { a: number; b: number } | null {
+  const fit = (idx: number[]) => {
+    const n = idx.length
+    if (n < 6) return null
+    let sumX = 0
+    let sumY = 0
+    let sumXX = 0
+    let sumXY = 0
+    for (const i of idx) {
+      const x = indep[i] ?? 0
+      const y = dep[i] ?? 0
+      sumX += x
+      sumY += y
+      sumXX += x * x
+      sumXY += x * y
     }
+    const denom = n * sumXX - sumX * sumX
+    if (Math.abs(denom) < 1e-6) return { a: 0, b: sumY / n }
+    const a = (n * sumXY - sumX * sumY) / denom
+    return { a, b: (sumY - a * sumX) / n }
   }
-  if (acc.count < 40) return null
-  return expand({ tl: acc.tl, tr: acc.tr, br: acc.br, bl: acc.bl }, width, height, MARGIN)
+  const all = indep.map((_, i) => i)
+  const first = fit(all)
+  if (!first) return null
+  const ranked = all
+    .map((i) => ({ i, e: Math.abs((dep[i] ?? 0) - (first.a * (indep[i] ?? 0) + first.b)) }))
+    .sort((a, b) => a.e - b.e)
+  const keep = ranked.slice(0, Math.max(6, Math.floor(ranked.length * 0.8))).map((item) => item.i)
+  return fit(keep) ?? first
+}
+
+function intersectEdge(
+  vert: { a: number; b: number },
+  horz: { a: number; b: number },
+): Point | null {
+  const denom = 1 - vert.a * horz.a
+  if (Math.abs(denom) < 1e-6) return null
+  const x = (vert.a * horz.b + vert.b) / denom
+  const y = horz.a * x + horz.b
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null
+  return { x, y }
+}
+
+function usableQuad(corners: Corners, width: number, height: number): Corners | null {
+  let ordered: Corners
+  try {
+    ordered = orderCorners([corners.tl, corners.tr, corners.br, corners.bl])
+  } catch {
+    return null
+  }
+  if (!quadIsConvex(ordered)) return null
+  const xs = [ordered.tl.x, ordered.tr.x, ordered.br.x, ordered.bl.x]
+  const ys = [ordered.tl.y, ordered.tr.y, ordered.br.y, ordered.bl.y]
+  if (xs.some((x) => !Number.isFinite(x)) || ys.some((y) => !Number.isFinite(y))) return null
+  if (
+    xs.some((x) => x < -width * 0.1 || x > width * 1.1) ||
+    ys.some((y) => y < -height * 0.1 || y > height * 1.1)
+  ) {
+    return null
+  }
+  const spanX = Math.max(...xs) - Math.min(...xs)
+  const spanY = Math.max(...ys) - Math.min(...ys)
+  if (spanX < width * 0.12 || spanY < height * 0.12) return null
+  return expand(ordered, width, height, MARGIN)
 }
 
 /**
- * Bright page blob, then the printed content inside it so the quad follows the paper
- * (not the desk AABB). Warp later maps this trapezoid onto a flat A4.
+ * Left/right + top/bottom ink envelopes of the printed table. Their intersections are the
+ * paper trapezoid: a shorter far (top) edge that the warp stretches until the page faces us.
+ */
+function tableQuad(
+  gray: Uint8Array,
+  width: number,
+  height: number,
+  box: Box,
+  paperThreshold: number,
+): Corners | null {
+  const darkCut = Math.min(paperThreshold - 6, 170)
+  const leftX: number[] = []
+  const leftY: number[] = []
+  const rightX: number[] = []
+  const rightY: number[] = []
+  const topX: number[] = []
+  const topY: number[] = []
+  const botX: number[] = []
+  const botY: number[] = []
+  const acc = extrema()
+
+  for (let y = box.minY; y <= box.maxY; y += 1) {
+    const row = y * width
+    let luma = 0
+    const span = box.maxX - box.minX + 1
+    for (let x = box.minX; x <= box.maxX; x += 1) luma += gray[row + x] ?? 0
+    if (span < 1 || luma / span < DARK_ROW) continue
+    let lo = box.maxX
+    let hi = box.minX
+    let n = 0
+    for (let x = box.minX; x <= box.maxX; x += 1) {
+      if (!isInk(gray, width, height, x, y, darkCut)) continue
+      addPoint(acc, x, y)
+      if (x < lo) lo = x
+      if (x > hi) hi = x
+      n += 1
+    }
+    if (n < 3) continue
+    leftX.push(lo)
+    leftY.push(y)
+    rightX.push(hi)
+    rightY.push(y)
+  }
+
+  for (let x = box.minX; x <= box.maxX; x += 1) {
+    let lo = box.maxY
+    let hi = box.minY
+    let n = 0
+    for (let y = box.minY; y <= box.maxY; y += 1) {
+      if (!isInk(gray, width, height, x, y, darkCut)) continue
+      if (y < lo) lo = y
+      if (y > hi) hi = y
+      n += 1
+    }
+    if (n < 3) continue
+    topX.push(x)
+    topY.push(lo)
+    botX.push(x)
+    botY.push(hi)
+  }
+
+  const left = fitLinear(leftY, leftX)
+  const right = fitLinear(rightY, rightX)
+  const top = fitLinear(topX, topY)
+  const bottom = fitLinear(botX, botY)
+  if (left && right && top && bottom) {
+    const tl = intersectEdge(left, top)
+    const tr = intersectEdge(right, top)
+    const br = intersectEdge(right, bottom)
+    const bl = intersectEdge(left, bottom)
+    if (tl && tr && br && bl) {
+      const quad = usableQuad({ tl, tr, br, bl }, width, height)
+      if (quad) return quad
+    }
+  }
+
+  if (acc.count < 40) return null
+  return usableQuad({ tl: acc.tl, tr: acc.tr, br: acc.br, bl: acc.bl }, width, height)
+}
+
+function lumaImage(image: ImageData): { gray: Uint8Array; mean: number } {
+  const { width, height, data } = image
+  const gray = new Uint8Array(width * height)
+  let sum = 0
+  for (let i = 0, p = 0; i < gray.length; i += 1, p += 4) {
+    const value = (0.299 * (data[p] ?? 0) + 0.587 * (data[p + 1] ?? 0) + 0.114 * (data[p + 2] ?? 0)) | 0
+    gray[i] = value
+    sum += value
+  }
+  return { gray, mean: sum / gray.length }
+}
+
+function findPageQuad(image: ImageData, seed?: Corners): Corners | null {
+  const { width, height } = image
+  const { gray, mean } = lumaImage(image)
+  if (mean < 12) return null
+  const roi = unitBox(seed, width, height)
+  const threshold = Math.min(210, Math.max(90, otsu(gray)))
+  const blob = largestBrightBlob(gray, width, height, threshold, roi)
+  const search: Box = blob
+    ? {
+        minX: Math.max(roi.minX, blob.minX),
+        minY: Math.max(roi.minY, blob.minY),
+        maxX: Math.min(roi.maxX, blob.maxX),
+        maxY: Math.min(roi.maxY, blob.maxY),
+      }
+    : roi
+  const table = tableQuad(gray, width, height, search, threshold)
+  if (table) return table
+  if (blob) return expand(blob.corners, width, height, MARGIN)
+  return null
+}
+
+/**
+ * Bright page blob, then the printed table's edge lines so the quad is a perspective
+ * trapezoid (far edge shorter). Warp later stretches that top onto a flat A4.
  */
 export function detectDocumentCorners(
   source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElement,
 ): Corners | null {
   try {
-    const image = grabFrame(source)
+    const image = grabFrame(source, DETECT_WIDTH)
     if (!image) return null
-    const { width, height, data } = image
-    const gray = new Uint8Array(width * height)
-    let sum = 0
-    for (let i = 0, p = 0; i < gray.length; i += 1, p += 4) {
-      const value = (0.299 * (data[p] ?? 0) + 0.587 * (data[p + 1] ?? 0) + 0.114 * (data[p + 2] ?? 0)) | 0
-      gray[i] = value
-      sum += value
-    }
-    if (sum / gray.length < 12) return null
-    const threshold = Math.min(210, Math.max(90, otsu(gray)))
-    const blob = largestBrightBlob(gray, width, height, threshold)
-    if (!blob) return null
-    const printed = inkCorners(gray, width, height, blob, threshold)
-    return toUnit(printed ?? blob.corners, width, height)
+    const quad = findPageQuad(image)
+    return quad ? toUnit(quad, image.width, image.height) : null
   } catch (err) {
     console.warn('Detection failed:', err)
+    return null
+  }
+}
+
+/** Pixel-space trapezoid of the printed page, searched inside the live/crop pins. */
+export function refineDocumentCorners(
+  source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElement,
+  seed?: Corners,
+): Corners | null {
+  try {
+    const { width: sw, height: sh } = sourceSize(source)
+    if (sw < 8 || sh < 8) return null
+    const image = grabFrame(source, REFINE_WIDTH)
+    if (!image) return null
+    const seedUnit = seed ? toUnit(seed, sw, sh) : undefined
+    const quad = findPageQuad(image, seedUnit)
+    if (!quad) return null
+    return cornersFromUnit(toUnit(quad, image.width, image.height), sw, sh)
+  } catch (err) {
+    console.warn('Refine failed:', err)
     return null
   }
 }
