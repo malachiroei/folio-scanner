@@ -6,7 +6,7 @@ import { useScan } from '../state/scan-context'
 import type { CaptureHint, Corners } from '../types'
 
 /** Live detection on a 200px canvas copy. Always reschedules so a throw cannot freeze the box. */
-const LIVE_INTERVAL_MS = 160
+const LIVE_INTERVAL_MS = 120
 const LIVE_TRACK = 0.75
 
 type LiveQuad = { corners: Corners; width: number; height: number; at: number }
@@ -332,9 +332,10 @@ export function CameraCapture() {
             height="76"
             rx="3"
             fill="none"
-            stroke="rgba(255,255,255,0.35)"
+            stroke="rgba(255,255,255,0.55)"
             strokeWidth={1.25}
-            strokeDasharray="4 5"
+            strokeDasharray="6 6"
+            className="origin-center animate-pulse"
             vectorEffect="non-scaling-stroke"
           />
         )}
@@ -348,7 +349,9 @@ export function CameraCapture() {
         >
           <X className="size-5" />
         </button>
-        <p className="rounded-full bg-black/50 px-3 py-1 text-xs">{quad ? 'מקם את הדף בתוך המסגרת' : 'מחפש מסמך...'}</p>
+        <p className={`rounded-full bg-black/50 px-3 py-1 text-xs ${quad ? '' : 'animate-pulse'}`}>
+          {quad ? 'מקם את הדף בתוך המסגרת' : 'מחפש מסמך...'}
+        </p>
         <span className="size-11" />
       </div>
 
