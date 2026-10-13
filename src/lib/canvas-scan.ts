@@ -1,15 +1,13 @@
 ﻿import type { Corners, FilterMode, Point } from '../types'
 import { distance } from './geometry'
 import { nextFrame } from './image'
-import { cornersFromUnit, detectDocumentCorners } from './detect'
-import { getCv, isOpenCvReady, loadOpenCv, MatBin } from './opencv'
 
-/** 300 DPI A4: 2480×3508 portrait, 3508×2480 landscape. */
-const A4_SHORT = 2480
-const A4_LONG = 3508
+/** Fast A4-shaped page. Full 300 DPI (3508) freezes phones during warp. */
+const WARP_LONG = 1600
 
 function a4Page(landscape: boolean): { width: number; height: number } {
-  return landscape ? { width: A4_LONG, height: A4_SHORT } : { width: A4_SHORT, height: A4_LONG }
+  const short = Math.round(WARP_LONG / Math.SQRT2)
+  return landscape ? { width: WARP_LONG, height: short } : { width: short, height: WARP_LONG }
 }
 
 /**
@@ -21,9 +19,6 @@ function isLandscape(corners: Corners): boolean {
   const height = (distance(corners.tl, corners.bl) + distance(corners.tr, corners.br)) / 2
   return width > height * 1.15
 }
-
-/** Destination mesh density: piecewise affine cells approximate the homography without seams. */
-const WARP_GRID = 48
 
 /** Uniform mathematical scan: flat-field → luma curve → saturation → unsharp. No region masks. */
 const LIGHT_GRID = 16
@@ -133,92 +128,53 @@ function mapHomography(h: number[], x: number, y: number): Point {
   }
 }
 
-function invert3(m: number[]): number[] | null {
-  const a = m[0] ?? 0
-  const b = m[1] ?? 0
-  const c = m[2] ?? 0
-  const d = m[3] ?? 0
-  const e = m[4] ?? 0
-  const f = m[5] ?? 0
-  const g = m[6] ?? 0
-  const h = m[7] ?? 0
-  const i = m[8] ?? 0
-  const det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
-  if (Math.abs(det) < 1e-12) return null
-  const id = 1 / det
-  return [
-    (e * i - f * h) * id,
-    (c * h - b * i) * id,
-    (b * f - c * e) * id,
-    (f * g - d * i) * id,
-    (a * i - c * g) * id,
-    (c * d - a * f) * id,
-    (d * h - e * g) * id,
-    (b * g - a * h) * id,
-    (a * e - b * d) * id,
-  ]
-}
-
-function mul3(left: number[], right: number[]): number[] {
-  const out = new Array<number>(9)
-  for (let row = 0; row < 3; row += 1) {
-    for (let col = 0; col < 3; col += 1) {
-      out[row * 3 + col] =
-        (left[row * 3] ?? 0) * (right[col] ?? 0) +
-        (left[row * 3 + 1] ?? 0) * (right[3 + col] ?? 0) +
-        (left[row * 3 + 2] ?? 0) * (right[6 + col] ?? 0)
-    }
-  }
-  return out
-}
-
-/** Affine matrix mapping source triangle → dest, as canvas setTransform(a, b, c, d, e, f). */
-function triangleTransform(s0: Point, s1: Point, s2: Point, d0: Point, d1: Point, d2: Point) {
-  const source = [s0.x, s1.x, s2.x, s0.y, s1.y, s2.y, 1, 1, 1]
-  const dest = [d0.x, d1.x, d2.x, d0.y, d1.y, d2.y, 1, 1, 1]
-  const inverse = invert3(source)
-  if (!inverse) return null
-  const mapped = mul3(dest, inverse)
-  return {
-    a: mapped[0] ?? 1,
-    b: mapped[3] ?? 0,
-    c: mapped[1] ?? 0,
-    d: mapped[4] ?? 1,
-    e: mapped[2] ?? 0,
-    f: mapped[5] ?? 0,
-  }
-}
-
-function drawTexturedTriangle(
-  context: CanvasRenderingContext2D,
-  source: HTMLCanvasElement,
-  s0: Point,
-  s1: Point,
-  s2: Point,
-  d0: Point,
-  d1: Point,
-  d2: Point,
+function sampleBilinear(
+  data: Uint8ClampedArray,
+  width: number,
+  height: number,
+  x: number,
+  y: number,
+  out: Uint8ClampedArray,
+  offset: number,
 ) {
-  const matrix = triangleTransform(s0, s1, s2, d0, d1, d2)
-  if (!matrix) return
-  const minX = Math.max(0, Math.floor(Math.min(s0.x, s1.x, s2.x)) - 2)
-  const minY = Math.max(0, Math.floor(Math.min(s0.y, s1.y, s2.y)) - 2)
-  const maxX = Math.min(source.width, Math.ceil(Math.max(s0.x, s1.x, s2.x)) + 2)
-  const maxY = Math.min(source.height, Math.ceil(Math.max(s0.y, s1.y, s2.y)) + 2)
-  const sw = maxX - minX
-  const sh = maxY - minY
-  if (sw < 1 || sh < 1) return
+  if (x < 0 || y < 0 || x >= width - 1 || y >= height - 1) {
+    out[offset] = 255
+    out[offset + 1] = 255
+    out[offset + 2] = 255
+    out[offset + 3] = 255
+    return
+  }
+  const x0 = Math.floor(x)
+  const y0 = Math.floor(y)
+  const fx = x - x0
+  const fy = y - y0
+  const i00 = (y0 * width + x0) * 4
+  const i10 = i00 + 4
+  const i01 = i00 + width * 4
+  const i11 = i01 + 4
+  for (let c = 0; c < 3; c += 1) {
+    const v00 = data[i00 + c] ?? 255
+    const v10 = data[i10 + c] ?? 255
+    const v01 = data[i01 + c] ?? 255
+    const v11 = data[i11 + c] ?? 255
+    const top = v00 + (v10 - v00) * fx
+    const bottom = v01 + (v11 - v01) * fx
+    out[offset + c] = top + (bottom - top) * fy
+  }
+  out[offset + 3] = 255
+}
 
-  context.save()
-  context.beginPath()
-  context.moveTo(d0.x, d0.y)
-  context.lineTo(d1.x, d1.y)
-  context.lineTo(d2.x, d2.y)
-  context.closePath()
-  context.clip()
-  context.setTransform(matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f)
-  context.drawImage(source, minX, minY, sw, sh, minX, minY, sw, sh)
-  context.restore()
+function scaleSource(source: HTMLCanvasElement, maxEdge: number) {
+  const scale = Math.min(1, maxEdge / Math.max(source.width, source.height, 1))
+  if (scale >= 0.999) return { canvas: source, scale: 1 }
+  const canvas = document.createElement('canvas')
+  canvas.width = Math.max(1, Math.round(source.width * scale))
+  canvas.height = Math.max(1, Math.round(source.height * scale))
+  const context = canvas.getContext('2d')
+  if (!context) return { canvas: source, scale: 1 }
+  highQuality(context)
+  context.drawImage(source, 0, 0, canvas.width, canvas.height)
+  return { canvas, scale }
 }
 
 /** Fast fallback when the homography cannot be solved: the corners' bounding box, scaled to the page. */
@@ -253,114 +209,57 @@ function paintScaled(
 }
 
 /**
- * Perspective warp of the approved crop onto a full A4 canvas.
- * srcPts = TL, TR, BR, BL → dstPts = [0,0], [W,0], [W,H], [0,H]. No inset, no bounding-rect fallback.
+ * Map the orange-box quad onto a flat page. Inverse homography + bilinear sample.
+ * No OpenCV — loading WASM here froze the phone after shutter.
  */
-function warpPerspectiveCv(
-  source: HTMLCanvasElement,
-  corners: Corners,
-  width: number,
-  height: number,
-): HTMLCanvasElement | null {
-  if (!isOpenCvReady()) return null
-  const cv = getCv()
-  const bin = new MatBin()
-  try {
-    const src = bin.keep(cv.imread(source))
-    const from = bin.keep(
-      cv.matFromArray(4, 1, cv.CV_32FC2, [
-        corners.tl.x,
-        corners.tl.y,
-        corners.tr.x,
-        corners.tr.y,
-        corners.br.x,
-        corners.br.y,
-        corners.bl.x,
-        corners.bl.y,
-      ]),
-    )
-    const destW = width
-    const destH = height
-    const to = bin.keep(
-      cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, destW, 0, destW, destH, 0, destH]),
-    )
-    const matrix = bin.keep(cv.getPerspectiveTransform(from, to))
-    const dst = bin.keep(new cv.Mat())
-    const border = typeof cv.BORDER_CONSTANT === 'number' ? cv.BORDER_CONSTANT : 0
-    cv.warpPerspective(
-      src,
-      dst,
-      matrix,
-      new cv.Size(width, height),
-      cv.INTER_LINEAR,
-      border,
-      new cv.Scalar(255, 255, 255, 255),
-    )
-    const canvas = document.createElement('canvas')
-    canvas.width = width
-    canvas.height = height
-    cv.imshow(canvas, dst)
-    return canvas
-  } catch (error) {
-    console.error(error)
-    return null
-  } finally {
-    bin.release()
-  }
-}
-
 async function warpCanvas(
   source: HTMLCanvasElement,
   corners: Corners,
   width: number,
   height: number,
 ): Promise<HTMLCanvasElement> {
-  const from = [
-    { x: 0, y: 0 },
-    { x: width, y: 0 },
-    { x: width, y: height },
-    { x: 0, y: height },
-  ]
-  const cvWarp = warpPerspectiveCv(source, corners, width, height)
-  if (cvWarp) return cvWarp
-  const to = [corners.tl, corners.tr, corners.br, corners.bl]
-  const map = homography(from, to)
+  const shrunk = scaleSource(source, 2000)
+  const quad: Corners = {
+    tl: { x: corners.tl.x * shrunk.scale, y: corners.tl.y * shrunk.scale },
+    tr: { x: corners.tr.x * shrunk.scale, y: corners.tr.y * shrunk.scale },
+    br: { x: corners.br.x * shrunk.scale, y: corners.br.y * shrunk.scale },
+    bl: { x: corners.bl.x * shrunk.scale, y: corners.bl.y * shrunk.scale },
+  }
+  const map = homography(
+    [
+      { x: 0, y: 0 },
+      { x: width, y: 0 },
+      { x: width, y: height },
+      { x: 0, y: height },
+    ],
+    [quad.tl, quad.tr, quad.br, quad.bl],
+  )
   if (!map) return paintScaled(source, width, height, corners)
+
+  const src = shrunk.canvas
+  const srcCtx = src.getContext('2d', { willReadFrequently: true })
+  if (!srcCtx) return paintScaled(source, width, height, corners)
+  const srcImage = srcCtx.getImageData(0, 0, src.width, src.height)
+  const srcData = srcImage.data
+  const sw = src.width
+  const sh = src.height
 
   const canvas = document.createElement('canvas')
   canvas.width = width
   canvas.height = height
   const context = canvas.getContext('2d')
   if (!context) throw new Error('לא ניתן ליישר את העמוד.')
-  highQuality(context)
-  context.fillStyle = '#ffffff'
-  context.fillRect(0, 0, width, height)
+  const dest = context.createImageData(width, height)
+  const out = dest.data
 
-  const padX = 0.45
-  const padY = 0.45
-  for (let gy = 0; gy < WARP_GRID; gy += 1) {
-    if (gy % 4 === 0) await nextFrame()
-    const y0 = (gy / WARP_GRID) * height
-    const y1 = ((gy + 1) / WARP_GRID) * height
-    const dy0 = gy === 0 ? y0 : y0 - padY
-    const dy1 = gy === WARP_GRID - 1 ? y1 : y1 + padY
-    for (let gx = 0; gx < WARP_GRID; gx += 1) {
-      const x0 = (gx / WARP_GRID) * width
-      const x1 = ((gx + 1) / WARP_GRID) * width
-      const dx0 = gx === 0 ? x0 : x0 - padX
-      const dx1 = gx === WARP_GRID - 1 ? x1 : x1 + padX
-      const d00 = { x: dx0, y: dy0 }
-      const d10 = { x: dx1, y: dy0 }
-      const d11 = { x: dx1, y: dy1 }
-      const d01 = { x: dx0, y: dy1 }
-      const s00 = mapHomography(map, d00.x, d00.y)
-      const s10 = mapHomography(map, d10.x, d10.y)
-      const s11 = mapHomography(map, d11.x, d11.y)
-      const s01 = mapHomography(map, d01.x, d01.y)
-      drawTexturedTriangle(context, source, s00, s10, s11, d00, d10, d11)
-      drawTexturedTriangle(context, source, s00, s11, s01, d00, d11, d01)
+  for (let y = 0; y < height; y += 1) {
+    if (y % 48 === 0) await nextFrame()
+    for (let x = 0; x < width; x += 1) {
+      const sample = mapHomography(map, x + 0.5, y + 0.5)
+      sampleBilinear(srcData, sw, sh, sample.x, sample.y, out, (y * width + x) * 4)
     }
   }
+  context.putImageData(dest, 0, 0)
   return canvas
 }
 
@@ -757,18 +656,9 @@ export async function straightenCanvas(
   corners: Corners,
 ): Promise<HTMLCanvasElement> {
   const copy = drawSource(image)
-  const found = detectDocumentCorners(copy)
-  const quad = found ? cornersFromUnit(found, copy.width, copy.height) : corners
-  const { width, height } = a4Page(isLandscape(quad))
-  if (!isOpenCvReady()) {
-    try {
-      await loadOpenCv()
-    } catch {
-      // JS mesh still maps the four paper corners onto a flat A4 page.
-    }
-  }
+  const { width, height } = a4Page(isLandscape(corners))
   try {
-    return await warpCanvas(copy, quad, width, height)
+    return await warpCanvas(copy, corners, width, height)
   } finally {
     copy.width = 0
     copy.height = 0
