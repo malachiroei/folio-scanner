@@ -1,6 +1,6 @@
 ﻿import type { Corners, FilterMode, Point } from '../types'
 import { snapToPaperCorners } from './detect'
-import { distance, quadKeystone } from './geometry'
+import { distance } from './geometry'
 import { nextFrame } from './image'
 
 /** Fast A4-shaped page. Full 300 DPI (3508) freezes phones during warp. */
@@ -25,7 +25,7 @@ function isLandscape(corners: Corners): boolean {
 const LIGHT_GRID = 16
 const LIGHT_PERCENTILE = 0.95
 const LIGHT_BLUR_PASSES = 4
-const LIGHT_FLOOR = 0.85
+const LIGHT_FLOOR = 0.74
 const FLAT_TARGET = 255
 const SAT_BOOST = 1.6
 const SAT_MIN = 0.08
@@ -722,8 +722,7 @@ export async function straightenCanvas(
   corners: Corners,
 ): Promise<HTMLCanvasElement> {
   const copy = drawSource(image)
-  const page =
-    quadKeystone(corners) >= 1.08 ? corners : (snapToPaperCorners(copy, corners) ?? corners)
+  const page = snapToPaperCorners(copy, corners) ?? corners
   const { width, height } = a4Page(isLandscape(page))
   try {
     return await warpCanvas(copy, page, width, height)

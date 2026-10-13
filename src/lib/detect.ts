@@ -5,7 +5,7 @@ const DETECT_WIDTH = 240
 const SNAP_WIDTH = 320
 const MIN_AREA = 0.08
 const MAX_AREA = 0.88
-const MARGIN = 0.06
+const MARGIN = 0.02
 const DARK_ROW = 85
 
 const sample = document.createElement('canvas')
@@ -209,8 +209,16 @@ export function detectDocumentCorners(
     const otsuT = Math.min(210, Math.max(130, otsu(gray)))
     const paperT = Math.max(otsuT, 162)
     const blob = largestBrightBlob(gray, width, height, paperT) ?? largestBrightBlob(gray, width, height, otsuT)
-    if (!blob) return null
-    return toUnit(expand(blob.corners, width, height, MARGIN), width, height)
+    const origin = blob
+      ? {
+          x: (blob.corners.tl.x + blob.corners.tr.x + blob.corners.br.x + blob.corners.bl.x) / 4,
+          y: (blob.corners.tl.y + blob.corners.tr.y + blob.corners.br.y + blob.corners.bl.y) / 4,
+        }
+      : { x: width / 2, y: height / 2 }
+    const radial = radialPaperQuad(gray, width, height, origin)
+    const quad = radial ?? blob?.corners
+    if (!quad) return null
+    return toUnit(expand(quad, width, height, MARGIN), width, height)
   } catch (err) {
     console.warn('Detection failed:', err)
     return null
@@ -229,6 +237,78 @@ function seedBox(seed: Corners, width: number, height: number): Box {
     minY: Math.max(0, Math.floor(Math.min(...ys) - padY)),
     maxX: Math.min(width - 1, Math.ceil(Math.max(...xs) + padX)),
     maxY: Math.min(height - 1, Math.ceil(Math.max(...ys) + padY)),
+  }
+}
+
+function lumaAt(gray: Uint8Array, width: number, height: number, x: number, y: number) {
+  const xx = Math.max(0, Math.min(width - 1, Math.round(x)))
+  const yy = Math.max(0, Math.min(height - 1, Math.round(y)))
+  return gray[yy * width + xx] ?? 0
+}
+
+function brightestNear(gray: Uint8Array, width: number, height: number, point: Point, radius: number): Point {
+  let best = point
+  let peak = -1
+  for (let y = Math.round(point.y) - radius; y <= Math.round(point.y) + radius; y += 1) {
+    if (y < 0 || y >= height) continue
+    for (let x = Math.round(point.x) - radius; x <= Math.round(point.x) + radius; x += 1) {
+      if (x < 0 || x >= width) continue
+      const g = gray[y * width + x] ?? 0
+      if (g > peak) {
+        peak = g
+        best = { x, y }
+      }
+    }
+  }
+  return best
+}
+
+/**
+ * Walk out from the page center until luma drops off the sheet. Keyboard, jeans and desk
+ * fall away; the last paper pixel on each ray is the real outline, including a crumpled edge.
+ */
+function radialPaperQuad(gray: Uint8Array, width: number, height: number, guess: Point): Corners | null {
+  const origin = brightestNear(gray, width, height, guess, 8)
+  const seed =
+    (lumaAt(gray, width, height, origin.x, origin.y) +
+      lumaAt(gray, width, height, origin.x - 2, origin.y) +
+      lumaAt(gray, width, height, origin.x + 2, origin.y) +
+      lumaAt(gray, width, height, origin.x, origin.y - 2) +
+      lumaAt(gray, width, height, origin.x, origin.y + 2)) /
+    5
+  if (seed < 120) return null
+  const floor = Math.max(100, seed - 38)
+  const acc = extrema()
+  const maxR = Math.hypot(width, height)
+  const rays = 72
+  for (let i = 0; i < rays; i += 1) {
+    const ang = (Math.PI * 2 * i) / rays
+    const dx = Math.cos(ang)
+    const dy = Math.sin(ang)
+    let lastX = origin.x
+    let lastY = origin.y
+    let onPaper = false
+    for (let r = 3; r < maxR; r += 1) {
+      const x = origin.x + dx * r
+      const y = origin.y + dy * r
+      if (x < 1 || y < 1 || x > width - 2 || y > height - 2) break
+      if (lumaAt(gray, width, height, x, y) >= floor) {
+        lastX = x
+        lastY = y
+        onPaper = true
+        continue
+      }
+      if (onPaper) break
+    }
+    if (onPaper) addPoint(acc, Math.round(lastX), Math.round(lastY))
+  }
+  if (acc.count < 28) return null
+  try {
+    const ordered = orderCorners([acc.tl, acc.tr, acc.br, acc.bl])
+    if (!quadIsConvex(ordered)) return null
+    return ordered
+  } catch {
+    return null
   }
 }
 
@@ -317,6 +397,21 @@ export function snapToPaperCorners(
     const seedPx = toUnit(seed, sw, sh)
     const seedQuad = cornersFromUnit(seedPx, width, height)
     const seedKeystone = quadKeystone(seedQuad)
+    const origin = {
+      x: (seedQuad.tl.x + seedQuad.tr.x + seedQuad.br.x + seedQuad.bl.x) / 4,
+      y: (seedQuad.tl.y + seedQuad.tr.y + seedQuad.br.y + seedQuad.bl.y) / 4,
+    }
+    const radial = radialPaperQuad(gray, width, height, origin)
+    if (radial) {
+      const area = cornersArea(radial)
+      const seedArea = cornersArea(seedQuad)
+      const tighter = area <= seedArea * 0.97
+      const flattened = !tighter && quadKeystone(radial) + 0.03 < seedKeystone
+      if (quadIsConvex(radial) && area >= seedArea * 0.5 && area <= seedArea * 1.15 && !flattened) {
+        const grown = expand(radial, width, height, 0.015)
+        return cornersFromUnit(toUnit(grown, width, height), sw, sh)
+      }
+    }
     const roi = seedBox(seedQuad, width, height)
     const roiW = roi.maxX - roi.minX + 1
     const roiH = roi.maxY - roi.minY + 1
@@ -408,7 +503,8 @@ export function snapToPaperCorners(
     const seedArea = cornersArea(seedQuad)
     const area = cornersArea(ordered)
     if (area < seedArea * 0.55 || area > seedArea * 1.2) return null
-    if (quadKeystone(ordered) + 0.02 < seedKeystone) return null
+    const tighter = area <= seedArea * 0.97
+    if (!tighter && quadKeystone(ordered) + 0.03 < seedKeystone) return null
     const xs = [ordered.tl.x, ordered.tr.x, ordered.br.x, ordered.bl.x]
     const ys = [ordered.tl.y, ordered.tr.y, ordered.br.y, ordered.bl.y]
     if (
