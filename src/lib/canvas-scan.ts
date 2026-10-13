@@ -1,11 +1,12 @@
 ﻿import type { Corners, FilterMode, Point } from '../types'
 import { distance } from './geometry'
 import { nextFrame } from './image'
-import { getCv, isOpenCvReady, MatBin } from './opencv'
+import { cornersFromUnit, detectDocumentCorners } from './detect'
+import { getCv, isOpenCvReady, loadOpenCv, MatBin } from './opencv'
 
-/** 200 DPI A4: sharp on a phone, fast enough to warp without freezing. */
-const A4_SHORT = 1654
-const A4_LONG = 2339
+/** 300 DPI A4: 2480×3508 portrait, 3508×2480 landscape. */
+const A4_SHORT = 2480
+const A4_LONG = 3508
 
 function a4Page(landscape: boolean): { width: number; height: number } {
   return landscape ? { width: A4_LONG, height: A4_SHORT } : { width: A4_SHORT, height: A4_LONG }
@@ -22,7 +23,7 @@ function isLandscape(corners: Corners): boolean {
 }
 
 /** Destination mesh density: piecewise affine cells approximate the homography without seams. */
-const WARP_GRID = 8
+const WARP_GRID = 48
 
 /** Uniform mathematical scan: flat-field → luma curve → saturation → unsharp. No region masks. */
 const LIGHT_GRID = 16
@@ -338,7 +339,7 @@ async function warpCanvas(
   const padX = 0.45
   const padY = 0.45
   for (let gy = 0; gy < WARP_GRID; gy += 1) {
-    if (gy === 4) await nextFrame()
+    if (gy % 4 === 0) await nextFrame()
     const y0 = (gy / WARP_GRID) * height
     const y1 = ((gy + 1) / WARP_GRID) * height
     const dy0 = gy === 0 ? y0 : y0 - padY
@@ -755,10 +756,19 @@ export async function straightenCanvas(
   image: CanvasImageSource,
   corners: Corners,
 ): Promise<HTMLCanvasElement> {
-  const { width, height } = a4Page(isLandscape(corners))
   const copy = drawSource(image)
+  const found = detectDocumentCorners(copy)
+  const quad = found ? cornersFromUnit(found, copy.width, copy.height) : corners
+  const { width, height } = a4Page(isLandscape(quad))
+  if (!isOpenCvReady()) {
+    try {
+      await loadOpenCv()
+    } catch {
+      // JS mesh still maps the four paper corners onto a flat A4 page.
+    }
+  }
   try {
-    return await warpCanvas(copy, corners, width, height)
+    return await warpCanvas(copy, quad, width, height)
   } finally {
     copy.width = 0
     copy.height = 0
