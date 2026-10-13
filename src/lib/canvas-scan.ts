@@ -1,5 +1,4 @@
 ﻿import type { Corners, FilterMode, Point } from '../types'
-import { snapToPaperCorners } from './detect'
 import { distance } from './geometry'
 import { nextFrame } from './image'
 
@@ -722,10 +721,9 @@ export async function straightenCanvas(
   corners: Corners,
 ): Promise<HTMLCanvasElement> {
   const copy = drawSource(image)
-  const page = snapToPaperCorners(copy, corners) ?? corners
-  const { width, height } = a4Page(isLandscape(page))
+  const { width, height } = a4Page(isLandscape(corners))
   try {
-    return await warpCanvas(copy, page, width, height)
+    return await warpCanvas(copy, corners, width, height)
   } finally {
     copy.width = 0
     copy.height = 0

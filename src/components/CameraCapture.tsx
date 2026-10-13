@@ -7,7 +7,9 @@ import type { CaptureHint, Corners } from '../types'
 
 /** Live detection on a 200px canvas copy. Always reschedules so a throw cannot freeze the box. */
 const LIVE_INTERVAL_MS = 120
-const LIVE_TRACK = 0.55
+const LIVE_TRACK = 0.2
+const LIVE_JUMP = 0.16
+const LIVE_MISS = 5
 
 type LiveQuad = { corners: Corners; width: number; height: number; at: number }
 
@@ -17,6 +19,14 @@ function blend(from: Corners, to: Corners, amount: number): Corners {
     y: a.y + (b.y - a.y) * amount,
   })
   return { tl: mix(from.tl, to.tl), tr: mix(from.tr, to.tr), br: mix(from.br, to.br), bl: mix(from.bl, to.bl) }
+}
+
+function jumpSize(from: Corners, to: Corners, width: number, height: number) {
+  const dist = (a: { x: number; y: number }, b: { x: number; y: number }) =>
+    Math.hypot((a.x - b.x) / width, (a.y - b.y) / height)
+  return (
+    (dist(from.tl, to.tl) + dist(from.tr, to.tr) + dist(from.br, to.br) + dist(from.bl, to.bl)) / 4
+  )
 }
 
 type ImageCaptureInstance = {
@@ -62,6 +72,8 @@ export function CameraCapture() {
     let timer = 0
     let frame = 0
     let current: LiveQuad | null = null
+    let misses = 0
+    let spikes = 0
 
     const clearBox = () => {
       if (!current) return
@@ -69,6 +81,8 @@ export function CameraCapture() {
       quadRef.current = null
       setQuad(null)
       clearLiveLock()
+      misses = 0
+      spikes = 0
     }
 
     const tick = () => {
@@ -81,17 +95,26 @@ export function CameraCapture() {
           const unit = detectDocumentCorners(video)
           if (unit) {
             const pixels = cornersFromUnit(unit, width, height)
-            current = {
-              corners: current && current.width === width ? blend(current.corners, pixels, LIVE_TRACK) : pixels,
-              width,
-              height,
-              at: performance.now(),
+            const jumped =
+              current && current.width === width && jumpSize(current.corners, pixels, width, height) > LIVE_JUMP
+            if (jumped && spikes < 2) {
+              spikes += 1
+            } else {
+              spikes = 0
+              misses = 0
+              current = {
+                corners: current && current.width === width ? blend(current.corners, pixels, LIVE_TRACK) : pixels,
+                width,
+                height,
+                at: performance.now(),
+              }
+              quadRef.current = current
+              setQuad(current)
+              rememberLiveLock(unitHintFromLive(current, false))
             }
-            quadRef.current = current
-            setQuad(current)
-            rememberLiveLock(unitHintFromLive(current, false))
           } else {
-            clearBox()
+            misses += 1
+            if (misses >= LIVE_MISS) clearBox()
           }
         }
       } catch (err) {

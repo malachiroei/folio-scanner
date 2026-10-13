@@ -1,12 +1,9 @@
 import type { Corners, Point } from '../types'
-import { cornersArea, orderCorners, quadIsConvex, quadKeystone } from './geometry'
 
 const DETECT_WIDTH = 240
-const SNAP_WIDTH = 320
 const MIN_AREA = 0.08
 const MAX_AREA = 0.88
-const MARGIN = 0.02
-const DARK_ROW = 85
+const MARGIN = 0.04
 
 const sample = document.createElement('canvas')
 const sampleCtx = sample.getContext('2d', { willReadFrequently: true })
@@ -19,21 +16,16 @@ function sourceSize(source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElem
   return { width: source.width, height: source.height }
 }
 
-function grabFrame(
-  source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElement,
-  maxWidth = DETECT_WIDTH,
-  smooth = false,
-): ImageData | null {
+function grabFrame(source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElement): ImageData | null {
   if (!sampleCtx) return null
   const { width: sw, height: sh } = sourceSize(source)
   if (sw < 8 || sh < 8) return null
-  const scale = Math.min(1, maxWidth / sw)
+  const scale = Math.min(1, DETECT_WIDTH / sw)
   const width = Math.max(1, Math.round(sw * scale))
   const height = Math.max(1, Math.round(sh * scale))
   if (sample.width !== width) sample.width = width
   if (sample.height !== height) sample.height = height
-  sampleCtx.imageSmoothingEnabled = smooth
-  if (smooth) sampleCtx.imageSmoothingQuality = 'high'
+  sampleCtx.imageSmoothingEnabled = false
   sampleCtx.drawImage(source, 0, 0, width, height)
   return sampleCtx.getImageData(0, 0, width, height)
 }
@@ -85,10 +77,7 @@ function otsu(gray: Uint8Array): number {
   return threshold
 }
 
-type BlobHit = {
-  count: number
-  corners: Corners
-}
+type BlobHit = { corners: Corners; count: number }
 
 function extrema() {
   return {
@@ -179,17 +168,14 @@ function largestBrightBlob(gray: Uint8Array, width: number, height: number, thre
     const touch =
       Number(acc.minX <= 1) + Number(acc.minY <= 1) + Number(acc.maxX >= width - 2) + Number(acc.maxY >= height - 2)
     if (touch >= 4) continue
-    best = {
-      count: acc.count,
-      corners: { tl: acc.tl, tr: acc.tr, br: acc.br, bl: acc.bl },
-    }
+    best = { count: acc.count, corners: { tl: acc.tl, tr: acc.tr, br: acc.br, bl: acc.bl } }
   }
   return best
 }
 
 /**
- * Largest bright page (the white sheet), not the printed ink. Ink extrema lock onto
- * handwriting and cut the table; the paper blob is the orange frame and the warp quad.
+ * Largest bright page blob. No ray-cast, no ink snap — those made the live box thrash
+ * and cropped the page after the user set pins.
  */
 export function detectDocumentCorners(
   source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElement,
@@ -206,317 +192,12 @@ export function detectDocumentCorners(
       sum += value
     }
     if (sum / gray.length < 12) return null
-    const otsuT = Math.min(210, Math.max(130, otsu(gray)))
-    const paperT = Math.max(otsuT, 162)
-    const blob = largestBrightBlob(gray, width, height, paperT) ?? largestBrightBlob(gray, width, height, otsuT)
-    const origin = blob
-      ? {
-          x: (blob.corners.tl.x + blob.corners.tr.x + blob.corners.br.x + blob.corners.bl.x) / 4,
-          y: (blob.corners.tl.y + blob.corners.tr.y + blob.corners.br.y + blob.corners.bl.y) / 4,
-        }
-      : { x: width / 2, y: height / 2 }
-    const radial = radialPaperQuad(gray, width, height, origin)
-    const quad = radial ?? blob?.corners
-    if (!quad) return null
-    return toUnit(expand(quad, width, height, MARGIN), width, height)
+    const threshold = Math.min(210, Math.max(130, otsu(gray)))
+    const blob = largestBrightBlob(gray, width, height, threshold)
+    if (!blob) return null
+    return toUnit(expand(blob.corners, width, height, MARGIN), width, height)
   } catch (err) {
     console.warn('Detection failed:', err)
-    return null
-  }
-}
-
-type Box = { minX: number; minY: number; maxX: number; maxY: number }
-
-function seedBox(seed: Corners, width: number, height: number): Box {
-  const xs = [seed.tl.x, seed.tr.x, seed.br.x, seed.bl.x]
-  const ys = [seed.tl.y, seed.tr.y, seed.br.y, seed.bl.y]
-  const padX = Math.max(2, (Math.max(...xs) - Math.min(...xs)) * 0.02)
-  const padY = Math.max(2, (Math.max(...ys) - Math.min(...ys)) * 0.02)
-  return {
-    minX: Math.max(0, Math.floor(Math.min(...xs) - padX)),
-    minY: Math.max(0, Math.floor(Math.min(...ys) - padY)),
-    maxX: Math.min(width - 1, Math.ceil(Math.max(...xs) + padX)),
-    maxY: Math.min(height - 1, Math.ceil(Math.max(...ys) + padY)),
-  }
-}
-
-function lumaAt(gray: Uint8Array, width: number, height: number, x: number, y: number) {
-  const xx = Math.max(0, Math.min(width - 1, Math.round(x)))
-  const yy = Math.max(0, Math.min(height - 1, Math.round(y)))
-  return gray[yy * width + xx] ?? 0
-}
-
-function brightestNear(gray: Uint8Array, width: number, height: number, point: Point, radius: number): Point {
-  let best = point
-  let peak = -1
-  for (let y = Math.round(point.y) - radius; y <= Math.round(point.y) + radius; y += 1) {
-    if (y < 0 || y >= height) continue
-    for (let x = Math.round(point.x) - radius; x <= Math.round(point.x) + radius; x += 1) {
-      if (x < 0 || x >= width) continue
-      const g = gray[y * width + x] ?? 0
-      if (g > peak) {
-        peak = g
-        best = { x, y }
-      }
-    }
-  }
-  return best
-}
-
-/**
- * Walk out from the page center until luma drops off the sheet. Keyboard, jeans and desk
- * fall away; the last paper pixel on each ray is the real outline, including a crumpled edge.
- */
-function radialPaperQuad(gray: Uint8Array, width: number, height: number, guess: Point): Corners | null {
-  const origin = brightestNear(gray, width, height, guess, 8)
-  const seed =
-    (lumaAt(gray, width, height, origin.x, origin.y) +
-      lumaAt(gray, width, height, origin.x - 2, origin.y) +
-      lumaAt(gray, width, height, origin.x + 2, origin.y) +
-      lumaAt(gray, width, height, origin.x, origin.y - 2) +
-      lumaAt(gray, width, height, origin.x, origin.y + 2)) /
-    5
-  if (seed < 120) return null
-  const floor = Math.max(100, seed - 38)
-  const acc = extrema()
-  const maxR = Math.hypot(width, height)
-  const rays = 72
-  for (let i = 0; i < rays; i += 1) {
-    const ang = (Math.PI * 2 * i) / rays
-    const dx = Math.cos(ang)
-    const dy = Math.sin(ang)
-    let lastX = origin.x
-    let lastY = origin.y
-    let onPaper = false
-    for (let r = 3; r < maxR; r += 1) {
-      const x = origin.x + dx * r
-      const y = origin.y + dy * r
-      if (x < 1 || y < 1 || x > width - 2 || y > height - 2) break
-      if (lumaAt(gray, width, height, x, y) >= floor) {
-        lastX = x
-        lastY = y
-        onPaper = true
-        continue
-      }
-      if (onPaper) break
-    }
-    if (onPaper) addPoint(acc, Math.round(lastX), Math.round(lastY))
-  }
-  if (acc.count < 28) return null
-  try {
-    const ordered = orderCorners([acc.tl, acc.tr, acc.br, acc.bl])
-    if (!quadIsConvex(ordered)) return null
-    return ordered
-  } catch {
-    return null
-  }
-}
-
-function blurGray(gray: Uint8Array, width: number, height: number): Uint8Array {
-  const out = new Uint8Array(gray.length)
-  for (let y = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) {
-      let sum = 0
-      let count = 0
-      for (let dy = -1; dy <= 1; dy += 1) {
-        const yy = y + dy
-        if (yy < 0 || yy >= height) continue
-        const row = yy * width
-        for (let dx = -1; dx <= 1; dx += 1) {
-          const xx = x + dx
-          if (xx < 0 || xx >= width) continue
-          sum += gray[row + xx] ?? 0
-          count += 1
-        }
-      }
-      out[y * width + x] = count ? (sum / count) | 0 : (gray[y * width + x] ?? 0)
-    }
-  }
-  return out
-}
-
-function fitLinear(indep: number[], dep: number[]): { a: number; b: number } | null {
-  const fit = (idx: number[]) => {
-    const n = idx.length
-    if (n < 8) return null
-    let sumX = 0
-    let sumY = 0
-    let sumXX = 0
-    let sumXY = 0
-    for (const i of idx) {
-      const x = indep[i] ?? 0
-      const y = dep[i] ?? 0
-      sumX += x
-      sumY += y
-      sumXX += x * x
-      sumXY += x * y
-    }
-    const denom = n * sumXX - sumX * sumX
-    if (Math.abs(denom) < 1e-6) return { a: 0, b: sumY / n }
-    const a = (n * sumXY - sumX * sumY) / denom
-    return { a, b: (sumY - a * sumX) / n }
-  }
-  const all = indep.map((_, i) => i)
-  const first = fit(all)
-  if (!first) return null
-  const ranked = all
-    .map((i) => ({ i, e: Math.abs((dep[i] ?? 0) - (first.a * (indep[i] ?? 0) + first.b)) }))
-    .sort((a, b) => a.e - b.e)
-  const keep = ranked.slice(0, Math.max(8, Math.floor(ranked.length * 0.8))).map((item) => item.i)
-  return fit(keep) ?? first
-}
-
-function intersectEdge(vert: { a: number; b: number }, horz: { a: number; b: number }): Point | null {
-  const denom = 1 - vert.a * horz.a
-  if (Math.abs(denom) < 1e-6) return null
-  const x = (vert.a * horz.b + vert.b) / denom
-  const y = horz.a * x + horz.b
-  if (!Number.isFinite(x) || !Number.isFinite(y)) return null
-  return { x, y }
-}
-
-/**
- * White-sheet edges inside the crop pins (not ink). Their trapezoid is what the warp
- * stretches until the page faces the camera — without cutting to handwriting.
- */
-export function snapToPaperCorners(
-  source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElement,
-  seed: Corners,
-): Corners | null {
-  try {
-    const { width: sw, height: sh } = sourceSize(source)
-    if (sw < 8 || sh < 8) return null
-    const image = grabFrame(source, SNAP_WIDTH, true)
-    if (!image) return null
-    const { width, height, data } = image
-    const raw = new Uint8Array(width * height)
-    for (let i = 0, p = 0; i < raw.length; i += 1, p += 4) {
-      raw[i] = (0.299 * (data[p] ?? 0) + 0.587 * (data[p + 1] ?? 0) + 0.114 * (data[p + 2] ?? 0)) | 0
-    }
-    const gray = blurGray(raw, width, height)
-    const seedPx = toUnit(seed, sw, sh)
-    const seedQuad = cornersFromUnit(seedPx, width, height)
-    const seedKeystone = quadKeystone(seedQuad)
-    const origin = {
-      x: (seedQuad.tl.x + seedQuad.tr.x + seedQuad.br.x + seedQuad.bl.x) / 4,
-      y: (seedQuad.tl.y + seedQuad.tr.y + seedQuad.br.y + seedQuad.bl.y) / 4,
-    }
-    const radial = radialPaperQuad(gray, width, height, origin)
-    if (radial) {
-      const area = cornersArea(radial)
-      const seedArea = cornersArea(seedQuad)
-      const tighter = area <= seedArea * 0.97
-      const flattened = !tighter && quadKeystone(radial) + 0.03 < seedKeystone
-      if (quadIsConvex(radial) && area >= seedArea * 0.5 && area <= seedArea * 1.15 && !flattened) {
-        const grown = expand(radial, width, height, 0.015)
-        return cornersFromUnit(toUnit(grown, width, height), sw, sh)
-      }
-    }
-    const roi = seedBox(seedQuad, width, height)
-    const roiW = roi.maxX - roi.minX + 1
-    const roiH = roi.maxY - roi.minY + 1
-    if (roiW < 24 || roiH < 24) return null
-    const threshold = Math.min(210, Math.max(162, otsu(gray)))
-    const minSpanX = Math.max(8, roiW * 0.28)
-    const minSpanY = Math.max(8, roiH * 0.28)
-
-    const leftX: number[] = []
-    const leftY: number[] = []
-    const rightX: number[] = []
-    const rightY: number[] = []
-    for (let y = roi.minY; y <= roi.maxY; y += 1) {
-      const row = y * width
-      let luma = 0
-      let lo = -1
-      let hi = -1
-      let bright = 0
-      for (let x = roi.minX; x <= roi.maxX; x += 1) {
-        const g = gray[row + x] ?? 0
-        luma += g
-        if (g <= threshold) continue
-        if (lo < 0) lo = x
-        hi = x
-        bright += 1
-      }
-      if (bright < minSpanX || luma / roiW < DARK_ROW || lo < 0) continue
-      leftX.push(lo)
-      leftY.push(y)
-      rightX.push(hi)
-      rightY.push(y)
-    }
-
-    const topX: number[] = []
-    const topY: number[] = []
-    const botX: number[] = []
-    const botY: number[] = []
-    for (let x = roi.minX; x <= roi.maxX; x += 1) {
-      let lo = -1
-      let hi = -1
-      let bright = 0
-      for (let y = roi.minY; y <= roi.maxY; y += 1) {
-        const g = gray[y * width + x] ?? 0
-        if (g <= threshold) continue
-        if (lo < 0) lo = y
-        hi = y
-        bright += 1
-      }
-      if (bright < minSpanY || lo < 0) continue
-      topX.push(x)
-      topY.push(lo)
-      botX.push(x)
-      botY.push(hi)
-    }
-
-    const left = fitLinear(leftY, leftX)
-    const right = fitLinear(rightY, rightX)
-    const top = fitLinear(topX, topY)
-    const bottom = fitLinear(botX, botY)
-    if (!left || !right) return null
-
-    const atY = (edge: { a: number; b: number }, y: number) => ({ x: edge.a * y + edge.b, y })
-    let tl: Point | null = null
-    let tr: Point | null = null
-    let br: Point | null = null
-    let bl: Point | null = null
-    if (top && bottom) {
-      tl = intersectEdge(left, top)
-      tr = intersectEdge(right, top)
-      br = intersectEdge(right, bottom)
-      bl = intersectEdge(left, bottom)
-    }
-    if (!tl || !tr || !br || !bl) {
-      const y0 = leftY[Math.floor(leftY.length * 0.04)] ?? roi.minY
-      const y1 = leftY[Math.floor(leftY.length * 0.96)] ?? roi.maxY
-      tl = atY(left, y0)
-      tr = atY(right, y0)
-      br = atY(right, y1)
-      bl = atY(left, y1)
-    }
-
-    let ordered: Corners
-    try {
-      ordered = orderCorners([tl, tr, br, bl])
-    } catch {
-      return null
-    }
-    if (!quadIsConvex(ordered)) return null
-    const seedArea = cornersArea(seedQuad)
-    const area = cornersArea(ordered)
-    if (area < seedArea * 0.55 || area > seedArea * 1.2) return null
-    const tighter = area <= seedArea * 0.97
-    if (!tighter && quadKeystone(ordered) + 0.03 < seedKeystone) return null
-    const xs = [ordered.tl.x, ordered.tr.x, ordered.br.x, ordered.bl.x]
-    const ys = [ordered.tl.y, ordered.tr.y, ordered.br.y, ordered.bl.y]
-    if (
-      xs.some((x) => x < roi.minX - roiW * 0.08 || x > roi.maxX + roiW * 0.08) ||
-      ys.some((y) => y < roi.minY - roiH * 0.08 || y > roi.maxY + roiH * 0.08)
-    ) {
-      return null
-    }
-    const grown = expand(ordered, width, height, 0.02)
-    return cornersFromUnit(toUnit(grown, width, height), sw, sh)
-  } catch (err) {
-    console.warn('Paper snap failed:', err)
     return null
   }
 }
