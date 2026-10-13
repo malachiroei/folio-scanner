@@ -94,6 +94,10 @@ export function ScanProvider({ children }: { children: ReactNode }) {
   }, [toast])
 
   useEffect(() => {
+    beginVisionLoad()
+  }, [])
+
+  useEffect(() => {
     const report = (error: unknown) => {
       console.error(error)
       setToast(errorMessage(error))
@@ -246,11 +250,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
         stopDetecting()
         return
       }
-      if (!isOpenCvReady()) {
-        stopDetecting()
-        return
-      }
-      const unit = detectDocumentCorners(getCv(), image)
+      const unit = detectDocumentCorners(image, isOpenCvReady() ? getCv() : null)
       if (cancelled() || !unit) {
         stopDetecting()
         return
