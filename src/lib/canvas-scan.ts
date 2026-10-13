@@ -2,9 +2,9 @@
 import { distance } from './geometry'
 import { nextFrame } from './image'
 
-/** ~200 DPI A4. Full 300 DPI (3508) froze phones; 1600 made small Hebrew text mushy. */
-const WARP_LONG = 2200
-const WARP_SOURCE = 3000
+/** ~277 DPI A4 — 147% of the 2200 pass that still looked soft at 100% zoom. */
+const WARP_LONG = 3234
+const WARP_SOURCE = 4032
 
 function a4Page(landscape: boolean): { width: number; height: number } {
   const short = Math.round(WARP_LONG / Math.SQRT2)
@@ -319,7 +319,7 @@ async function warpCanvas(
   const out = dest.data
 
   for (let y = 0; y < height; y += 1) {
-    if (y % 40 === 0) await nextFrame()
+    if (y % 24 === 0) await nextFrame()
     for (let x = 0; x < width; x += 1) {
       const sample = mapHomography(map, x + 0.5, y + 0.5)
       sampleBilinear(srcData, sw, sh, sample.x, sample.y, out, (y * width + x) * 4)
