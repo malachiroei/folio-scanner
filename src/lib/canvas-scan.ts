@@ -2,9 +2,9 @@
 import { distance } from './geometry'
 import { nextFrame } from './image'
 
-/** ~277 DPI A4 — 147% of the 2200 pass that still looked soft at 100% zoom. */
-const WARP_LONG = 3234
-const WARP_SOURCE = 4032
+/** 125% of the 3234 page that looked right when the PDF was zoomed to 125%. */
+const WARP_LONG = 4042
+const WARP_SOURCE = 4600
 
 function a4Page(landscape: boolean): { width: number; height: number } {
   const short = Math.round(WARP_LONG / Math.SQRT2)
@@ -33,6 +33,7 @@ const PAPER_LUMA = 215
 const PAPER_SAT = 0.1
 const INK_SAT = 0.12
 const INK_HARD = 90
+const FAINT_INK = 150
 const MID_DARK = 175
 const SHADOW_TARGET = 20
 const MID_DARK_TARGET = 100
@@ -319,7 +320,7 @@ async function warpCanvas(
   const out = dest.data
 
   for (let y = 0; y < height; y += 1) {
-    if (y % 24 === 0) await nextFrame()
+    if (y % 20 === 0) await nextFrame()
     for (let x = 0; x < width; x += 1) {
       const sample = mapHomography(map, x + 0.5, y + 0.5)
       sampleBilinear(srcData, sw, sh, sample.x, sample.y, out, (y * width + x) * 4)
@@ -597,13 +598,13 @@ async function whiteBalanceRgb(
 }
 
 /**
- * Contrast stretch: gray print (L < 175, S < 0.12) → toward #151515; colored
- * midtones stay continuous; paper snaps to white. No region mask.
+ * Contrast stretch: gray print (L < 150, S < 0.12) → toward #151515; colored
+ * midtones stay continuous; paper snaps to white. Grain at 150–175 stays paper.
  */
 function scanLuma(normL: number, sat: number) {
   let next: number
-  if (normL < MID_DARK && sat < INK_SAT) {
-    next = Math.floor(Math.pow(Math.max(0, normL) / MID_DARK, 1.5) * INK_FAINT_GAIN)
+  if (normL < FAINT_INK && sat < INK_SAT) {
+    next = Math.floor(Math.pow(Math.max(0, normL) / FAINT_INK, 1.5) * INK_FAINT_GAIN)
   } else if (normL < INK_HARD) {
     next = Math.floor((normL / INK_HARD) * SHADOW_TARGET)
   } else if (normL < MID_DARK) {
@@ -681,6 +682,160 @@ function sharpenLuma(image: ImageData) {
   }
 }
 
+/** Isolated dark specks (dust / sensor noise), not strokes of letters or barcode modules. */
+async function despeckle(
+  data: Uint8ClampedArray,
+  width: number,
+  height: number,
+  clock: { last: number },
+) {
+  const n = width * height
+  const gray = new Uint8Array(n)
+  for (let p = 0, i = 0; p < n; p += 1, i += 4) {
+    gray[p] = pixelLuma(data[i] ?? 0, data[i + 1] ?? 0, data[i + 2] ?? 0) | 0
+  }
+  const seen = new Uint8Array(n)
+  const stack = new Int32Array(n)
+  const cells = new Int32Array(8)
+  const yieldEvery = Math.max(width * 20, 1)
+  for (let start = 0; start < n; start += 1) {
+    if (start % yieldEvery === 0) await yieldBusy(clock)
+    if (seen[start] || (gray[start] ?? 255) >= 108) continue
+    let top = 0
+    stack[0] = start
+    top = 1
+    seen[start] = 1
+    let count = 0
+    let minX = width
+    let minY = height
+    let maxX = 0
+    let maxY = 0
+    while (top > 0) {
+      top -= 1
+      const index = stack[top] ?? 0
+      if (count < 8) cells[count] = index
+      count += 1
+      const x = index % width
+      const y = (index - x) / width
+      if (x < minX) minX = x
+      if (y < minY) minY = y
+      if (x > maxX) maxX = x
+      if (y > maxY) maxY = y
+      if (x > 0) {
+        const next = index - 1
+        if (!seen[next] && (gray[next] ?? 255) < 108) {
+          seen[next] = 1
+          stack[top] = next
+          top += 1
+        }
+      }
+      if (x + 1 < width) {
+        const next = index + 1
+        if (!seen[next] && (gray[next] ?? 255) < 108) {
+          seen[next] = 1
+          stack[top] = next
+          top += 1
+        }
+      }
+      if (y > 0) {
+        const next = index - width
+        if (!seen[next] && (gray[next] ?? 255) < 108) {
+          seen[next] = 1
+          stack[top] = next
+          top += 1
+        }
+      }
+      if (y + 1 < height) {
+        const next = index + width
+        if (!seen[next] && (gray[next] ?? 255) < 108) {
+          seen[next] = 1
+          stack[top] = next
+          top += 1
+        }
+      }
+    }
+    if (count > 8 || maxX - minX > 3 || maxY - minY > 3) continue
+    for (let c = 0; c < count; c += 1) {
+      const index = cells[c] ?? 0
+      const x = index % width
+      const y = (index - x) / width
+      let sr = 0
+      let sg = 0
+      let sb = 0
+      let paper = 0
+      for (let dy = -2; dy <= 2; dy += 1) {
+        const yy = y + dy
+        if (yy < 0 || yy >= height) continue
+        for (let dx = -2; dx <= 2; dx += 1) {
+          const xx = x + dx
+          if (xx < 0 || xx >= width) continue
+          const g = gray[yy * width + xx] ?? 0
+          if (g < 160) continue
+          const i = (yy * width + xx) * 4
+          sr += data[i] ?? 255
+          sg += data[i + 1] ?? 255
+          sb += data[i + 2] ?? 255
+          paper += 1
+        }
+      }
+      const i = index * 4
+      data[i] = paper ? (sr / paper) | 0 : 255
+      data[i + 1] = paper ? (sg / paper) | 0 : 255
+      data[i + 2] = paper ? (sb / paper) | 0 : 255
+    }
+  }
+}
+
+function edgeIsKeyboard(data: Uint8ClampedArray, width: number, height: number, axis: 'row' | 'col', index: number) {
+  const span = axis === 'row' ? width : height
+  let dark = 0
+  let paper = 0
+  let sum = 0
+  for (let k = 0; k < span; k += 1) {
+    const i = axis === 'row' ? (index * width + k) * 4 : (k * width + index) * 4
+    const luma = pixelLuma(data[i] ?? 0, data[i + 1] ?? 0, data[i + 2] ?? 0)
+    sum += luma
+    if (luma < 58) dark += 1
+    if (luma > 175) paper += 1
+  }
+  return sum / span < 58 && dark > span * 0.55 && paper < span * 0.1
+}
+
+/** Drop keyboard / jeans strips that rode along after the warp. Never more than 12% per side. */
+function trimDarkMargins(source: HTMLCanvasElement): HTMLCanvasElement {
+  const context = source.getContext('2d', { willReadFrequently: true })
+  if (!context) return source
+  const { width, height } = source
+  const image = context.getImageData(0, 0, width, height)
+  const data = image.data
+  const maxY = Math.floor(height * 0.12)
+  const maxX = Math.floor(width * 0.08)
+  let top = 0
+  let bottom = height
+  let left = 0
+  let right = width
+  while (top < maxY && edgeIsKeyboard(data, width, height, 'row', top)) top += 1
+  while (bottom - 1 > height - 1 - maxY && bottom - 1 > top + 32 && edgeIsKeyboard(data, width, height, 'row', bottom - 1)) {
+    bottom -= 1
+  }
+  while (left < maxX && edgeIsKeyboard(data, width, height, 'col', left)) left += 1
+  while (right - 1 > width - 1 - maxX && right - 1 > left + 32 && edgeIsKeyboard(data, width, height, 'col', right - 1)) {
+    right -= 1
+  }
+  if (top === 0 && bottom === height && left === 0 && right === width) return source
+  const cropW = right - left
+  const cropH = bottom - top
+  if (cropW < 64 || cropH < 64) return source
+  const canvas = document.createElement('canvas')
+  canvas.width = cropW
+  canvas.height = cropH
+  const next = canvas.getContext('2d')
+  if (!next) return source
+  highQuality(next)
+  next.drawImage(source, left, top, cropW, cropH, 0, 0, cropW, cropH)
+  return canvas
+}
+
 function desaturatePixels(data: Uint8ClampedArray) {
   for (let i = 0; i < data.length; i += 4) {
     const tone = Math.round(pixelLuma(data[i] ?? 0, data[i + 1] ?? 0, data[i + 2] ?? 0))
@@ -696,6 +851,7 @@ async function applyMagicColor(image: ImageData) {
   await whiteBalanceRgb(data, width, height, clock)
   await applyScanTone(data, width, height, clock)
   sharpenLuma(image)
+  await despeckle(data, width, height, clock)
 }
 
 async function applyFastBlackWhite(image: ImageData) {
@@ -704,6 +860,7 @@ async function applyFastBlackWhite(image: ImageData) {
   await whiteBalanceRgb(data, width, height, clock)
   await applyScanTone(data, width, height, clock)
   sharpenLuma(image)
+  await despeckle(data, width, height, clock)
   desaturatePixels(data)
   await yieldBusy(clock)
 }
@@ -724,7 +881,8 @@ export async function straightenCanvas(
   const copy = drawSource(image)
   const { width, height } = a4Page(isLandscape(corners))
   try {
-    return await warpCanvas(copy, corners, width, height)
+    const warped = await warpCanvas(copy, corners, width, height)
+    return trimDarkMargins(warped)
   } finally {
     copy.width = 0
     copy.height = 0

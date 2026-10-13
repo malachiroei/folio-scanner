@@ -2,8 +2,8 @@ import { jsPDF } from 'jspdf'
 import type { ScanPage } from '../types'
 import { canvasToJpegBlob, downloadBlob, loadImage } from './image'
 
-/** Page image: up to full A4 at 300 DPI (3508px long edge). Keep the stored JPEG when possible. */
-export const PDF_MAX_EDGE = 3508
+/** Page image: keep the 125% scan (4042px long edge) without a second downscale. */
+export const PDF_MAX_EDGE = 4096
 export const PDF_JPEG_QUALITY = 0.95
 
 /** A page stored at full size is embedded as is (no second JPEG pass) when it is smaller than this. */
