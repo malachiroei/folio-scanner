@@ -2,8 +2,9 @@
 import { distance } from './geometry'
 import { nextFrame } from './image'
 
-/** Fast A4-shaped page. Full 300 DPI (3508) freezes phones during warp. */
-const WARP_LONG = 1600
+/** ~200 DPI A4. Full 300 DPI (3508) froze phones; 1600 made small Hebrew text mushy. */
+const WARP_LONG = 2200
+const WARP_SOURCE = 3000
 
 function a4Page(landscape: boolean): { width: number; height: number } {
   const short = Math.round(WARP_LONG / Math.SQRT2)
@@ -35,10 +36,10 @@ const INK_HARD = 90
 const MID_DARK = 175
 const SHADOW_TARGET = 20
 const MID_DARK_TARGET = 100
-const INK_FAINT_GAIN = 85
+const INK_FAINT_GAIN = 70
 const HIGHLIGHT_TARGET = 220
-const SHARPEN_AMOUNT = 1.25
-const SHARPEN_NOISE = 3
+const SHARPEN_AMOUNT = 1.7
+const SHARPEN_NOISE = 2
 const YIELD_MS = 24
 
 function sourceSize(image: CanvasImageSource): { width: number; height: number } {
@@ -283,7 +284,7 @@ async function warpCanvas(
   width: number,
   height: number,
 ): Promise<HTMLCanvasElement> {
-  const shrunk = scaleSource(source, 2000)
+  const shrunk = scaleSource(source, WARP_SOURCE)
   const quad: Corners = {
     tl: { x: corners.tl.x * shrunk.scale, y: corners.tl.y * shrunk.scale },
     tr: { x: corners.tr.x * shrunk.scale, y: corners.tr.y * shrunk.scale },
@@ -318,7 +319,7 @@ async function warpCanvas(
   const out = dest.data
 
   for (let y = 0; y < height; y += 1) {
-    if (y % 48 === 0) await nextFrame()
+    if (y % 40 === 0) await nextFrame()
     for (let x = 0; x < width; x += 1) {
       const sample = mapHomography(map, x + 0.5, y + 0.5)
       sampleBilinear(srcData, sw, sh, sample.x, sample.y, out, (y * width + x) * 4)
@@ -646,7 +647,7 @@ async function applyScanTone(
   }
 }
 
-/** Unsharp mask: skip |L − blur| < 3, boost 1.25, clamp 0–255. */
+/** Unsharp mask: skip |L − blur| < 2, boost 1.7 so print stays crisp after the warp. */
 function sharpenLuma(image: ImageData) {
   const { data, width, height } = image
   const gray = new Float32Array(width * height)
