@@ -1,5 +1,4 @@
 ﻿import type { Corners, FilterMode, Point } from '../types'
-import { refineDocumentCorners } from './detect'
 import { distance } from './geometry'
 import { nextFrame } from './image'
 
@@ -658,10 +657,9 @@ export async function straightenCanvas(
   corners: Corners,
 ): Promise<HTMLCanvasElement> {
   const copy = drawSource(image)
-  const refined = refineDocumentCorners(copy, corners) ?? corners
-  const { width, height } = a4Page(isLandscape(refined))
+  const { width, height } = a4Page(isLandscape(corners))
   try {
-    return await warpCanvas(copy, refined, width, height)
+    return await warpCanvas(copy, corners, width, height)
   } finally {
     copy.width = 0
     copy.height = 0
