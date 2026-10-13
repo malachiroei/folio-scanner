@@ -95,7 +95,7 @@ export async function buildPagesPdf(pages: ScanPage[], options: PdfOptions = {})
   const quality = options.quality ?? PDF_JPEG_QUALITY
 
   let doc: jsPDF | null = null
-  for (const page of pages) {
+  for (const [index, page] of pages.entries()) {
     const { pw, ph, orientation } = pageFormat(page.resultWidth, page.resultHeight)
     if (!doc) {
       doc = new jsPDF({
@@ -108,7 +108,7 @@ export async function buildPagesPdf(pages: ScanPage[], options: PdfOptions = {})
       doc.addPage([pw, ph], orientation)
     }
     const dataUrl = await encodePage(page.resultUrl, maxEdge, quality)
-    doc.addImage(dataUrl, 'JPEG', 0, 0, pw, ph, undefined, 'FAST')
+    doc.addImage(dataUrl, 'JPEG', 0, 0, pw, ph, `p${index + 1}`, 'FAST')
   }
 
   if (!doc) throw new Error('הוסף עמוד לפני הייצוא.')
