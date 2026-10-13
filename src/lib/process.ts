@@ -22,7 +22,7 @@ async function renderWithCanvas(
   return { canvas, width: canvas.width, height: canvas.height }
 }
 
-/** Perspective warp onto a full A4 canvas (2480×3508 portrait or 3508×2480 landscape). */
+/** Perspective warp onto a full A4 canvas. */
 export async function straightenDocument(
   image: CanvasImageSource,
   corners: Corners,
