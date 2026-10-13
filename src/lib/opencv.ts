@@ -18,7 +18,9 @@ export type CvMatVector = {
 }
 
 export type Cv = {
-  Mat: new (...args: unknown[]) => CvMat
+  Mat: (new (...args: unknown[]) => CvMat) & {
+    ones: (rows: number, cols: number, type: number) => CvMat
+  }
   MatVector: new () => CvMatVector
   Size: new (width: number, height: number) => object
   Scalar: new (...values: number[]) => object
@@ -70,6 +72,7 @@ export type Cv = {
   boxPoints?: (rect: unknown) => CvMat
   RotatedRect: { points: (rect: unknown) => { x: number; y: number }[] }
   matFromArray: (rows: number, cols: number, type: number, array: number[]) => CvMat
+  matFromImageData: (imageData: ImageData) => CvMat
   getPerspectiveTransform: (src: CvMat, dst: CvMat) => CvMat
   warpPerspective: (
     src: CvMat,

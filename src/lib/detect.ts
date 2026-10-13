@@ -1,17 +1,31 @@
 import type { Corners, Point } from '../types'
-import { MatBin, type Cv, type CvMat } from './opencv'
+import type { Cv, CvMat, CvMatVector } from './opencv'
 
-const DETECT_WIDTH = 360
-const MIN_AREA = 0.15
-const MAX_AREA = 0.95
+const DETECT_WIDTH = 320
+const MIN_AREA = 0.1
 
-function readPoints(mat: CvMat): Point[] {
-  const points: Point[] = []
-  const data = mat.data32S
-  for (let i = 0; i < mat.rows; i += 1) {
-    points.push({ x: data[i * 2] ?? 0, y: data[i * 2 + 1] ?? 0 })
+const sample = document.createElement('canvas')
+const sampleCtx = sample.getContext('2d', { willReadFrequently: true })
+
+function sourceSize(source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElement) {
+  if (source instanceof HTMLVideoElement) return { width: source.videoWidth, height: source.videoHeight }
+  if (source instanceof HTMLImageElement) {
+    return { width: source.naturalWidth || source.width, height: source.naturalHeight || source.height }
   }
-  return points
+  return { width: source.width, height: source.height }
+}
+
+function grabFrame(source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElement): ImageData | null {
+  if (!sampleCtx) return null
+  const { width: sw, height: sh } = sourceSize(source)
+  if (sw < 8 || sh < 8) return null
+  const scale = Math.min(1, DETECT_WIDTH / sw)
+  const width = Math.max(1, Math.round(sw * scale))
+  const height = Math.max(1, Math.round(sh * scale))
+  if (sample.width !== width) sample.width = width
+  if (sample.height !== height) sample.height = height
+  sampleCtx.drawImage(source, 0, 0, width, height)
+  return sampleCtx.getImageData(0, 0, width, height)
 }
 
 function orderCorners(points: Point[]): Corners {
@@ -56,8 +70,18 @@ export function cornersFromUnit(corners: Corners, width: number, height: number)
   return { tl: n(corners.tl), tr: n(corners.tr), br: n(corners.br), bl: n(corners.bl) }
 }
 
-function boxPoints(cv: Cv, hull: CvMat): Point[] {
-  const rect = cv.minAreaRect(hull)
+function release(...mats: Array<CvMat | CvMatVector | null | undefined>) {
+  for (const mat of mats) {
+    try {
+      mat?.delete()
+    } catch {
+      // Already freed by OpenCV.js.
+    }
+  }
+}
+
+function boxPoints(cv: Cv, contour: CvMat): Point[] {
+  const rect = cv.minAreaRect(contour)
   const fromApi = cv.RotatedRect?.points?.(rect)
   if (fromApi?.length === 4) return fromApi
   if (typeof cv.boxPoints === 'function') {
@@ -86,94 +110,74 @@ function boxPoints(cv: Cv, hull: CvMat): Point[] {
   }))
 }
 
-function closeMask(cv: Cv, bin: MatBin, src: CvMat, kernel: CvMat): CvMat {
-  const closed = bin.keep(new cv.Mat())
-  cv.morphologyEx(src, closed, cv.MORPH_CLOSE, kernel)
-  return closed
-}
-
-function largestSheet(cv: Cv, bin: MatBin, mask: CvMat, width: number, height: number): CvMat | null {
-  const work = bin.keep(mask.clone())
-  const contours = bin.keep(new cv.MatVector())
-  const hierarchy = bin.keep(new cv.Mat())
-  cv.findContours(work, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-  const frame = width * height
-  let best: CvMat | null = null
-  let bestArea = 0
-  for (let i = 0; i < contours.size(); i += 1) {
-    const contour = contours.get(i)
-    const area = cv.contourArea(contour)
-    const frac = area / frame
-    if (frac <= MIN_AREA || frac >= MAX_AREA) continue
-    if (area > bestArea) {
-      bestArea = area
-      best = contour
-    }
-  }
-  return best
-}
-
-function quadFromContour(cv: Cv, bin: MatBin, contour: CvMat, width: number, height: number): Corners | null {
-  const hull = bin.keep(new cv.Mat())
-  cv.convexHull(contour, hull, false, true)
-  const poly = bin.keep(new cv.Mat())
-  cv.approxPolyDP(hull, poly, 0.02 * cv.arcLength(hull, true), true)
-  const points = poly.rows === 4 ? readPoints(poly) : boxPoints(cv, hull)
-  if (points.length < 4) return null
-  return toUnit(orderCorners(points), width, height)
-}
-
 /**
- * White sheet on a light desk: Otsu / saturation / adaptive — not fixed Canny.
- * Returns unit 0..1 corners, or null when the frame is empty.
+ * One adaptive-threshold pass on a 320px canvas. Every Mat is deleted in `finally`
+ * so the live camera cannot exhaust OpenCV WASM memory.
  */
 export function detectDocumentCorners(
   cv: Cv,
   source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElement,
 ): Corners | null {
-  const bin = new MatBin()
+  const image = grabFrame(source)
+  if (!image) return null
+
+  let src: CvMat | undefined
+  let gray: CvMat | undefined
+  let blurred: CvMat | undefined
+  let thresh: CvMat | undefined
+  let kernel: CvMat | undefined
+  let contours: CvMatVector | undefined
+  let hierarchy: CvMat | undefined
+  let best: CvMat | undefined
+
   try {
-    const src = bin.keep(cv.imread(source))
-    if (src.cols < 8 || src.rows < 8) return null
-    const scale = Math.min(1, DETECT_WIDTH / src.cols)
-    const width = Math.max(1, Math.round(src.cols * scale))
-    const height = Math.max(1, Math.round(src.rows * scale))
-    const small = bin.keep(new cv.Mat())
-    cv.resize(src, small, new cv.Size(width, height), 0, 0, cv.INTER_AREA)
+    src = typeof cv.matFromImageData === 'function' ? cv.matFromImageData(image) : cv.imread(sample)
+    const width = src.cols
+    const height = src.rows
+    gray = new cv.Mat()
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY)
+    blurred = new cv.Mat()
+    cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0)
+    thresh = new cv.Mat()
+    cv.adaptiveThreshold(
+      blurred,
+      thresh,
+      255,
+      cv.ADAPTIVE_THRESH_GAUSSIAN_C,
+      cv.THRESH_BINARY_INV,
+      15,
+      4,
+    )
+    kernel =
+      typeof cv.Mat.ones === 'function'
+        ? cv.Mat.ones(5, 5, cv.CV_8U)
+        : cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(5, 5))
+    cv.morphologyEx(thresh, thresh, cv.MORPH_CLOSE, kernel)
+    contours = new cv.MatVector()
+    hierarchy = new cv.Mat()
+    cv.findContours(thresh, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
 
-    const gray = bin.keep(new cv.Mat())
-    cv.cvtColor(small, gray, cv.COLOR_RGBA2GRAY)
-    const blur = bin.keep(new cv.Mat())
-    cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0)
-    const kernel = bin.keep(cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(5, 5)))
-
-    const luma = bin.keep(new cv.Mat())
-    cv.threshold(blur, luma, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
-    let sheet = largestSheet(cv, bin, closeMask(cv, bin, luma, kernel), width, height)
-
-    if (!sheet) {
-      const rgb = bin.keep(new cv.Mat())
-      const hsv = bin.keep(new cv.Mat())
-      const sat = bin.keep(new cv.Mat())
-      const paper = bin.keep(new cv.Mat())
-      cv.cvtColor(small, rgb, cv.COLOR_RGBA2RGB)
-      cv.cvtColor(rgb, hsv, cv.COLOR_RGB2HSV)
-      cv.extractChannel(hsv, sat, 1)
-      cv.threshold(sat, paper, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU)
-      sheet = largestSheet(cv, bin, closeMask(cv, bin, paper, kernel), width, height)
+    let bestArea = 0
+    for (let i = 0; i < contours.size(); i += 1) {
+      const contour = contours.get(i)
+      const area = cv.contourArea(contour)
+      if (area > bestArea) {
+        release(best)
+        best = contour
+        bestArea = area
+      } else {
+        contour.delete()
+      }
     }
 
-    if (!sheet) {
-      const adapt = bin.keep(new cv.Mat())
-      cv.adaptiveThreshold(blur, adapt, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY, 21, 4)
-      sheet = largestSheet(cv, bin, closeMask(cv, bin, adapt, kernel), width, height)
-    }
-
-    return sheet ? quadFromContour(cv, bin, sheet, width, height) : null
+    if (!best || bestArea < width * height * MIN_AREA) return null
+    const points = boxPoints(cv, best)
+    if (points.length < 4) return null
+    return toUnit(orderCorners(points), width, height)
   } catch (err) {
-    console.error('Detect error:', err)
+    console.warn('Detection failed:', err)
     return null
   } finally {
-    bin.release()
+    release(src, gray, blurred, thresh, kernel, contours, hierarchy, best)
   }
 }
