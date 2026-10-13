@@ -927,10 +927,9 @@ export function ScanProvider({ children }: { children: ReactNode }) {
       let blob = await buildPagesPdf(assembled.ready)
       if (emailLimit) {
         for (const step of [
-          // Never below 2800px on the long edge: dense tables turn to mush at lower sizes.
-          { maxEdge: 2800, quality: 0.8 },
-          { maxEdge: 2800, quality: 0.7 },
-          { maxEdge: 2800, quality: 0.6 },
+          { maxEdge: 4096, quality: 0.9 },
+          { maxEdge: 4096, quality: 0.82 },
+          { maxEdge: 4096, quality: 0.75 },
         ]) {
           if (blob.size <= emailLimit) break
           blob = await buildPagesPdf(assembled.ready, step)

@@ -38,7 +38,7 @@ const SHADOW_TARGET = 20
 const MID_DARK_TARGET = 100
 const INK_FAINT_GAIN = 70
 const HIGHLIGHT_TARGET = 220
-const SHARPEN_AMOUNT = 1.7
+const SHARPEN_AMOUNT = 1.9
 const SHARPEN_NOISE = 2
 const YIELD_MS = 24
 
@@ -306,6 +306,7 @@ async function warpCanvas(
   const srcCtx = src.getContext('2d', { willReadFrequently: true })
   if (!srcCtx) return paintScaled(source, width, height, corners)
   const srcImage = srcCtx.getImageData(0, 0, src.width, src.height)
+  sharpenLuma(srcImage)
   const srcData = srcImage.data
   const sw = src.width
   const sh = src.height
@@ -325,6 +326,7 @@ async function warpCanvas(
       sampleBilinear(srcData, sw, sh, sample.x, sample.y, out, (y * width + x) * 4)
     }
   }
+  sharpenLuma(dest)
   context.putImageData(dest, 0, 0)
   return canvas
 }
@@ -647,7 +649,7 @@ async function applyScanTone(
   }
 }
 
-/** Unsharp mask: skip |L − blur| < 2, boost 1.7 so print stays crisp after the warp. */
+/** Unsharp mask: skip |L − blur| < 2, boost 1.9 so print stays crisp through bilinear warp. */
 function sharpenLuma(image: ImageData) {
   const { data, width, height } = image
   const gray = new Float32Array(width * height)
