@@ -39,10 +39,16 @@ export function cornersFromUnit(corners: Corners, width: number, height: number)
   return { tl: n(corners.tl), tr: n(corners.tr), br: n(corners.br), bl: n(corners.bl) }
 }
 
-function otsu(gray: Uint8Array): number {
+function otsu(gray: Uint8Array, minValue = -1): number {
   const hist = new Uint32Array(256)
-  for (let i = 0; i < gray.length; i += 1) hist[gray[i] ?? 0] += 1
-  const total = gray.length
+  let total = 0
+  for (let i = 0; i < gray.length; i += 1) {
+    const value = gray[i] ?? 0
+    if (value <= minValue) continue
+    hist[value] += 1
+    total += 1
+  }
+  if (total < 32) return minValue < 0 ? 160 : Math.min(230, minValue + 24)
   let sumAll = 0
   for (let level = 0; level < 256; level += 1) sumAll += level * (hist[level] ?? 0)
   let weightBack = 0
@@ -155,9 +161,19 @@ function largestBrightQuad(gray: Uint8Array, width: number, height: number, thre
   return best ? toUnit(best, width, height) : null
 }
 
+function expandUnit(corners: Corners, amount = 0.04): Corners {
+  const cx = (corners.tl.x + corners.tr.x + corners.br.x + corners.bl.x) / 4
+  const cy = (corners.tl.y + corners.tr.y + corners.br.y + corners.bl.y) / 4
+  const grow = (point: Point): Point => ({
+    x: Math.min(1, Math.max(0, point.x + (point.x - cx) * amount)),
+    y: Math.min(1, Math.max(0, point.y + (point.y - cy) * amount)),
+  })
+  return { tl: grow(corners.tl), tr: grow(corners.tr), br: grow(corners.br), bl: grow(corners.bl) }
+}
+
 /**
- * Largest bright sheet (the page), not the extrema of every edge in the room.
- * Keyboard and dark fabric stay out of the mask, so the orange box can follow the paper.
+ * Largest bright sheet (the page). Two-level Otsu: drop the dark keyboard/fabric, then
+ * split paper from a beige desk so the four corners are the page, not an upright crop box.
  */
 export function detectDocumentCorners(
   source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElement,
@@ -174,8 +190,10 @@ export function detectDocumentCorners(
       sum += value
     }
     if (sum / gray.length < 12) return null
-    const threshold = Math.min(210, Math.max(90, otsu(gray)))
-    return largestBrightQuad(gray, width, height, threshold)
+    const room = Math.min(200, Math.max(80, otsu(gray)))
+    const paper = Math.min(230, Math.max(room + 8, otsu(gray, room)))
+    const found = largestBrightQuad(gray, width, height, paper) ?? largestBrightQuad(gray, width, height, room)
+    return found ? expandUnit(found) : null
   } catch (err) {
     console.warn('Detection failed:', err)
     return null

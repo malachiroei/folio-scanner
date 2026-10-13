@@ -380,6 +380,13 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     const key = pageKey(sourceUrl, corners)
     const cached = cachedWarp(key)
     if (cached) return { key, canvas: cached }
+    if (!isOpenCvReady()) {
+      try {
+        await loadOpenCv()
+      } catch (error) {
+        console.warn('Detection failed:', error)
+      }
+    }
     const image = await loadImage(sourceUrl)
     await new Promise((resolve) => window.setTimeout(resolve, 0))
     const canvas = await straightenDocument(image, corners)
