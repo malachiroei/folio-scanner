@@ -7,7 +7,7 @@ import type { CaptureHint, Corners } from '../types'
 
 /** Live detection on a 200px canvas copy. Always reschedules so a throw cannot freeze the box. */
 const LIVE_INTERVAL_MS = 120
-const LIVE_TRACK = 0.75
+const LIVE_TRACK = 0.55
 
 type LiveQuad = { corners: Corners; width: number; height: number; at: number }
 

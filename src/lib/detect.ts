@@ -1,6 +1,8 @@
 import type { Corners, Point } from '../types'
 
 const DETECT_WIDTH = 240
+const MIN_AREA = 0.08
+const MAX_AREA = 0.88
 
 const sample = document.createElement('canvas')
 const sampleCtx = sample.getContext('2d', { willReadFrequently: true })
@@ -37,50 +39,65 @@ export function cornersFromUnit(corners: Corners, width: number, height: number)
   return { tl: n(corners.tl), tr: n(corners.tr), br: n(corners.br), bl: n(corners.bl) }
 }
 
-function finish(
-  count: number,
-  width: number,
-  height: number,
-  minX: number,
-  minY: number,
-  maxX: number,
-  maxY: number,
-  tl: Point,
-  tr: Point,
-  br: Point,
-  bl: Point,
-): Corners | null {
-  if (count < 24) return null
-  const boxW = maxX - minX
-  const boxH = maxY - minY
-  const boxFrac = (boxW * boxH) / (width * height)
-  if (boxFrac < 0.08 || boxFrac > 0.99) return null
-  if (boxW < 12 || boxH < 12) return null
-  return toUnit({ tl, tr, br, bl }, width, height)
+function otsu(gray: Uint8Array): number {
+  const hist = new Uint32Array(256)
+  for (let i = 0; i < gray.length; i += 1) hist[gray[i] ?? 0] += 1
+  const total = gray.length
+  let sumAll = 0
+  for (let level = 0; level < 256; level += 1) sumAll += level * (hist[level] ?? 0)
+  let weightBack = 0
+  let sumBack = 0
+  let best = -1
+  let threshold = 160
+  for (let level = 0; level < 256; level += 1) {
+    weightBack += hist[level] ?? 0
+    if (weightBack === 0) continue
+    const weightFront = total - weightBack
+    if (weightFront === 0) break
+    sumBack += level * (hist[level] ?? 0)
+    const meanBack = sumBack / weightBack
+    const meanFront = (sumAll - sumBack) / weightFront
+    const between = weightBack * weightFront * (meanBack - meanFront) ** 2
+    if (between > best) {
+      best = between
+      threshold = level
+    }
+  }
+  return threshold
 }
 
-function extremaFrom(
-  gray: Uint8Array,
-  width: number,
-  height: number,
-  keep: (value: number, index: number) => boolean,
-): Corners | null {
-  let count = 0
-  let minX = width
-  let minY = height
-  let maxX = 0
-  let maxY = 0
-  let tl = { x: 0, y: 0 }
-  let tr = { x: 0, y: 0 }
-  let br = { x: 0, y: 0 }
-  let bl = { x: 0, y: 0 }
-  let minSum = Number.POSITIVE_INFINITY
-  let maxSum = Number.NEGATIVE_INFINITY
-  let minDiff = Number.POSITIVE_INFINITY
-  let maxDiff = Number.NEGATIVE_INFINITY
-  for (let y = 0, i = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1, i += 1) {
-      if (!keep(gray[i] ?? 0, i)) continue
+function largestBrightQuad(gray: Uint8Array, width: number, height: number, threshold: number): Corners | null {
+  const frame = width * height
+  const seen = new Uint8Array(gray.length)
+  const stack = new Int32Array(gray.length)
+  let bestArea = 0
+  let best: Corners | null = null
+
+  for (let start = 0; start < gray.length; start += 1) {
+    if ((gray[start] ?? 0) <= threshold || seen[start]) continue
+    let top = 0
+    stack[top] = start
+    top += 1
+    seen[start] = 1
+    let count = 0
+    let minX = width
+    let minY = height
+    let maxX = 0
+    let maxY = 0
+    let tl = { x: 0, y: 0 }
+    let tr = { x: 0, y: 0 }
+    let br = { x: 0, y: 0 }
+    let bl = { x: 0, y: 0 }
+    let minSum = Number.POSITIVE_INFINITY
+    let maxSum = Number.NEGATIVE_INFINITY
+    let minDiff = Number.POSITIVE_INFINITY
+    let maxDiff = Number.NEGATIVE_INFINITY
+
+    while (top > 0) {
+      top -= 1
+      const index = stack[top] ?? 0
+      const x = index % width
+      const y = (index - x) / width
       count += 1
       if (x < minX) minX = x
       if (y < minY) minY = y
@@ -104,24 +121,43 @@ function extremaFrom(
         minDiff = diff
         bl = { x, y }
       }
+      if (x > 0 && !seen[index - 1] && (gray[index - 1] ?? 0) > threshold) {
+        seen[index - 1] = 1
+        stack[top] = index - 1
+        top += 1
+      }
+      if (x < width - 1 && !seen[index + 1] && (gray[index + 1] ?? 0) > threshold) {
+        seen[index + 1] = 1
+        stack[top] = index + 1
+        top += 1
+      }
+      if (y > 0 && !seen[index - width] && (gray[index - width] ?? 0) > threshold) {
+        seen[index - width] = 1
+        stack[top] = index - width
+        top += 1
+      }
+      if (y < height - 1 && !seen[index + width] && (gray[index + width] ?? 0) > threshold) {
+        seen[index + width] = 1
+        stack[top] = index + width
+        top += 1
+      }
     }
-  }
-  return finish(count, width, height, minX, minY, maxX, maxY, tl, tr, br, bl)
-}
 
-function percentile(hist: Uint32Array, total: number, p: number): number {
-  const target = total * p
-  let acc = 0
-  for (let level = 0; level < 256; level += 1) {
-    acc += hist[level] ?? 0
-    if (acc >= target) return level
+    const frac = count / frame
+    if (frac < MIN_AREA || frac > MAX_AREA || count <= bestArea) continue
+    const touch =
+      Number(minX <= 1) + Number(minY <= 1) + Number(maxX >= width - 2) + Number(maxY >= height - 2)
+    if (touch >= 4) continue
+    bestArea = count
+    best = { tl, tr, br, bl }
   }
-  return 200
+
+  return best ? toUnit(best, width, height) : null
 }
 
 /**
- * Live page finder: paper edges first (white sheet on a beige desk), then bright pixels.
- * Uses the bounding box of hits, so a page that fills the view is not rejected.
+ * Largest bright sheet (the page), not the extrema of every edge in the room.
+ * Keyboard and dark fabric stay out of the mask, so the orange box can follow the paper.
  */
 export function detectDocumentCorners(
   source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElement,
@@ -131,28 +167,15 @@ export function detectDocumentCorners(
     if (!image) return null
     const { width, height, data } = image
     const gray = new Uint8Array(width * height)
-    const hist = new Uint32Array(256)
     let sum = 0
     for (let i = 0, p = 0; i < gray.length; i += 1, p += 4) {
       const value = (0.299 * (data[p] ?? 0) + 0.587 * (data[p + 1] ?? 0) + 0.114 * (data[p + 2] ?? 0)) | 0
       gray[i] = value
-      hist[value] += 1
       sum += value
     }
     if (sum / gray.length < 12) return null
-
-    const fromEdges = extremaFrom(gray, width, height, (_value, index) => {
-      const x = index % width
-      const y = (index - x) / width
-      if (x < 1 || y < 1 || x >= width - 1 || y >= height - 1) return false
-      const gx = (gray[index + 1] ?? 0) - (gray[index - 1] ?? 0)
-      const gy = (gray[index + width] ?? 0) - (gray[index - width] ?? 0)
-      return Math.abs(gx) + Math.abs(gy) > 12
-    })
-    if (fromEdges) return fromEdges
-
-    const brightCut = Math.max(percentile(hist, gray.length, 0.62), 140)
-    return extremaFrom(gray, width, height, (value) => value >= brightCut)
+    const threshold = Math.min(210, Math.max(90, otsu(gray)))
+    return largestBrightQuad(gray, width, height, threshold)
   } catch (err) {
     console.warn('Detection failed:', err)
     return null
