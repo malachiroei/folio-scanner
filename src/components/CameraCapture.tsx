@@ -2,12 +2,11 @@ import { Images, SwitchCamera, X } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { cornersFromUnit, detectDocumentCorners } from '../lib/detect'
 import { clearLiveLock, peekLiveLock, rememberLiveLock } from '../lib/live-lock'
-import { getCv, isOpenCvReady, loadOpenCv } from '../lib/opencv'
 import { useScan } from '../state/scan-context'
 import type { CaptureHint, Corners } from '../types'
 
-/** Live detection on a 360px OpenCV copy. Always reschedules so a throw cannot freeze the box. */
-const LIVE_INTERVAL_MS = 80
+/** Live detection on a 200px canvas copy. Always reschedules so a throw cannot freeze the box. */
+const LIVE_INTERVAL_MS = 160
 const LIVE_TRACK = 0.75
 
 type LiveQuad = { corners: Corners; width: number; height: number; at: number }
@@ -58,10 +57,6 @@ export function CameraCapture() {
   const quadRef = useRef<LiveQuad | null>(null)
 
   useEffect(() => {
-    void loadOpenCv().catch((err) => console.warn('Detection failed:', err))
-  }, [])
-
-  useEffect(() => {
     if (!ready) return
     let stopped = false
     let timer = 0
@@ -83,7 +78,7 @@ export function CameraCapture() {
         if (video && video.videoWidth > 0 && video.readyState >= 2 && !document.hidden) {
           const width = video.videoWidth
           const height = video.videoHeight
-          const unit = detectDocumentCorners(video, isOpenCvReady() ? getCv() : null)
+          const unit = detectDocumentCorners(video)
           if (unit) {
             const pixels = cornersFromUnit(unit, width, height)
             current = {

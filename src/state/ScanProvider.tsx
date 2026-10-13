@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { cornersFromUnit, detectDocumentCorners } from '../lib/detect'
 import { cornersValid, fullFrameCorners, mapLiveCorners } from '../lib/geometry'
 import { clearLiveLock, consumeLiveLock } from '../lib/live-lock'
-import { getCv, isOpenCvReady, loadOpenCv } from '../lib/opencv'
+import { isOpenCvReady, loadOpenCv } from '../lib/opencv'
 import {
   canvasToJpegBlob,
   downloadBlob,
@@ -92,10 +92,6 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     const id = window.setTimeout(() => setToast(null), 4200)
     return () => window.clearTimeout(id)
   }, [toast])
-
-  useEffect(() => {
-    beginVisionLoad()
-  }, [])
 
   useEffect(() => {
     const report = (error: unknown) => {
@@ -250,7 +246,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
         stopDetecting()
         return
       }
-      const unit = detectDocumentCorners(image, isOpenCvReady() ? getCv() : null)
+      const unit = detectDocumentCorners(image)
       if (cancelled() || !unit) {
         stopDetecting()
         return
