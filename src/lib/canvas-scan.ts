@@ -786,46 +786,11 @@ async function despeckle(
   }
 }
 
-function edgeIsKeyboard(data: Uint8ClampedArray, width: number, height: number, axis: 'row' | 'col', index: number) {
-  const span = axis === 'row' ? width : height
-  let dark = 0
-  let paper = 0
-  let sum = 0
-  for (let k = 0; k < span; k += 1) {
-    const i = axis === 'row' ? (index * width + k) * 4 : (k * width + index) * 4
-    const luma = pixelLuma(data[i] ?? 0, data[i + 1] ?? 0, data[i + 2] ?? 0)
-    sum += luma
-    if (luma < 58) dark += 1
-    if (luma > 175) paper += 1
-  }
-  return sum / span < 58 && dark > span * 0.55 && paper < span * 0.1
-}
-
-/** Drop keyboard / jeans strips that rode along after the warp. Never more than 12% per side. */
-function trimDarkMargins(source: HTMLCanvasElement): HTMLCanvasElement {
-  const context = source.getContext('2d', { willReadFrequently: true })
-  if (!context) return source
-  const { width, height } = source
-  const image = context.getImageData(0, 0, width, height)
-  const data = image.data
-  const maxY = Math.floor(height * 0.12)
-  const maxX = Math.floor(width * 0.08)
-  let top = 0
-  let bottom = height
-  let left = 0
-  let right = width
-  while (top < maxY && edgeIsKeyboard(data, width, height, 'row', top)) top += 1
-  while (bottom - 1 > height - 1 - maxY && bottom - 1 > top + 32 && edgeIsKeyboard(data, width, height, 'row', bottom - 1)) {
-    bottom -= 1
-  }
-  while (left < maxX && edgeIsKeyboard(data, width, height, 'col', left)) left += 1
-  while (right - 1 > width - 1 - maxX && right - 1 > left + 32 && edgeIsKeyboard(data, width, height, 'col', right - 1)) {
-    right -= 1
-  }
-  if (top === 0 && bottom === height && left === 0 && right === width) return source
+function cropCanvas(source: HTMLCanvasElement, left: number, top: number, right: number, bottom: number) {
   const cropW = right - left
   const cropH = bottom - top
   if (cropW < 64 || cropH < 64) return source
+  if (left <= 0 && top <= 0 && right >= source.width && bottom >= source.height) return source
   const canvas = document.createElement('canvas')
   canvas.width = cropW
   canvas.height = cropH
@@ -834,6 +799,159 @@ function trimDarkMargins(source: HTMLCanvasElement): HTMLCanvasElement {
   highQuality(next)
   next.drawImage(source, left, top, cropW, cropH, 0, 0, cropW, cropH)
   return canvas
+}
+
+function otsuThreshold(gray: Uint8Array) {
+  const hist = new Uint32Array(256)
+  for (let i = 0; i < gray.length; i += 1) hist[gray[i] ?? 0] += 1
+  const total = gray.length
+  let sumAll = 0
+  for (let level = 0; level < 256; level += 1) sumAll += level * (hist[level] ?? 0)
+  let weightBack = 0
+  let sumBack = 0
+  let best = -1
+  let threshold = 170
+  for (let level = 0; level < 256; level += 1) {
+    weightBack += hist[level] ?? 0
+    if (weightBack === 0) continue
+    const weightFront = total - weightBack
+    if (weightFront === 0) break
+    sumBack += level * (hist[level] ?? 0)
+    const meanBack = sumBack / weightBack
+    const meanFront = (sumAll - sumBack) / weightFront
+    const between = weightBack * weightFront * (meanBack - meanFront) ** 2
+    if (between > best) {
+      best = between
+      threshold = level
+    }
+  }
+  return threshold
+}
+
+/** Axis-aligned crop to the largest bright page on the warped photo (desk / keyboard stay out). */
+function trimToPaper(source: HTMLCanvasElement): HTMLCanvasElement {
+  const { width, height } = source
+  const maxEdge = 400
+  const scale = Math.min(1, maxEdge / Math.max(width, height))
+  const sw = Math.max(1, Math.round(width * scale))
+  const sh = Math.max(1, Math.round(height * scale))
+  const sample = document.createElement('canvas')
+  sample.width = sw
+  sample.height = sh
+  const context = sample.getContext('2d', { willReadFrequently: true })
+  if (!context) return source
+  context.imageSmoothingEnabled = false
+  context.drawImage(source, 0, 0, sw, sh)
+  const data = context.getImageData(0, 0, sw, sh).data
+  const gray = new Uint8Array(sw * sh)
+  for (let p = 0, i = 0; p < gray.length; p += 1, i += 4) {
+    gray[p] = pixelLuma(data[i] ?? 0, data[i + 1] ?? 0, data[i + 2] ?? 0) | 0
+  }
+  const threshold = Math.min(215, Math.max(165, otsuThreshold(gray)))
+  const seen = new Uint8Array(gray.length)
+  const stack = new Int32Array(gray.length)
+  let bestCount = 0
+  let best = { minX: 0, minY: 0, maxX: sw - 1, maxY: sh - 1 }
+  for (let start = 0; start < gray.length; start += 1) {
+    if (seen[start] || (gray[start] ?? 0) <= threshold) continue
+    let top = 0
+    stack[0] = start
+    top = 1
+    seen[start] = 1
+    let count = 0
+    let minX = sw
+    let minY = sh
+    let maxX = 0
+    let maxY = 0
+    while (top > 0) {
+      top -= 1
+      const index = stack[top] ?? 0
+      count += 1
+      const x = index % sw
+      const y = (index - x) / sw
+      if (x < minX) minX = x
+      if (y < minY) minY = y
+      if (x > maxX) maxX = x
+      if (y > maxY) maxY = y
+      if (x > 0 && !seen[index - 1] && (gray[index - 1] ?? 0) > threshold) {
+        seen[index - 1] = 1
+        stack[top] = index - 1
+        top += 1
+      }
+      if (x + 1 < sw && !seen[index + 1] && (gray[index + 1] ?? 0) > threshold) {
+        seen[index + 1] = 1
+        stack[top] = index + 1
+        top += 1
+      }
+      if (y > 0 && !seen[index - sw] && (gray[index - sw] ?? 0) > threshold) {
+        seen[index - sw] = 1
+        stack[top] = index - sw
+        top += 1
+      }
+      if (y + 1 < sh && !seen[index + sw] && (gray[index + sw] ?? 0) > threshold) {
+        seen[index + sw] = 1
+        stack[top] = index + sw
+        top += 1
+      }
+    }
+    if (count > bestCount) {
+      bestCount = count
+      best = { minX, minY, maxX, maxY }
+    }
+  }
+  sample.width = 0
+  sample.height = 0
+  if (bestCount < gray.length * 0.18) return source
+  const inv = 1 / scale
+  const padX = Math.max(10, Math.round(width * 0.008))
+  const padY = Math.max(10, Math.round(height * 0.008))
+  const left = Math.max(0, Math.floor(best.minX * inv) - padX)
+  const top = Math.max(0, Math.floor(best.minY * inv) - padY)
+  const right = Math.min(width, Math.ceil((best.maxX + 1) * inv) + padX)
+  const bottom = Math.min(height, Math.ceil((best.maxY + 1) * inv) + padY)
+  if (right - left < width * 0.28 || bottom - top < height * 0.28) return source
+  if (left <= 6 && top <= 6 && right >= width - 6 && bottom >= height - 6) return source
+  return cropCanvas(source, left, top, right, bottom)
+}
+
+function edgeIsBackdrop(data: Uint8ClampedArray, width: number, height: number, axis: 'row' | 'col', index: number) {
+  const span = axis === 'row' ? width : height
+  let dark = 0
+  let paper = 0
+  let sum = 0
+  for (let k = 0; k < span; k += 1) {
+    const i = axis === 'row' ? (index * width + k) * 4 : (k * width + index) * 4
+    const luma = pixelLuma(data[i] ?? 0, data[i + 1] ?? 0, data[i + 2] ?? 0)
+    sum += luma
+    if (luma < 70) dark += 1
+    if (luma > 200) paper += 1
+  }
+  return paper < span * 0.12 && (sum / span < 80 || dark > span * 0.45)
+}
+
+/** Drop keyboard / laptop-bezel strips. Safe after Magic Color has crushed them to black. */
+function trimDarkMargins(source: HTMLCanvasElement): HTMLCanvasElement {
+  const context = source.getContext('2d', { willReadFrequently: true })
+  if (!context) return source
+  const { width, height } = source
+  const image = context.getImageData(0, 0, width, height)
+  const data = image.data
+  const maxY = Math.floor(height * 0.14)
+  const maxX = Math.floor(width * 0.14)
+  let top = 0
+  let bottom = height
+  let left = 0
+  let right = width
+  while (top < maxY && edgeIsBackdrop(data, width, height, 'row', top)) top += 1
+  while (bottom - 1 > height - 1 - maxY && bottom - 1 > top + 32 && edgeIsBackdrop(data, width, height, 'row', bottom - 1)) {
+    bottom -= 1
+  }
+  while (left < maxX && edgeIsBackdrop(data, width, height, 'col', left)) left += 1
+  while (right - 1 > width - 1 - maxX && right - 1 > left + 32 && edgeIsBackdrop(data, width, height, 'col', right - 1)) {
+    right -= 1
+  }
+  if (top === 0 && bottom === height && left === 0 && right === width) return source
+  return cropCanvas(source, left, top, right, bottom)
 }
 
 function desaturatePixels(data: Uint8ClampedArray) {
@@ -882,7 +1000,7 @@ export async function straightenCanvas(
   const { width, height } = a4Page(isLandscape(corners))
   try {
     const warped = await warpCanvas(copy, corners, width, height)
-    return trimDarkMargins(warped)
+    return trimDarkMargins(trimToPaper(warped))
   } finally {
     copy.width = 0
     copy.height = 0
@@ -908,12 +1026,12 @@ async function processPixels(
 
 /** Magic Color: white paper, crisp text, continuous-tone photos. Never 1-bit, never a region mask. */
 export async function applyCanvasMagic(source: HTMLCanvasElement): Promise<HTMLCanvasElement> {
-  return processPixels(source, applyMagicColor)
+  return trimDarkMargins(await processPixels(source, applyMagicColor))
 }
 
 /** High-contrast grayscale of the same continuous-tone page (no binary threshold). */
 export async function applyCanvasBlackWhite(source: HTMLCanvasElement): Promise<HTMLCanvasElement> {
-  return processPixels(source, applyFastBlackWhite)
+  return trimDarkMargins(await processPixels(source, applyFastBlackWhite))
 }
 
 export async function renderCanvasDocument(
