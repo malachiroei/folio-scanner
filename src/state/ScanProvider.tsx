@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { detectDocumentCorners, refineToPaper, sheetCornersOk } from '../lib/detect'
+import { cornersFromUnit, detectDocumentCorners } from '../lib/detect'
 import { cornersValid, fullFrameCorners, mapLiveCorners } from '../lib/geometry'
 import { clearLiveLock, consumeLiveLock } from '../lib/live-lock'
-import { isOpenCvReady, loadOpenCv } from '../lib/opencv'
+import { getCv, isOpenCvReady, loadOpenCv } from '../lib/opencv'
 import {
   canvasToJpegBlob,
   downloadBlob,
@@ -200,13 +200,12 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     if (userAdjustedRef.current) return
     setDraft((current) => {
       if (!current) return current
-      const ok = detected && sheetCornersOk(corners, current.width, current.height)
       return {
         ...current,
-        corners: ok ? corners : fullFrameCorners(current.width, current.height),
-        detected: ok,
+        corners: detected ? corners : current.corners,
+        detected,
         detecting: false,
-        snapToken: current.snapToken + 1,
+        snapToken: detected ? current.snapToken + 1 : current.snapToken,
       }
     })
   }
@@ -215,12 +214,12 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     setDraft((current) => (current ? { ...current, detecting: false } : current))
   }
 
-  function scheduleLocate(sourceUrl: string, width: number, height: number, seed?: Corners) {
+  function scheduleLocate(sourceUrl: string, width: number, height: number) {
     const gen = ++detectGen.current
 
     window.setTimeout(() => {
       const start = () => {
-        void locatePage(sourceUrl, width, height, gen, seed)
+        void locatePage(sourceUrl, width, height, gen)
       }
       const idle = window.requestIdleCallback
       if (typeof idle === 'function') idle(start, { timeout: 80 })
@@ -228,11 +227,8 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     }, 50)
   }
 
-  /**
-   * Without a seed: full page detection. With a seed (the outline tracked live): only snap its sides
-   * to the white sheet in the full photo, so the page never jumps somewhere else.
-   */
-  async function locatePage(sourceUrl: string, width: number, height: number, gen: number, seed?: Corners) {
+  /** Gallery / reset only. Camera capture already locked the live corners and must not re-detect. */
+  async function locatePage(sourceUrl: string, width: number, height: number, gen: number) {
     const cancelled = () => gen !== detectGen.current || userAdjustedRef.current
     if (cancelled()) {
       stopDetecting()
@@ -250,12 +246,16 @@ export function ScanProvider({ children }: { children: ReactNode }) {
         stopDetecting()
         return
       }
-      const found = seed ? { corners: refineToPaper(image, width, height, seed), detected: true } : detectDocumentCorners(image, width, height)
-      if (cancelled() || !found.detected) {
+      if (!isOpenCvReady()) {
         stopDetecting()
         return
       }
-      applyAutoCorners(found.corners, true)
+      const unit = detectDocumentCorners(getCv(), image)
+      if (cancelled() || !unit) {
+        stopDetecting()
+        return
+      }
+      applyAutoCorners(cornersFromUnit(unit, width, height), true)
     } catch (error) {
       console.error(error)
       if (cancelled()) return

@@ -67,6 +67,7 @@ export type Cv = {
     size: { width: number; height: number }
     angle: number
   }
+  boxPoints?: (rect: unknown) => CvMat
   RotatedRect: { points: (rect: unknown) => { x: number; y: number }[] }
   matFromArray: (rows: number, cols: number, type: number, array: number[]) => CvMat
   getPerspectiveTransform: (src: CvMat, dst: CvMat) => CvMat

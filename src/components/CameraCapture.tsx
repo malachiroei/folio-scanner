@@ -1,15 +1,14 @@
 import { Images, SwitchCamera, X } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
-import { detectDocumentCorners } from '../lib/detect'
-import { peekLiveLock, rememberLiveLock } from '../lib/live-lock'
+import { cornersFromUnit, detectDocumentCorners } from '../lib/detect'
+import { clearLiveLock, peekLiveLock, rememberLiveLock } from '../lib/live-lock'
+import { getCv, isOpenCvReady } from '../lib/opencv'
 import { useScan } from '../state/scan-context'
 import type { CaptureHint, Corners } from '../types'
 
-/** Live detection runs about every 140ms on a 480px copy of the video frame. */
-const LIVE_INTERVAL_MS = 140
-const LIVE_EDGE = 480
-const LIVE_MISSES_BEFORE_CLEAR = 5
-const LIVE_SMOOTH = 0.3
+/** Live detection on a 360px OpenCV copy. Always reschedules so a throw cannot freeze the box. */
+const LIVE_INTERVAL_MS = 50
+const LIVE_TRACK = 0.75
 
 type LiveQuad = { corners: Corners; width: number; height: number; at: number }
 
@@ -58,48 +57,54 @@ export function CameraCapture() {
   const [quad, setQuad] = useState<LiveQuad | null>(null)
   const quadRef = useRef<LiveQuad | null>(null)
 
-  // Live page outline: a light pass on a 240px copy of the current frame, never blocking the video.
   useEffect(() => {
     if (!ready) return
     let stopped = false
     let timer = 0
     let frame = 0
     let current: LiveQuad | null = null
-    let misses = 0
+
+    const clearBox = () => {
+      if (!current) return
+      current = null
+      quadRef.current = null
+      setQuad(null)
+      clearLiveLock()
+    }
 
     const tick = () => {
       if (stopped) return
-      const video = videoRef.current
-      if (video && video.videoWidth > 0 && video.readyState >= 2 && !document.hidden) {
-        const width = video.videoWidth
-        const height = video.videoHeight
-        const found = detectDocumentCorners(video, width, height, { maxEdge: LIVE_EDGE, live: true })
-        if (found.detected) {
-          misses = 0
-          current = {
-            corners:
-              current && current.width === width
-                ? blend(current.corners, found.corners, LIVE_SMOOTH)
-                : found.corners,
-            width,
-            height,
-            at: performance.now(),
-          }
-          quadRef.current = current
-          setQuad(current)
-          rememberLiveLock(unitHintFromLive(current, false))
-        } else {
-          misses += 1
-          if (misses >= LIVE_MISSES_BEFORE_CLEAR && current) {
-            current = null
-            quadRef.current = null
-            setQuad(null)
+      try {
+        const video = videoRef.current
+        if (video && video.videoWidth > 0 && video.readyState >= 2 && !document.hidden && isOpenCvReady()) {
+          const width = video.videoWidth
+          const height = video.videoHeight
+          const unit = detectDocumentCorners(getCv(), video)
+          if (unit) {
+            const pixels = cornersFromUnit(unit, width, height)
+            current = {
+              corners: current && current.width === width ? blend(current.corners, pixels, LIVE_TRACK) : pixels,
+              width,
+              height,
+              at: performance.now(),
+            }
+            quadRef.current = current
+            setQuad(current)
+            rememberLiveLock(unitHintFromLive(current, false))
+          } else {
+            clearBox()
           }
         }
+      } catch (err) {
+        console.error('Detect error:', err)
+        clearBox()
+      } finally {
+        if (!stopped) {
+          timer = window.setTimeout(() => {
+            frame = requestAnimationFrame(tick)
+          }, LIVE_INTERVAL_MS)
+        }
       }
-      timer = window.setTimeout(() => {
-        frame = requestAnimationFrame(tick)
-      }, LIVE_INTERVAL_MS)
     }
 
     timer = window.setTimeout(() => {
@@ -298,28 +303,43 @@ export function CameraCapture() {
         muted
         playsInline
       />
-      {quad && (
-        <svg
-          viewBox={`0 0 ${quad.width} ${quad.height}`}
-          preserveAspectRatio="xMidYMid meet"
-          className={`pointer-events-none absolute inset-0 h-full w-full ${facing === 'user' ? '-scale-x-100' : ''}`}
-          aria-hidden="true"
-        >
-          <polygon
-            points={[quad.corners.tl, quad.corners.tr, quad.corners.br, quad.corners.bl]
-              .map((point) => `${point.x},${point.y}`)
-              .join(' ')}
-            fill="rgba(231,160,106,0.16)"
-            stroke="#e7a06a"
-            strokeWidth={3}
-            strokeLinejoin="round"
+      <svg
+        viewBox={quad ? `0 0 ${quad.width} ${quad.height}` : '0 0 100 100'}
+        preserveAspectRatio="xMidYMid meet"
+        className={`pointer-events-none absolute inset-0 h-full w-full ${facing === 'user' ? '-scale-x-100' : ''}`}
+        aria-hidden="true"
+      >
+        {quad ? (
+          <>
+            <polygon
+              points={[quad.corners.tl, quad.corners.tr, quad.corners.br, quad.corners.bl]
+                .map((point) => `${point.x},${point.y}`)
+                .join(' ')}
+              fill="rgba(231,160,106,0.16)"
+              stroke="#e7a06a"
+              strokeWidth={3}
+              strokeLinejoin="round"
+              vectorEffect="non-scaling-stroke"
+            />
+            {[quad.corners.tl, quad.corners.tr, quad.corners.br, quad.corners.bl].map((point, index) => (
+              <circle key={index} cx={point.x} cy={point.y} r={quad.width * 0.012} fill="#fff" stroke="#e7a06a" strokeWidth={3} vectorEffect="non-scaling-stroke" />
+            ))}
+          </>
+        ) : (
+          <rect
+            x="12"
+            y="12"
+            width="76"
+            height="76"
+            rx="3"
+            fill="none"
+            stroke="rgba(255,255,255,0.35)"
+            strokeWidth={1.25}
+            strokeDasharray="4 5"
             vectorEffect="non-scaling-stroke"
           />
-          {[quad.corners.tl, quad.corners.tr, quad.corners.br, quad.corners.bl].map((point, index) => (
-            <circle key={index} cx={point.x} cy={point.y} r={quad.width * 0.012} fill="#fff" stroke="#e7a06a" strokeWidth={3} vectorEffect="non-scaling-stroke" />
-          ))}
-        </svg>
-      )}
+        )}
+      </svg>
       <div className="absolute inset-x-0 top-0 flex items-center justify-between px-4 pt-[max(0.75rem,env(safe-area-inset-top))]">
         <button
           type="button"
@@ -329,7 +349,7 @@ export function CameraCapture() {
         >
           <X className="size-5" />
         </button>
-        <p className="rounded-full bg-black/50 px-3 py-1 text-xs">מקם את הדף בתוך המסגרת</p>
+        <p className="rounded-full bg-black/50 px-3 py-1 text-xs">{quad ? 'מקם את הדף בתוך המסגרת' : 'מחפש מסמך...'}</p>
         <span className="size-11" />
       </div>
 
