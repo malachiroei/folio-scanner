@@ -5,6 +5,13 @@ export function isIOS() {
   return navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1
 }
 
+/** Older iPads grant getUserMedia but never paint a live preview. Use the system Camera app instead. */
+export function isIPad() {
+  if (typeof navigator === 'undefined') return false
+  if (/iPad/.test(navigator.userAgent)) return true
+  return navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1
+}
+
 function desktopConstraints(facing: 'environment' | 'user'): MediaTrackConstraints {
   return {
     facingMode: { ideal: facing },

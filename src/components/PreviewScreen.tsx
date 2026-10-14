@@ -1,5 +1,6 @@
 import { ChevronLeft, Crop, Download, FileDown, Plus, Send, Share2 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
+import { isIPad } from '../lib/camera'
 import { readQuickRecipient, type QuickRecipient } from '../lib/favorite-emails'
 import { filteredSource, filterCss } from '../lib/view-filter'
 import { useScan } from '../state/scan-context'
@@ -16,6 +17,7 @@ export function PreviewScreen() {
     busy,
     setFilter,
     addPage,
+    ingestFile,
     downloadDraft,
     exportPdf,
     sharePdf,
@@ -110,14 +112,31 @@ export function PreviewScreen() {
           </Button>
         )}
         <div className="pointer-events-auto grid grid-cols-3 gap-2" style={{ pointerEvents: 'auto' }}>
-          <Button
-            variant="secondary"
-            className="h-auto flex-col gap-1 px-1 py-2 text-xs"
-            onClick={clicked(() => void addPage())}
-          >
-            <Plus className="size-4" />
-            הוסף עמוד
-          </Button>
+          <div className="relative">
+            <Button
+              variant="secondary"
+              className="h-auto w-full flex-col gap-1 px-1 py-2 text-xs"
+              onClick={clicked(() => void addPage())}
+            >
+              <Plus className="size-4" />
+              הוסף עמוד
+            </Button>
+            {isIPad() ? (
+              <input
+                type="file"
+                accept="image/*"
+                capture="environment"
+                className="absolute inset-0 z-10 cursor-pointer opacity-0"
+                aria-label="הוסף עמוד עם מצלמת האייפד"
+                onChange={(event) => {
+                  const file = event.target.files?.[0]
+                  event.target.value = ''
+                  if (!file) return
+                  void addPage().then(() => ingestFile(file))
+                }}
+              />
+            ) : null}
+          </div>
           <Button
             variant="secondary"
             className="h-auto flex-col gap-1 px-1 py-2 text-xs"

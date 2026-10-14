@@ -4,6 +4,7 @@ import {
   attachCameraStream,
   consumePrimedCamera,
   isIOS,
+  isIPad,
   primeCameraGesture,
 } from '../lib/camera'
 import { cornersFromUnit, detectDocumentCorners } from '../lib/detect'
@@ -160,6 +161,12 @@ export function CameraCapture() {
     setNeedsTap(false)
 
     async function start() {
+      if (isIPad()) {
+        setReady(false)
+        setNeedsTap(false)
+        setError(null)
+        return
+      }
       if (!navigator.mediaDevices?.getUserMedia) {
         setError('הדפדפן הזה לא יכול לפתוח את המצלמה. צלם או העלה תמונה במקום.')
         return
@@ -404,34 +411,62 @@ export function CameraCapture() {
           <X className="size-5" />
         </button>
         <p className={`rounded-full bg-black/50 px-3 py-1 text-xs ${quad || !ready ? '' : 'animate-pulse'}`}>
-          {quad ? 'מקם את הדף בתוך המסגרת' : ready ? 'מחפש מסמך...' : 'פותח מצלמה...'}
+          {isIPad()
+            ? 'מצלמת האייפד'
+            : quad
+              ? 'מקם את הדף בתוך המסגרת'
+              : ready
+                ? 'מחפש מסמך...'
+                : 'פותח מצלמה...'}
         </p>
         <span className="size-11" />
       </div>
 
-      {(error || needsTap) && (
+      {(isIPad() || error || needsTap) && (
         <div className="absolute inset-x-5 top-24 z-10 rounded-2xl bg-black/70 px-4 py-3 text-sm leading-5">
-          <p>{error ?? 'הקש לפתיחת תצוגת המצלמה.'}</p>
-          <button
-            type="button"
-            className="mt-3 min-h-11 w-full rounded-xl bg-white px-4 py-2 font-semibold text-black"
-            onClick={() => void resumePreview()}
-          >
-            {isIOS() ? 'הקש לתצוגה / צלם באייפד' : 'הקש לתצוגה'}
-          </button>
-          <button
-            type="button"
-            className="mt-2 min-h-11 w-full rounded-xl bg-white/15 px-4 py-2 font-semibold text-white"
-            onClick={() => nativeRef.current?.click()}
-          >
-            {isIOS() ? 'צלם עם מצלמת האייפד' : 'צלם או בחר תמונה'}
-          </button>
+          <p>
+            {isIPad()
+              ? 'באייפד הסריקה נעשית עם מצלמת המערכת. הקש לצילום המסמך.'
+              : (error ?? 'הקש לפתיחת תצוגת המצלמה.')}
+          </p>
+          {!isIPad() ? (
+            <button
+              type="button"
+              className="mt-3 min-h-11 w-full rounded-xl bg-white px-4 py-2 font-semibold text-black"
+              onClick={() => void resumePreview()}
+            >
+              {isIOS() ? 'הקש לתצוגה / צלם באייפד' : 'הקש לתצוגה'}
+            </button>
+          ) : null}
+          <div className="relative mt-3">
+            <button
+              type="button"
+              className="min-h-11 w-full rounded-xl bg-white px-4 py-2 font-semibold text-black"
+              onClick={() => nativeRef.current?.click()}
+            >
+              {isIOS() ? 'צלם עם מצלמת האייפד' : 'צלם או בחר תמונה'}
+            </button>
+            {isIPad() ? (
+              <input
+                type="file"
+                accept="image/*"
+                capture="environment"
+                className="absolute inset-0 z-10 cursor-pointer opacity-0"
+                aria-label="צלם עם מצלמת האייפד"
+                onChange={(event) => {
+                  const file = event.target.files?.[0]
+                  event.target.value = ''
+                  if (file) ingestFile(file)
+                }}
+              />
+            ) : null}
+          </div>
         </div>
       )}
       <input
         ref={nativeRef}
         type="file"
-        accept={IMAGE_FILE_ACCEPT}
+        accept="image/*"
         capture="environment"
         className="sr-only"
         onChange={(event) => {
@@ -451,35 +486,55 @@ export function CameraCapture() {
         >
           <Images className="size-5" />
         </button>
-        <button
-          type="button"
-          onClick={() => {
-            if (!ready) {
-              nativeRef.current?.click()
-              return
-            }
-            void capture()
-          }}
-          disabled={capturing}
-          aria-label="צילום"
-          className="grid size-20 place-items-center rounded-full border-4 border-white disabled:opacity-40"
-        >
-          <span className="size-14 rounded-full bg-white active:scale-95" />
-        </button>
-        <button
-          type="button"
-          className="grid size-12 place-items-center rounded-full bg-white/15"
-          aria-label="החלפת מצלמה"
-          onClick={() => {
-            setFacing((current) => {
-              const next = current === 'environment' ? 'user' : 'environment'
-              primeCameraGesture(next)
-              return next
-            })
-          }}
-        >
-          <SwitchCamera className="size-5" />
-        </button>
+        <div className="relative">
+          <button
+            type="button"
+            onClick={() => {
+              if (!ready) {
+                nativeRef.current?.click()
+                return
+              }
+              void capture()
+            }}
+            disabled={capturing}
+            aria-label="צילום"
+            className="grid size-20 place-items-center rounded-full border-4 border-white disabled:opacity-40"
+          >
+            <span className="size-14 rounded-full bg-white active:scale-95" />
+          </button>
+          {isIPad() ? (
+            <input
+              type="file"
+              accept="image/*"
+              capture="environment"
+              className="absolute inset-0 z-10 cursor-pointer opacity-0"
+              aria-label="צילום"
+              onChange={(event) => {
+                const file = event.target.files?.[0]
+                event.target.value = ''
+                if (file) ingestFile(file)
+              }}
+            />
+          ) : null}
+        </div>
+        {isIPad() ? (
+          <span className="size-12" />
+        ) : (
+          <button
+            type="button"
+            className="grid size-12 place-items-center rounded-full bg-white/15"
+            aria-label="החלפת מצלמה"
+            onClick={() => {
+              setFacing((current) => {
+                const next = current === 'environment' ? 'user' : 'environment'
+                primeCameraGesture(next)
+                return next
+              })
+            }}
+          >
+            <SwitchCamera className="size-5" />
+          </button>
+        )}
       </div>
       <input
         ref={fileRef}

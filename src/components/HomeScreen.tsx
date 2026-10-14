@@ -1,4 +1,5 @@
 import { Camera, FilePlus2, Moon, Sun } from 'lucide-react'
+import { isIPad } from '../lib/camera'
 import { useScan } from '../state/scan-context'
 import { Button } from './Button'
 import { InstallAppButtons } from './InstallAppButtons'
@@ -7,6 +8,7 @@ import { UploadDropzone } from './UploadDropzone'
 export function HomeScreen() {
   const { theme, toggleTheme, engine, retryEngine, pages, openCamera, openPages, ingestFile, startNewDocument } =
     useScan()
+  const ipad = isIPad()
 
   return (
     <div className="app-bg min-h-dvh text-ink dark:text-paper">
@@ -37,10 +39,31 @@ export function HomeScreen() {
         </p>
 
         <div className="mt-8 space-y-3">
-          <Button className="h-16 w-full text-base shadow-[0_12px_28px_rgba(28,107,86,0.22)]" onClick={openCamera}>
-            <Camera className="size-5" />
-            סריקה באמצעות מצלמה
-          </Button>
+          <div className="relative">
+            <Button
+              className="h-16 w-full text-base shadow-[0_12px_28px_rgba(28,107,86,0.22)]"
+              onClick={() => {
+                if (!ipad) openCamera()
+              }}
+            >
+              <Camera className="size-5" />
+              סריקה באמצעות מצלמה
+            </Button>
+            {ipad ? (
+              <input
+                type="file"
+                accept="image/*"
+                capture="environment"
+                className="absolute inset-0 z-10 cursor-pointer opacity-0"
+                aria-label="צלם עם מצלמת האייפד"
+                onChange={(event) => {
+                  const file = event.target.files?.[0]
+                  event.target.value = ''
+                  if (file) ingestFile(file)
+                }}
+              />
+            ) : null}
+          </div>
           <UploadDropzone onFile={ingestFile} />
           <InstallAppButtons />
         </div>
