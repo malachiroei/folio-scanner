@@ -831,6 +831,7 @@ function otsuThreshold(gray: Uint8Array) {
 function sampleLine(
   mask: Uint8Array,
   luma: Uint8Array,
+  chroma: Uint8Array,
   width: number,
   height: number,
   axis: 'row' | 'col',
@@ -839,6 +840,7 @@ function sampleLine(
   const span = axis === 'row' ? width : height
   let paper = 0
   let dark = 0
+  let yellow = 0
   let sum = 0
   let midPaper = 0
   const mid0 = (span * 0.22) | 0
@@ -846,8 +848,10 @@ function sampleLine(
   for (let k = 0; k < span; k += 1) {
     const p = axis === 'row' ? index * width + k : k * width + index
     const tone = luma[p] ?? 0
+    const sat = chroma[p] ?? 0
     sum += tone
     if (tone < 70) dark += 1
+    if (tone > 160 && sat > 28) yellow += 1
     if (mask[p]) {
       paper += 1
       if (k >= mid0 && k < mid1) midPaper += 1
@@ -857,6 +861,7 @@ function sampleLine(
   return {
     paper: paper / span,
     dark: dark / span,
+    yellow: yellow / span,
     mean: sum / span,
     midPaper: midPaper / midN,
   }
@@ -878,6 +883,7 @@ function trimToPaper(source: HTMLCanvasElement): HTMLCanvasElement {
   context.drawImage(source, 0, 0, sw, sh)
   const data = context.getImageData(0, 0, sw, sh).data
   const gray = new Uint8Array(sw * sh)
+  const chroma = new Uint8Array(sw * sh)
   const mask = new Uint8Array(sw * sh)
   for (let p = 0, i = 0; p < gray.length; p += 1, i += 4) {
     const r = data[i] ?? 0
@@ -885,8 +891,9 @@ function trimToPaper(source: HTMLCanvasElement): HTMLCanvasElement {
     const b = data[i + 2] ?? 0
     const tone = pixelLuma(r, g, b) | 0
     gray[p] = tone
-    const chroma = Math.max(r, g, b) - Math.min(r, g, b)
-    if (tone > 148 && chroma < 52) mask[p] = 1
+    const sat = Math.max(r, g, b) - Math.min(r, g, b)
+    chroma[p] = sat
+    if (tone > 148 && sat < 38) mask[p] = 1
   }
   const threshold = Math.min(185, Math.max(148, otsuThreshold(gray)))
   for (let p = 0; p < mask.length; p += 1) {
@@ -944,13 +951,13 @@ function trimToPaper(source: HTMLCanvasElement): HTMLCanvasElement {
     }
   }
   const linePage = (axis: 'row' | 'col', index: number) => {
-    const stats = sampleLine(mask, gray, sw, sh, axis, index)
-    return stats.dark < 0.38 && (stats.paper > 0.18 || stats.mean > 148)
+    const stats = sampleLine(mask, gray, chroma, sw, sh, axis, index)
+    return stats.paper > 0.3 && stats.dark < 0.22 && stats.yellow < 0.28
   }
-  const lineBackdrop = (axis: 'row' | 'col', index: number) => {
-    const stats = sampleLine(mask, gray, sw, sh, axis, index)
-    if (stats.midPaper > 0.18) return false
-    return stats.paper < 0.14 && (stats.mean < 90 || stats.dark > 0.4)
+  const lineWeak = (axis: 'row' | 'col', index: number) => {
+    const stats = sampleLine(mask, gray, chroma, sw, sh, axis, index)
+    if (stats.midPaper > 0.48) return false
+    return stats.paper < 0.4 && (stats.dark > 0.12 || stats.yellow > 0.25 || stats.paper < 0.22)
   }
   let left = best.minX
   let right = best.maxX
@@ -960,16 +967,18 @@ function trimToPaper(source: HTMLCanvasElement): HTMLCanvasElement {
   while (right + 1 < sw && linePage('col', right + 1)) right += 1
   while (top > 0 && linePage('row', top - 1)) top -= 1
   while (bottom + 1 < sh && linePage('row', bottom + 1)) bottom += 1
-  while (left < right && lineBackdrop('col', left)) left += 1
-  while (right > left && lineBackdrop('col', right)) right -= 1
-  while (top < bottom && lineBackdrop('row', top)) top += 1
-  while (bottom > top && lineBackdrop('row', bottom)) bottom -= 1
+  const maxX = (sw * 0.22) | 0
+  const maxY = (sh * 0.12) | 0
+  while (left < maxX && left < right && lineWeak('col', left)) left += 1
+  while (right > sw - 1 - maxX && right > left && lineWeak('col', right)) right -= 1
+  while (top < maxY && top < bottom && lineWeak('row', top)) top += 1
+  while (bottom > sh - 1 - maxY && bottom > top && lineWeak('row', bottom)) bottom -= 1
   sample.width = 0
   sample.height = 0
   if (bestCount < gray.length * 0.16) return source
   const inv = 1 / scale
-  const padX = 6
-  const padY = 6
+  const padX = 2
+  const padY = 2
   const cropL = Math.max(0, Math.floor(left * inv) - padX)
   const cropT = Math.max(0, Math.floor(top * inv) - padY)
   const cropR = Math.min(width, Math.ceil((right + 1) * inv) + padX)
@@ -979,47 +988,86 @@ function trimToPaper(source: HTMLCanvasElement): HTMLCanvasElement {
   return cropCanvas(source, cropL, cropT, cropR, cropB)
 }
 
-function edgeIsBackdrop(data: Uint8ClampedArray, width: number, height: number, axis: 'row' | 'col', index: number) {
+function edgeIsBackdrop(
+  data: Uint8ClampedArray,
+  width: number,
+  height: number,
+  axis: 'row' | 'col',
+  index: number,
+  dropYellow: boolean,
+) {
   const span = axis === 'row' ? width : height
   const mid0 = (span * 0.22) | 0
   const mid1 = (span * 0.78) | 0
   let dark = 0
   let paper = 0
+  let yellow = 0
   let midPaper = 0
   let sum = 0
   for (let k = 0; k < span; k += 1) {
     const i = axis === 'row' ? (index * width + k) * 4 : (k * width + index) * 4
-    const luma = pixelLuma(data[i] ?? 0, data[i + 1] ?? 0, data[i + 2] ?? 0)
+    const r = data[i] ?? 0
+    const g = data[i + 1] ?? 0
+    const b = data[i + 2] ?? 0
+    const luma = pixelLuma(r, g, b)
+    const sat = Math.max(r, g, b) - Math.min(r, g, b)
     sum += luma
     if (luma < 70) dark += 1
-    if (luma > 200) {
+    if (luma > 160 && sat > 28) yellow += 1
+    if (luma > 200 && sat < 22) {
       paper += 1
       if (k >= mid0 && k < mid1) midPaper += 1
+    } else if (!dropYellow && luma > 200 && k >= mid0 && k < mid1) {
+      midPaper += 1
     }
   }
-  if (midPaper > (mid1 - mid0) * 0.18) return false
-  return paper < span * 0.12 && (sum / span < 80 || dark > span * 0.45)
+  if (midPaper > (mid1 - mid0) * 0.48) return false
+  if (paper < span * 0.12 && (sum / span < 80 || dark > span * 0.4)) return true
+  if (!dropYellow) return false
+  return paper < span * 0.4 && (dark > span * 0.12 || yellow > span * 0.25 || paper < span * 0.22)
 }
 
-/** Drop keyboard / laptop-bezel strips. Sides first so a header is not sliced off with the bezel. */
+function interiorIsWhite(data: Uint8ClampedArray, width: number, height: number) {
+  const x0 = (width * 0.25) | 0
+  const x1 = (width * 0.75) | 0
+  const y0 = (height * 0.25) | 0
+  const y1 = (height * 0.75) | 0
+  let sat = 0
+  let n = 0
+  for (let y = y0; y < y1; y += 3) {
+    for (let x = x0; x < x1; x += 3) {
+      const i = (y * width + x) * 4
+      const r = data[i] ?? 0
+      const g = data[i + 1] ?? 0
+      const b = data[i + 2] ?? 0
+      if (pixelLuma(r, g, b) < 200) continue
+      sat += Math.max(r, g, b) - Math.min(r, g, b)
+      n += 1
+    }
+  }
+  return n > 40 && sat / n < 16
+}
+
+/** Drop keyboard / beige-desk strips. Sides first so a header is not sliced off with the bezel. */
 function trimDarkMargins(source: HTMLCanvasElement): HTMLCanvasElement {
   const context = source.getContext('2d', { willReadFrequently: true })
   if (!context) return source
   const { width, height } = source
   const image = context.getImageData(0, 0, width, height)
   const data = image.data
-  const maxY = Math.floor(height * 0.12)
+  const dropYellow = interiorIsWhite(data, width, height)
+  const maxY = Math.floor(height * 0.1)
   const maxX = Math.floor(width * 0.2)
   let top = 0
   let bottom = height
   let left = 0
   let right = width
-  while (left < maxX && edgeIsBackdrop(data, width, height, 'col', left)) left += 1
-  while (right - 1 > width - 1 - maxX && right - 1 > left + 32 && edgeIsBackdrop(data, width, height, 'col', right - 1)) {
+  while (left < maxX && edgeIsBackdrop(data, width, height, 'col', left, dropYellow)) left += 1
+  while (right - 1 > width - 1 - maxX && right - 1 > left + 32 && edgeIsBackdrop(data, width, height, 'col', right - 1, dropYellow)) {
     right -= 1
   }
-  while (top < maxY && edgeIsBackdrop(data, width, height, 'row', top)) top += 1
-  while (bottom - 1 > height - 1 - maxY && bottom - 1 > top + 32 && edgeIsBackdrop(data, width, height, 'row', bottom - 1)) {
+  while (top < maxY && edgeIsBackdrop(data, width, height, 'row', top, dropYellow)) top += 1
+  while (bottom - 1 > height - 1 - maxY && bottom - 1 > top + 32 && edgeIsBackdrop(data, width, height, 'row', bottom - 1, dropYellow)) {
     bottom -= 1
   }
   if (top === 0 && bottom === height && left === 0 && right === width) return source
