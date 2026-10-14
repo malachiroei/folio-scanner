@@ -36,11 +36,16 @@ async function sniffHeic(blob: Blob) {
 
 async function convertHeicToJpeg(blob: Blob): Promise<Blob> {
   const { default: heic2any } = await import('heic2any')
-  const converted = await heic2any({
-    blob,
-    toType: 'image/jpeg',
-    quality: 0.92,
-  })
+  const converted = await Promise.race([
+    heic2any({
+      blob,
+      toType: 'image/jpeg',
+      quality: 0.92,
+    }),
+    new Promise<never>((_, reject) => {
+      window.setTimeout(() => reject(new Error('heic-timeout')), 12000)
+    }),
+  ])
   const jpeg = Array.isArray(converted) ? converted[0] : converted
   if (!jpeg) throw new Error('לא ניתן לפתוח את התמונה. נסה JPEG, PNG או HEIC.')
   return jpeg

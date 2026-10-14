@@ -36,6 +36,57 @@ type ImageCaptureInstance = {
 }
 type ImageCaptureConstructor = new (track: MediaStreamTrack) => ImageCaptureInstance
 
+function isIOS() {
+  if (typeof navigator === 'undefined') return false
+  const ua = navigator.userAgent
+  if (/iPad|iPhone|iPod/.test(ua)) return true
+  return navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1
+}
+
+function videoConstraints(facing: 'environment' | 'user'): MediaTrackConstraints {
+  // iPad/Safari often returns a black stream if we ask for 4K preview.
+  if (isIOS()) {
+    return {
+      facingMode: { ideal: facing },
+      width: { ideal: 1280 },
+      height: { ideal: 720 },
+    }
+  }
+  return {
+    facingMode: { ideal: facing },
+    width: { ideal: 1920 },
+    height: { ideal: 1080 },
+  }
+}
+
+async function waitForVideo(video: HTMLVideoElement) {
+  if (video.videoWidth > 0 && video.readyState >= 2) return
+  await new Promise<void>((resolve, reject) => {
+    const finish = () => {
+      window.clearTimeout(timer)
+      video.removeEventListener('loadedmetadata', onReady)
+      video.removeEventListener('loadeddata', onReady)
+      if (video.videoWidth > 0) resolve()
+      else reject(new Error('video-timeout'))
+    }
+    const onReady = () => {
+      if (video.videoWidth > 0) finish()
+    }
+    const timer = window.setTimeout(finish, 8000)
+    video.addEventListener('loadedmetadata', onReady)
+    video.addEventListener('loadeddata', onReady)
+  })
+}
+
+function primeVideo(video: HTMLVideoElement) {
+  video.muted = true
+  video.playsInline = true
+  video.autoplay = true
+  video.setAttribute('playsinline', 'true')
+  video.setAttribute('webkit-playsinline', 'true')
+  video.setAttribute('muted', 'true')
+}
+
 function cameraMessage(error: unknown): string {
   if (!window.isSecureContext) {
     return 'המצלמה דורשת דף מאובטח (https או localhost). עדיין אפשר להעלות תמונה.'
@@ -156,21 +207,21 @@ export function CameraCapture() {
         setError('הדפדפן הזה לא יכול לפתוח את המצלמה. העלה תמונה במקום.')
         return
       }
+      primeVideo(view)
       try {
         try {
           stream = await navigator.mediaDevices.getUserMedia({
             audio: false,
-            video: {
-              facingMode: { ideal: facing },
-              width: { ideal: 3840 },
-              height: { ideal: 2160 },
-            },
+            video: videoConstraints(facing),
           })
         } catch (first) {
           if (first instanceof DOMException && (first.name === 'NotAllowedError' || first.name === 'SecurityError')) {
             throw first
           }
-          stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false })
+          stream = await navigator.mediaDevices.getUserMedia({
+            audio: false,
+            video: { facingMode: facing },
+          })
         }
         if (cancelled) {
           stream.getTracks().forEach((track) => track.stop())
@@ -179,10 +230,24 @@ export function CameraCapture() {
         view.srcObject = stream
         streamRef.current = stream
         try {
+          await waitForVideo(view)
           await view.play()
         } catch (playError) {
-          // A interrupted play() (e.g. fast unmount) is harmless; the stream is still attached.
           console.warn(playError)
+          try {
+            stream.getTracks().forEach((track) => track.stop())
+            stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false })
+            if (cancelled) {
+              stream.getTracks().forEach((track) => track.stop())
+              return
+            }
+            view.srcObject = stream
+            streamRef.current = stream
+            await waitForVideo(view)
+            await view.play()
+          } catch (retryError) {
+            console.warn(retryError)
+          }
         }
         if (!cancelled) setReady(true)
       } catch (err) {
@@ -321,7 +386,7 @@ export function CameraCapture() {
       <div className="relative min-h-0 flex-1 overflow-hidden">
       <video
         ref={videoRef}
-        className={`absolute inset-0 h-full w-full object-contain ${facing === 'user' ? '-scale-x-100' : ''}`}
+        className={`absolute inset-0 h-full w-full bg-black object-cover ${facing === 'user' ? '-scale-x-100' : ''}`}
         autoPlay
         muted
         playsInline
