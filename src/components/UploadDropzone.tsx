@@ -1,5 +1,6 @@
 import { ImagePlus } from 'lucide-react'
 import { useRef, useState } from 'react'
+import { IMAGE_FILE_ACCEPT } from '../lib/image'
 
 export function UploadDropzone({
   onFile,
@@ -37,7 +38,7 @@ export function UploadDropzone({
       <input
         ref={inputRef}
         type="file"
-        accept="image/*"
+        accept={IMAGE_FILE_ACCEPT}
         className="sr-only"
         onChange={(event) => {
           take(event.target.files?.[0])

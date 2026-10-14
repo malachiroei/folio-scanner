@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "canvas-confetti": "^1.9.4",
+    "heic2any": "^0.0.4",
     "jscanify": "^1.4.3",
     "jspdf": "^4.2.1",
     "lucide-react": "^1.52.0",

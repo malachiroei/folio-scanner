@@ -1,6 +1,7 @@
 import { Images, SwitchCamera, X } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { cornersFromUnit, detectDocumentCorners } from '../lib/detect'
+import { IMAGE_FILE_ACCEPT } from '../lib/image'
 import { clearLiveLock, peekLiveLock, rememberLiveLock } from '../lib/live-lock'
 import { useScan } from '../state/scan-context'
 import type { CaptureHint, Corners } from '../types'
@@ -393,7 +394,7 @@ export function CameraCapture() {
       <input
         ref={nativeRef}
         type="file"
-        accept="image/*"
+        accept={IMAGE_FILE_ACCEPT}
         capture="environment"
         className="sr-only"
         onChange={(event) => {
@@ -434,7 +435,7 @@ export function CameraCapture() {
       <input
         ref={fileRef}
         type="file"
-        accept="image/*"
+        accept={IMAGE_FILE_ACCEPT}
         className="sr-only"
         onChange={(event) => {
           const file = event.target.files?.[0]

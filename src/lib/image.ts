@@ -1,4 +1,9 @@
 const MAX_SOURCE_EDGE = 4000
+const IMAGE_EXT = /\.(jpe?g|png|webp|gif|bmp|heic|heif|heics)$/i
+const HEIC_EXT = /\.(heic|heif|heics)$/i
+const HEIC_BRAND = /^(heic|heix|heif|heis|heim|hevc|hevx|mif1|msf1)$/i
+
+export const IMAGE_FILE_ACCEPT = 'image/*,.heic,.heif,.jpg,.jpeg,.png,.webp'
 
 export function nextFrame(): Promise<void> {
   return new Promise((resolve) => {
@@ -6,11 +11,46 @@ export function nextFrame(): Promise<void> {
   })
 }
 
+export function isAllowedImageFile(file: File) {
+  const type = (file.type || '').toLowerCase()
+  const name = file.name || ''
+  if (type.startsWith('image/')) return true
+  if (IMAGE_EXT.test(name)) return true
+  return !type
+}
+
+function isHeicTypeOrName(file: File) {
+  const type = (file.type || '').toLowerCase()
+  const name = (file.name || '').toLowerCase()
+  return type.includes('heic') || type.includes('heif') || HEIC_EXT.test(name)
+}
+
+async function sniffHeic(blob: Blob) {
+  const bytes = new Uint8Array(await blob.slice(0, 16).arrayBuffer())
+  if (bytes.length < 12) return false
+  const tag = String.fromCharCode(bytes[4] ?? 0, bytes[5] ?? 0, bytes[6] ?? 0, bytes[7] ?? 0)
+  if (tag !== 'ftyp') return false
+  const brand = String.fromCharCode(bytes[8] ?? 0, bytes[9] ?? 0, bytes[10] ?? 0, bytes[11] ?? 0)
+  return HEIC_BRAND.test(brand)
+}
+
+async function convertHeicToJpeg(blob: Blob): Promise<Blob> {
+  const { default: heic2any } = await import('heic2any')
+  const converted = await heic2any({
+    blob,
+    toType: 'image/jpeg',
+    quality: 0.92,
+  })
+  const jpeg = Array.isArray(converted) ? converted[0] : converted
+  if (!jpeg) throw new Error('לא ניתן לפתוח את התמונה. נסה JPEG, PNG או HEIC.')
+  return jpeg
+}
+
 export function loadImage(src: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const image = new Image()
     image.onload = () => resolve(image)
-    image.onerror = () => reject(new Error('לא ניתן לפתוח את התמונה. נסה JPEG או PNG.'))
+    image.onerror = () => reject(new Error('לא ניתן לפתוח את התמונה. נסה JPEG, PNG או HEIC.'))
     image.src = src
   })
 }
@@ -116,13 +156,46 @@ async function decodeBitmap(blob: Blob): Promise<ImageBitmap> {
   }
   return await createImageBitmap(blob, { imageOrientation: 'from-image' })
 }
-export async function normalizeImage(blob: Blob): Promise<{ url: string; width: number; height: number }> {
-  let bitmap: ImageBitmap
+
+async function decodeViaImageElement(blob: Blob): Promise<ImageBitmap> {
+  const url = URL.createObjectURL(blob)
   try {
-    bitmap = await decodeBitmap(blob)
-  } catch {
-    throw new Error('לא ניתן לפתוח את התמונה. נסה JPEG או PNG.')
+    const image = await loadImage(url)
+    return await createImageBitmap(image)
+  } finally {
+    URL.revokeObjectURL(url)
   }
+}
+
+async function decodeSource(blob: Blob): Promise<ImageBitmap> {
+  try {
+    return await decodeBitmap(blob)
+  } catch {
+    return await decodeViaImageElement(blob)
+  }
+}
+
+export async function normalizeImage(blob: Blob): Promise<{ url: string; width: number; height: number }> {
+  let source = blob
+  let bitmap: ImageBitmap | null = null
+  try {
+    bitmap = await decodeSource(source)
+  } catch {
+    bitmap = null
+  }
+  if (!bitmap) {
+    const named = blob instanceof File ? isHeicTypeOrName(blob) : false
+    const heic = named || (await sniffHeic(blob))
+    if (heic) {
+      try {
+        source = await convertHeicToJpeg(blob)
+        bitmap = await decodeSource(source)
+      } catch {
+        bitmap = null
+      }
+    }
+  }
+  if (!bitmap) throw new Error('לא ניתן לפתוח את התמונה. נסה JPEG, PNG או HEIC.')
 
   const scale = Math.min(1, MAX_SOURCE_EDGE / Math.max(bitmap.width, bitmap.height))
   const width = Math.max(1, Math.round(bitmap.width * scale))

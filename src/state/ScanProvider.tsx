@@ -7,6 +7,7 @@ import {
   canvasToJpegBlob,
   downloadBlob,
   errorMessage,
+  isAllowedImageFile,
   loadImage,
   nextFrame,
   normalizeImage,
@@ -300,8 +301,8 @@ export function ScanProvider({ children }: { children: ReactNode }) {
   }
 
   function ingestFile(file: File) {
-    if (file.type && !file.type.startsWith('image/')) {
-      setToast('בחר תמונת JPEG, PNG או WebP.')
+    if (!isAllowedImageFile(file)) {
+      setToast('בחר תמונת JPEG, PNG, WebP או HEIC.')
       return
     }
     clearLiveLock()
