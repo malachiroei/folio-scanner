@@ -57,10 +57,10 @@ export async function sendScan(input: unknown): Promise<SendScanResult> {
 
   const resend = new Resend(apiKey)
   const { error } = await resend.emails.send({
-    from: process.env.RESEND_FROM || 'Folio Scanner <onboarding@resend.dev>',
+    from: process.env.RESEND_FROM || 'סורק מסמכים <onboarding@resend.dev>',
     to,
-    subject: `סריקת מסמך - Folio (${new Date().toLocaleDateString('he-IL')})`,
-    text: 'מצורף קובץ PDF של המסמך שנסרק באפליקציית Folio.',
+    subject: `סריקת מסמך (${new Date().toLocaleDateString('he-IL')})`,
+    text: 'מצורף קובץ PDF של המסמך שנסרק.',
     attachments: [{ filename: pdfName(record.filename), content: pdfBase64 }],
   })
   if (error) {

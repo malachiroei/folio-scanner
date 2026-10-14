@@ -1,6 +1,7 @@
 import { Camera, FilePlus2, Moon, Sun } from 'lucide-react'
 import { useScan } from '../state/scan-context'
 import { Button } from './Button'
+import { InstallAppButtons } from './InstallAppButtons'
 import { UploadDropzone } from './UploadDropzone'
 
 export function HomeScreen() {
@@ -12,8 +13,14 @@ export function HomeScreen() {
       <div className="mx-auto flex min-h-dvh w-full max-w-lg flex-col px-5 pt-[max(1.25rem,env(safe-area-inset-top))] pb-[max(1.25rem,env(safe-area-inset-bottom))]">
         <header className="flex items-start justify-between gap-4">
           <div className="min-w-0">
-            <p className="text-sm font-semibold text-moss dark:text-moss-bright">Folio</p>
-            <h1 className="mt-1 font-display text-[2rem] leading-tight font-bold">סורק מסמכים חכם</h1>
+            <div className="flex items-center gap-3">
+              <img
+                src="/apple-touch-icon.png"
+                alt=""
+                className="size-12 shrink-0 rounded-[14px] shadow-[0_8px_20px_rgba(8,18,40,0.35)] ring-1 ring-black/10"
+              />
+              <h1 className="font-display text-[1.85rem] leading-tight font-bold">סורק מסמכים</h1>
+            </div>
           </div>
           <button
             type="button"
@@ -35,6 +42,7 @@ export function HomeScreen() {
             סריקה באמצעות מצלמה
           </Button>
           <UploadDropzone onFile={ingestFile} />
+          <InstallAppButtons />
         </div>
 
         {pages.length > 0 && (

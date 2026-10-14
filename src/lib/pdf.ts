@@ -112,7 +112,7 @@ export async function buildPagesPdf(pages: ScanPage[], options: PdfOptions = {})
   }
 
   if (!doc) throw new Error('הוסף עמוד לפני הייצוא.')
-  doc.setProperties({ title: 'Folio — סורק מסמכים', creator: 'Folio' })
+  doc.setProperties({ title: 'סורק מסמכים', creator: 'סורק מסמכים' })
   return doc.output('blob')
 }
 

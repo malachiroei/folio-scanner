@@ -942,7 +942,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
   }
 
   function openMailto(email: string) {
-    const href = `mailto:${email}?subject=${encodeURIComponent('סריקת מסמך - Folio')}&body=${encodeURIComponent('מצורף מסמך סרוק.')}`
+    const href = `mailto:${email}?subject=${encodeURIComponent('סריקת מסמך')}&body=${encodeURIComponent('מצורף מסמך סרוק.')}`
     const link = document.createElement('a')
     link.href = href
     document.body.appendChild(link)
@@ -953,7 +953,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
   async function shareFile(file: File, email?: string) {
     const payload = {
       files: [file],
-      title: 'סריקת מסמך - Folio',
+      title: 'סריקת מסמך',
       text: email ? `אל: ${email}\nמצורף מסמך סרוק.` : 'מצורף מסמך סרוק.',
     }
     if (typeof navigator.share !== 'function' || typeof navigator.canShare !== 'function') return false
