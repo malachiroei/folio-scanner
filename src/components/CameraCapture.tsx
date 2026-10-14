@@ -1,5 +1,11 @@
 import { Images, SwitchCamera, X } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
+import {
+  attachCameraStream,
+  consumePrimedCamera,
+  isIOS,
+  primeCameraGesture,
+} from '../lib/camera'
 import { cornersFromUnit, detectDocumentCorners } from '../lib/detect'
 import { IMAGE_FILE_ACCEPT } from '../lib/image'
 import { clearLiveLock, peekLiveLock, rememberLiveLock } from '../lib/live-lock'
@@ -36,57 +42,6 @@ type ImageCaptureInstance = {
 }
 type ImageCaptureConstructor = new (track: MediaStreamTrack) => ImageCaptureInstance
 
-function isIOS() {
-  if (typeof navigator === 'undefined') return false
-  const ua = navigator.userAgent
-  if (/iPad|iPhone|iPod/.test(ua)) return true
-  return navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1
-}
-
-function videoConstraints(facing: 'environment' | 'user'): MediaTrackConstraints {
-  // iPad/Safari often returns a black stream if we ask for 4K preview.
-  if (isIOS()) {
-    return {
-      facingMode: { ideal: facing },
-      width: { ideal: 1280 },
-      height: { ideal: 720 },
-    }
-  }
-  return {
-    facingMode: { ideal: facing },
-    width: { ideal: 1920 },
-    height: { ideal: 1080 },
-  }
-}
-
-async function waitForVideo(video: HTMLVideoElement) {
-  if (video.videoWidth > 0 && video.readyState >= 2) return
-  await new Promise<void>((resolve, reject) => {
-    const finish = () => {
-      window.clearTimeout(timer)
-      video.removeEventListener('loadedmetadata', onReady)
-      video.removeEventListener('loadeddata', onReady)
-      if (video.videoWidth > 0) resolve()
-      else reject(new Error('video-timeout'))
-    }
-    const onReady = () => {
-      if (video.videoWidth > 0) finish()
-    }
-    const timer = window.setTimeout(finish, 8000)
-    video.addEventListener('loadedmetadata', onReady)
-    video.addEventListener('loadeddata', onReady)
-  })
-}
-
-function primeVideo(video: HTMLVideoElement) {
-  video.muted = true
-  video.playsInline = true
-  video.autoplay = true
-  video.setAttribute('playsinline', 'true')
-  video.setAttribute('webkit-playsinline', 'true')
-  video.setAttribute('muted', 'true')
-}
-
 function cameraMessage(error: unknown): string {
   if (!window.isSecureContext) {
     return 'המצלמה דורשת דף מאובטח (https או localhost). עדיין אפשר להעלות תמונה.'
@@ -116,6 +71,7 @@ export function CameraCapture() {
   const [capturing, setCapturing] = useState(false)
   const streamRef = useRef<MediaStream | null>(null)
   const [quad, setQuad] = useState<LiveQuad | null>(null)
+  const [needsTap, setNeedsTap] = useState(false)
   const quadRef = useRef<LiveQuad | null>(null)
 
   useEffect(() => {
@@ -201,55 +157,32 @@ export function CameraCapture() {
     let cancelled = false
     setReady(false)
     setError(null)
+    setNeedsTap(false)
 
     async function start() {
       if (!navigator.mediaDevices?.getUserMedia) {
-        setError('הדפדפן הזה לא יכול לפתוח את המצלמה. העלה תמונה במקום.')
+        setError('הדפדפן הזה לא יכול לפתוח את המצלמה. צלם או העלה תמונה במקום.')
         return
       }
-      primeVideo(view)
       try {
-        try {
-          stream = await navigator.mediaDevices.getUserMedia({
-            audio: false,
-            video: videoConstraints(facing),
-          })
-        } catch (first) {
-          if (first instanceof DOMException && (first.name === 'NotAllowedError' || first.name === 'SecurityError')) {
-            throw first
-          }
-          stream = await navigator.mediaDevices.getUserMedia({
-            audio: false,
-            video: { facingMode: facing },
-          })
-        }
+        stream = await consumePrimedCamera(facing)
         if (cancelled) {
           stream.getTracks().forEach((track) => track.stop())
           return
         }
-        view.srcObject = stream
         streamRef.current = stream
-        try {
-          await waitForVideo(view)
-          await view.play()
-        } catch (playError) {
-          console.warn(playError)
-          try {
-            stream.getTracks().forEach((track) => track.stop())
-            stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false })
-            if (cancelled) {
-              stream.getTracks().forEach((track) => track.stop())
-              return
-            }
-            view.srcObject = stream
-            streamRef.current = stream
-            await waitForVideo(view)
-            await view.play()
-          } catch (retryError) {
-            console.warn(retryError)
-          }
+        await attachCameraStream(view, stream)
+        if (cancelled) return
+        if (view.videoWidth > 0) {
+          setReady(true)
+          return
         }
-        if (!cancelled) setReady(true)
+        setNeedsTap(true)
+        setError(
+          isIOS()
+            ? 'המצלמה אושרה, אבל התצוגה לא עלתה. הקש על המסך, או צלם עם מצלמת האייפד.'
+            : 'המצלמה אושרה, אבל התצוגה לא עלתה. הקש על המסך או העלה תמונה.',
+        )
       } catch (err) {
         console.error(err)
         if (!cancelled) setError(cameraMessage(err))
@@ -381,6 +314,38 @@ export function CameraCapture() {
     )
   }
 
+  async function resumePreview() {
+    const video = videoRef.current
+    const stream = streamRef.current
+    if (video) {
+      try {
+        await video.play()
+        if (video.videoWidth > 0) {
+          setReady(true)
+          setError(null)
+          setNeedsTap(false)
+          return
+        }
+      } catch {
+        // iPad sometimes needs the native camera instead of in-browser preview.
+      }
+      if (stream) {
+        try {
+          await attachCameraStream(video, stream)
+          if (video.videoWidth > 0) {
+            setReady(true)
+            setError(null)
+            setNeedsTap(false)
+            return
+          }
+        } catch {
+          // Fall through to the system camera.
+        }
+      }
+    }
+    nativeRef.current?.click()
+  }
+
   return (
     <div className="fixed inset-0 z-40 flex h-[100dvh] max-h-[100dvh] flex-col overflow-hidden bg-black text-white">
       <div className="relative min-h-0 flex-1 overflow-hidden">
@@ -438,21 +403,28 @@ export function CameraCapture() {
         >
           <X className="size-5" />
         </button>
-        <p className={`rounded-full bg-black/50 px-3 py-1 text-xs ${quad ? '' : 'animate-pulse'}`}>
-          {quad ? 'מקם את הדף בתוך המסגרת' : 'מחפש מסמך...'}
+        <p className={`rounded-full bg-black/50 px-3 py-1 text-xs ${quad || !ready ? '' : 'animate-pulse'}`}>
+          {quad ? 'מקם את הדף בתוך המסגרת' : ready ? 'מחפש מסמך...' : 'פותח מצלמה...'}
         </p>
         <span className="size-11" />
       </div>
 
-      {error && (
+      {(error || needsTap) && (
         <div className="absolute inset-x-5 top-24 z-10 rounded-2xl bg-black/70 px-4 py-3 text-sm leading-5">
-          <p>{error}</p>
+          <p>{error ?? 'הקש לפתיחת תצוגת המצלמה.'}</p>
           <button
             type="button"
             className="mt-3 min-h-11 w-full rounded-xl bg-white px-4 py-2 font-semibold text-black"
+            onClick={() => void resumePreview()}
+          >
+            {isIOS() ? 'הקש לתצוגה / צלם באייפד' : 'הקש לתצוגה'}
+          </button>
+          <button
+            type="button"
+            className="mt-2 min-h-11 w-full rounded-xl bg-white/15 px-4 py-2 font-semibold text-white"
             onClick={() => nativeRef.current?.click()}
           >
-            צלם או בחר תמונה
+            {isIOS() ? 'צלם עם מצלמת האייפד' : 'צלם או בחר תמונה'}
           </button>
         </div>
       )}
@@ -481,8 +453,14 @@ export function CameraCapture() {
         </button>
         <button
           type="button"
-          onClick={() => void capture()}
-          disabled={!ready || capturing}
+          onClick={() => {
+            if (!ready) {
+              nativeRef.current?.click()
+              return
+            }
+            void capture()
+          }}
+          disabled={capturing}
           aria-label="צילום"
           className="grid size-20 place-items-center rounded-full border-4 border-white disabled:opacity-40"
         >
@@ -492,7 +470,13 @@ export function CameraCapture() {
           type="button"
           className="grid size-12 place-items-center rounded-full bg-white/15"
           aria-label="החלפת מצלמה"
-          onClick={() => setFacing((current) => (current === 'environment' ? 'user' : 'environment'))}
+          onClick={() => {
+            setFacing((current) => {
+              const next = current === 'environment' ? 'user' : 'environment'
+              primeCameraGesture(next)
+              return next
+            })
+          }}
         >
           <SwitchCamera className="size-5" />
         </button>

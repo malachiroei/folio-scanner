@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { cornersFromUnit, detectDocumentCorners } from '../lib/detect'
 import { cornersValid, fullFrameCorners, mapLiveCorners } from '../lib/geometry'
+import { primeCameraGesture } from '../lib/camera'
 import { clearLiveLock, consumeLiveLock } from '../lib/live-lock'
 import { isOpenCvReady, loadOpenCv } from '../lib/opencv'
 import {
@@ -1085,6 +1086,7 @@ export function ScanProvider({ children }: { children: ReactNode }) {
     selectedId,
     openCamera: () => {
       clearLiveLock()
+      primeCameraGesture('environment')
       setScreen('camera')
     },
     closeCamera: () => {
