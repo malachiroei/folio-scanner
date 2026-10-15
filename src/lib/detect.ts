@@ -1,12 +1,15 @@
 import type { Corners, Point } from '../types'
 
-const DETECT_WIDTH = 240
+const DETECT_WIDTH = 320
 const STILL_WIDTH = 720
-const MIN_AREA = 0.08
+const MIN_AREA = 0.2
 const MAX_AREA = 0.88
-const MARGIN = 0.04
-const STILL_MARGIN = 0.02
-const PAPER_SAT = 46
+const MARGIN = 0.012
+const STILL_MARGIN = 0.012
+const PAPER_SAT = 34
+const A4_ASPECT = Math.SQRT2
+const A4_ASPECT_MIN = 1.2
+const A4_ASPECT_MAX = 1.6
 
 const sample = document.createElement('canvas')
 const sampleCtx = sample.getContext('2d', { willReadFrequently: true })
@@ -129,11 +132,33 @@ function addPoint(acc: ReturnType<typeof extrema>, x: number, y: number) {
   }
 }
 
+function quadAspect(corners: Corners) {
+  const width =
+    (Math.hypot(corners.tr.x - corners.tl.x, corners.tr.y - corners.tl.y) +
+      Math.hypot(corners.br.x - corners.bl.x, corners.br.y - corners.bl.y)) /
+    2
+  const height =
+    (Math.hypot(corners.bl.x - corners.tl.x, corners.bl.y - corners.tl.y) +
+      Math.hypot(corners.br.x - corners.tr.x, corners.br.y - corners.tr.y)) /
+    2
+  const short = Math.min(width, height)
+  if (short < 1) return 0
+  return Math.max(width, height) / short
+}
+
+function a4Score(corners: Corners, frac: number) {
+  const aspect = quadAspect(corners)
+  if (aspect < A4_ASPECT_MIN || aspect > A4_ASPECT_MAX) return 0
+  const aspectScore = 1 - Math.abs(aspect - A4_ASPECT) / (A4_ASPECT_MAX - A4_ASPECT_MIN)
+  return aspectScore * 2 + frac
+}
+
 function largestBrightBlob(gray: Uint8Array, width: number, height: number, threshold: number): BlobHit | null {
   const frame = width * height
   const seen = new Uint8Array(gray.length)
   const stack = new Int32Array(gray.length)
   let best: BlobHit | null = null
+  let bestScore = -1
 
   for (let start = 0; start < gray.length; start += 1) {
     if ((gray[start] ?? 0) <= threshold || seen[start]) continue
@@ -170,11 +195,15 @@ function largestBrightBlob(gray: Uint8Array, width: number, height: number, thre
       }
     }
     const frac = acc.count / frame
-    if (frac < MIN_AREA || frac > MAX_AREA || (best && acc.count <= best.count)) continue
+    if (frac < MIN_AREA || frac > MAX_AREA) continue
     const touch =
       Number(acc.minX <= 1) + Number(acc.minY <= 1) + Number(acc.maxX >= width - 2) + Number(acc.maxY >= height - 2)
     if (touch >= 4) continue
-    best = { count: acc.count, corners: { tl: acc.tl, tr: acc.tr, br: acc.br, bl: acc.bl } }
+    const corners = { tl: acc.tl, tr: acc.tr, br: acc.br, bl: acc.bl }
+    const score = a4Score(corners, frac)
+    if (score <= 0 || score <= bestScore) continue
+    bestScore = score
+    best = { count: acc.count, corners }
   }
   return best
 }
@@ -366,15 +395,24 @@ function paperPageMask(
   return page
 }
 
-function stillPageCorners(data: Uint8ClampedArray, gray: Uint8Array, width: number, height: number, lumaThresh: number) {
+function sheetCorners(
+  data: Uint8ClampedArray,
+  gray: Uint8Array,
+  width: number,
+  height: number,
+  lumaThresh: number,
+  fitEdges: boolean,
+) {
   const page = paperPageMask(data, gray, width, height, lumaThresh)
   if (!page) return null
-  return fitTrapezoid(page, width, height) ?? cornersFromMask(page, width, height)
+  const corners = (fitEdges ? fitTrapezoid(page, width, height) : null) ?? cornersFromMask(page, width, height)
+  if (!corners) return null
+  return corners
 }
 
 /**
- * Live view: largest bright blob only (stable orange box).
- * Still photo: paper vs beige desk, then a fitted trapezoid so the far edge lifts like CamScanner.
+ * White-sheet quadrilateral: ignore keys/desk, keep A4-like hull extrema.
+ * Live uses the filled paper mask; stills also fit edge lines for a true trapezoid.
  */
 export function detectDocumentCorners(
   source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElement,
@@ -392,11 +430,9 @@ export function detectDocumentCorners(
       sum += value
     }
     if (sum / gray.length < 12) return null
-    const threshold = Math.min(210, Math.max(130, otsu(gray)))
-    if (still) {
-      const fitted = stillPageCorners(data, gray, width, height, threshold)
-      if (fitted) return toUnit(expand(fitted, width, height, STILL_MARGIN), width, height)
-    }
+    const threshold = Math.min(210, Math.max(150, otsu(gray)))
+    const sheet = sheetCorners(data, gray, width, height, threshold, still)
+    if (sheet) return toUnit(expand(sheet, width, height, still ? STILL_MARGIN : MARGIN), width, height)
     const blob = largestBrightBlob(gray, width, height, threshold)
     if (!blob) return null
     return toUnit(expand(blob.corners, width, height, still ? STILL_MARGIN : MARGIN), width, height)

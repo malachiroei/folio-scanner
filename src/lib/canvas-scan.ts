@@ -1,5 +1,5 @@
 ﻿import type { Corners, FilterMode, Point } from '../types'
-import { distance } from './geometry'
+import { distance, orderCorners } from './geometry'
 import { nextFrame } from './image'
 
 /** 125% of the 3234 page that looked right when the PDF was zoomed to 125%. */
@@ -27,10 +27,11 @@ const LIGHT_PERCENTILE = 0.95
 const LIGHT_BLUR_PASSES = 4
 const LIGHT_FLOOR = 0.74
 const FLAT_TARGET = 255
-const SAT_BOOST = 1.6
+const SAT_BOOST = 1.22
 const SAT_MIN = 0.08
 const PAPER_LUMA = 215
-const PAPER_SAT = 0.1
+const PAPER_SAT = 0.06
+const COLOR_CONTRAST = 1.18
 const INK_SAT = 0.12
 const INK_HARD = 90
 const FAINT_INK = 150
@@ -216,13 +217,6 @@ function sampleBicubic(
   out: Uint8ClampedArray,
   offset: number,
 ) {
-  if (x < -1 || y < -1 || x > width || y > height) {
-    out[offset] = 255
-    out[offset + 1] = 255
-    out[offset + 2] = 255
-    out[offset + 3] = 255
-    return
-  }
   const x0 = Math.floor(x)
   const y0 = Math.floor(y)
   const fx = x - x0
@@ -306,6 +300,14 @@ async function warpCanvas(
     br: { x: corners.br.x * shrunk.scale, y: corners.br.y * shrunk.scale },
     bl: { x: corners.bl.x * shrunk.scale, y: corners.bl.y * shrunk.scale },
   }
+  const ordered = (() => {
+    try {
+      return orderCorners([quad.tl, quad.tr, quad.br, quad.bl])
+    } catch {
+      return quad
+    }
+  })()
+  // Inverse homography: dest A4 rectangle → source quad (same math as cv.getPerspectiveTransform + warpPerspective).
   const map = homography(
     [
       { x: 0, y: 0 },
@@ -313,7 +315,7 @@ async function warpCanvas(
       { x: width, y: height },
       { x: 0, y: height },
     ],
-    [quad.tl, quad.tr, quad.br, quad.bl],
+    [ordered.tl, ordered.tr, ordered.br, ordered.bl],
   )
   if (!map) return paintScaled(source, width, height, corners)
 
@@ -616,6 +618,10 @@ async function whiteBalanceRgb(
  * midtones stay continuous; paper snaps to white. Grain at 150–175 stays paper.
  */
 function scanLuma(normL: number, sat: number) {
+  if (sat >= SAT_MIN) {
+    const t = normL / 255
+    return clamp255(((t - 0.5) * COLOR_CONTRAST + 0.5) * 255)
+  }
   let next: number
   if (normL < FAINT_INK && sat < INK_SAT) {
     next = Math.floor(Math.pow(Math.max(0, normL) / FAINT_INK, 1.5) * INK_FAINT_GAIN)
@@ -637,7 +643,7 @@ function scanLuma(normL: number, sat: number) {
   return clamp255(next)
 }
 
-/** Luma curve then 1.6× HSV saturation when S > 0.08. Every pixel is written. */
+/** Paper/ink curve; colored stamps keep hue and get 1.22× saturation. */
 async function applyScanTone(
   data: Uint8ClampedArray,
   width: number,
