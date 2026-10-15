@@ -21,21 +21,18 @@ function isLandscape(corners: Corners): boolean {
   return width > height * 1.15
 }
 
-/** Uniform mathematical scan: flat-field → luma curve → saturation → unsharp. No region masks. */
-const LIGHT_GRID = 16
-const LIGHT_PERCENTILE = 0.95
-const LIGHT_BLUR_PASSES = 4
-const LIGHT_FLOOR = 0.82
-const FLAT_TARGET = 255
+/** Uniform mathematical scan: illumination ÷ → saturation → despeckle → unsharp. No region masks. */
+const BG_DOWN = 8
+const BG_BLUR_RADIUS = 18
+const BG_BLUR_PASSES = 3
+const PAPER_RATIO = 0.82
+const INK_RATIO = 0.15
+const PAPER_SAT = 0.2
+const PAPER_LUMA = 232
 const SAT_BOOST = 1.1
 const SAT_MIN = 0.08
-const PAPER_BG = 0.88
-const PAPER_SAT = 0.18
-const INK_LUMA = 160
-const INK_GAMMA = 1.25
-const INK_GAIN = 0.95
-const SHARPEN_AMOUNT = 1.12
-const SHARPEN_NOISE = 8
+const SHARPEN_AMOUNT = 1.08
+const SHARPEN_NOISE = 10
 const YIELD_MS = 24
 
 function sourceSize(image: CanvasImageSource): { width: number; height: number } {
@@ -362,16 +359,6 @@ function pixelSat(r: number, g: number, b: number) {
   return max < 1 ? 0 : (max - min) / max
 }
 
-function histPercentile(hist: Uint32Array, total: number, q: number) {
-  const target = total * q
-  let acc = 0
-  for (let value = 0; value < 256; value += 1) {
-    acc += hist[value] ?? 0
-    if (acc >= target) return value
-  }
-  return 255
-}
-
 function rgbToHsv(r: number, g: number, b: number): [number, number, number] {
   const max = Math.max(r, g, b)
   const min = Math.min(r, g, b)
@@ -409,175 +396,92 @@ function hsvToRgb(h: number, s: number, v: number): [number, number, number] {
   }
 }
 
-function blurGrid3x3(grid: Float32Array, size: number) {
-  const next = new Float32Array(size * size)
-  for (let y = 0; y < size; y += 1) {
-    for (let x = 0; x < size; x += 1) {
-      let sum = 0
-      let count = 0
-      for (let dy = -1; dy <= 1; dy += 1) {
-        const yy = y + dy
-        if (yy < 0 || yy >= size) continue
-        const row = yy * size
-        for (let dx = -1; dx <= 1; dx += 1) {
-          const xx = x + dx
-          if (xx < 0 || xx >= size) continue
-          sum += grid[row + xx] ?? 0
-          count += 1
-        }
-      }
-      next[y * size + x] = count > 0 ? sum / count : 1
-    }
-  }
-  return next
-}
-
-function dilateGrid3x3(grid: Float32Array, size: number) {
-  const next = new Float32Array(size * size)
-  for (let y = 0; y < size; y += 1) {
-    for (let x = 0; x < size; x += 1) {
-      let peak = 0
-      for (let dy = -1; dy <= 1; dy += 1) {
-        const yy = y + dy
-        if (yy < 0 || yy >= size) continue
-        const row = yy * size
-        for (let dx = -1; dx <= 1; dx += 1) {
-          const xx = x + dx
-          if (xx < 0 || xx >= size) continue
-          const value = grid[row + xx] ?? 0
-          if (value > peak) peak = value
-        }
-      }
-      next[y * size + x] = peak
-    }
-  }
-  return next
-}
-
-function erodeGrid3x3(grid: Float32Array, size: number) {
-  const next = new Float32Array(size * size)
-  for (let y = 0; y < size; y += 1) {
-    for (let x = 0; x < size; x += 1) {
-      let floor = Number.POSITIVE_INFINITY
-      for (let dy = -1; dy <= 1; dy += 1) {
-        const yy = y + dy
-        if (yy < 0 || yy >= size) continue
-        const row = yy * size
-        for (let dx = -1; dx <= 1; dx += 1) {
-          const xx = x + dx
-          if (xx < 0 || xx >= size) continue
-          const value = grid[row + xx] ?? 0
-          if (value < floor) floor = value
-        }
-      }
-      next[y * size + x] = Number.isFinite(floor) ? floor : 1
-    }
-  }
-  return next
-}
-
-function finishLightGrid(hists: Uint32Array, global: Uint32Array, counts: Uint32Array, total: number) {
-  const cells = LIGHT_GRID * LIGHT_GRID
-  const paper = Math.max(1, histPercentile(global, total, LIGHT_PERCENTILE))
-  const grid = new Float32Array(cells)
-  for (let id = 0; id < cells; id += 1) {
-    const n = Math.max(1, counts[id] ?? 1)
-    grid[id] = Math.max(1, histPercentile(hists.subarray(id * 256, id * 256 + 256), n, LIGHT_PERCENTILE))
-  }
-  let smooth = erodeGrid3x3(dilateGrid3x3(grid, LIGHT_GRID), LIGHT_GRID)
-  for (let pass = 0; pass < LIGHT_BLUR_PASSES; pass += 1) {
-    smooth = blurGrid3x3(smooth, LIGHT_GRID)
-  }
-  return { grid: smooth, paper }
-}
-
-/**
- * Paper-white field per RGB channel: 16×16 95th-percentile cells, closed and
- * blurred, then bilinearly sampled across the page. Floor at global 95th × 0.85
- * so a dark tile cannot collapse the lighting estimate toward its own content.
- */
-function illuminationRgb(data: Uint8ClampedArray, width: number, height: number) {
-  const cells = LIGHT_GRID * LIGHT_GRID
-  const histR = new Uint32Array(cells * 256)
-  const histG = new Uint32Array(cells * 256)
-  const histB = new Uint32Array(cells * 256)
-  const globalR = new Uint32Array(256)
-  const globalG = new Uint32Array(256)
-  const globalB = new Uint32Array(256)
-  const counts = new Uint32Array(cells)
-
-  for (let y = 0; y < height; y += 1) {
-    const gy = Math.min(LIGHT_GRID - 1, ((y * LIGHT_GRID) / height) | 0)
-    for (let x = 0; x < width; x += 1) {
-      const gx = Math.min(LIGHT_GRID - 1, ((x * LIGHT_GRID) / width) | 0)
-      const id = gy * LIGHT_GRID + gx
-      const i = (y * width + x) * 4
-      const red = Math.min(255, Math.max(0, Math.round(data[i] ?? 0)))
-      const green = Math.min(255, Math.max(0, Math.round(data[i + 1] ?? 0)))
-      const blue = Math.min(255, Math.max(0, Math.round(data[i + 2] ?? 0)))
-      histR[id * 256 + red] += 1
-      histG[id * 256 + green] += 1
-      histB[id * 256 + blue] += 1
-      globalR[red] += 1
-      globalG[green] += 1
-      globalB[blue] += 1
-      counts[id] += 1
-    }
-  }
-
-  const total = width * height
-  const r = finishLightGrid(histR, globalR, counts, total)
-  const g = finishLightGrid(histG, globalG, counts, total)
-  const b = finishLightGrid(histB, globalB, counts, total)
-  return {
-    gridR: r.grid,
-    gridG: g.grid,
-    gridB: b.grid,
-    paperR: r.paper,
-    paperG: g.paper,
-    paperB: b.paper,
-  }
-}
-
-function sampleGridRaw(grid: Float32Array, x: number, y: number, width: number, height: number) {
-  const fx = ((x + 0.5) / width) * (LIGHT_GRID - 1)
-  const fy = ((y + 0.5) / height) * (LIGHT_GRID - 1)
-  const x0 = fx | 0
-  const y0 = fy | 0
-  const x1 = Math.min(LIGHT_GRID - 1, x0 + 1)
-  const y1 = Math.min(LIGHT_GRID - 1, y0 + 1)
-  const tx = fx - x0
-  const ty = fy - y0
-  const a = grid[y0 * LIGHT_GRID + x0] ?? 0
-  const b = grid[y0 * LIGHT_GRID + x1] ?? 0
-  const c = grid[y1 * LIGHT_GRID + x0] ?? 0
-  const d = grid[y1 * LIGHT_GRID + x1] ?? 0
-  return (a * (1 - tx) + b * tx) * (1 - ty) + (c * (1 - tx) + d * tx) * ty
-}
-
-function sampleGrid(grid: Float32Array, x: number, y: number, width: number, height: number) {
-  return Math.max(1, sampleGridRaw(grid, x, y, width, height))
-}
-
-function flattenChannel(value: number, bg: number) {
-  const flat = (value / bg) * FLAT_TARGET
-  return flat < 0 ? 0 : flat > 255 ? 255 : flat
-}
-
 function boostSat(r: number, g: number, b: number, sat: number): [number, number, number] {
   const [hue, , value] = rgbToHsv(r, g, b)
   return hsvToRgb(hue, Math.min(1, sat * SAT_BOOST), value)
 }
 
-function smooth01(t: number) {
-  const x = t < 0 ? 0 : t > 1 ? 1 : t
-  return x * x * (3 - 2 * x)
+function boxBlurAxis(
+  src: Float32Array,
+  dest: Float32Array,
+  length: number,
+  stride: number,
+  count: number,
+  step: number,
+  radius: number,
+) {
+  for (let line = 0; line < count; line += 1) {
+    const origin = line * step
+    let left = 0
+    let right = -1
+    let sum = 0
+    let n = 0
+    for (let i = 0; i < length; i += 1) {
+      const newRight = Math.min(length - 1, i + radius)
+      const newLeft = Math.max(0, i - radius)
+      while (right < newRight) {
+        right += 1
+        sum += src[origin + right * stride] ?? 0
+        n += 1
+      }
+      while (left < newLeft) {
+        sum -= src[origin + left * stride] ?? 0
+        n -= 1
+        left += 1
+      }
+      dest[origin + i * stride] = n > 0 ? sum / n : 1
+    }
+  }
+}
+
+function boxBlurGray(gray: Float32Array, width: number, height: number, radius: number) {
+  const temp = new Float32Array(width * height)
+  boxBlurAxis(gray, temp, width, 1, height, width, radius)
+  boxBlurAxis(temp, gray, height, width, width, 1, radius)
+  return gray
+}
+
+function dilateGray3x3(gray: Float32Array, width: number, height: number) {
+  const next = new Float32Array(width * height)
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      let peak = 0
+      for (let dy = -1; dy <= 1; dy += 1) {
+        const yy = y + dy
+        if (yy < 0 || yy >= height) continue
+        const row = yy * width
+        for (let dx = -1; dx <= 1; dx += 1) {
+          const xx = x + dx
+          if (xx < 0 || xx >= width) continue
+          const value = gray[row + xx] ?? 0
+          if (value > peak) peak = value
+        }
+      }
+      next[y * width + x] = peak
+    }
+  }
+  return next
+}
+
+function sampleBlurred(gray: Float32Array, sw: number, sh: number, x: number, y: number, width: number, height: number) {
+  const fx = ((x + 0.5) / width) * (sw - 1)
+  const fy = ((y + 0.5) / height) * (sh - 1)
+  const x0 = fx | 0
+  const y0 = fy | 0
+  const x1 = Math.min(sw - 1, x0 + 1)
+  const y1 = Math.min(sh - 1, y0 + 1)
+  const tx = fx - x0
+  const ty = fy - y0
+  const a = gray[y0 * sw + x0] ?? 1
+  const b = gray[y0 * sw + x1] ?? 1
+  const c = gray[y1 * sw + x0] ?? 1
+  const d = gray[y1 * sw + x1] ?? 1
+  return Math.max(1, (a * (1 - tx) + b * tx) * (1 - ty) + (c * (1 - tx) + d * tx) * ty)
 }
 
 /**
- * Paper pixels (near local background, low sat) lift to white.
- * Ink darker than 160 is gamma-weighted so fine print is not clipped.
- * Photos/midtones get a partial flatten so gradients stay continuous.
+ * CamScanner-style illumination: heavily blurred paper field, then divide.
+ * Soft shadows follow the field (ratio ≈ 1 → white); ink and photos stay below 0.82.
  */
 async function whiteBalanceRgb(
   data: Uint8ClampedArray,
@@ -585,11 +489,35 @@ async function whiteBalanceRgb(
   height: number,
   clock: { last: number },
 ) {
-  const fields = illuminationRgb(data, width, height)
-  await yieldBusy(clock)
-  const floorR = fields.paperR * LIGHT_FLOOR
-  const floorG = fields.paperG * LIGHT_FLOOR
-  const floorB = fields.paperB * LIGHT_FLOOR
+  const sw = Math.max(12, Math.round(width / BG_DOWN))
+  const sh = Math.max(12, Math.round(height / BG_DOWN))
+  let field = new Float32Array(sw * sh)
+  for (let y = 0; y < sh; y += 1) {
+    const y0 = Math.floor((y * height) / sh)
+    const y1 = Math.max(y0 + 1, Math.floor(((y + 1) * height) / sh))
+    for (let x = 0; x < sw; x += 1) {
+      const x0 = Math.floor((x * width) / sw)
+      const x1 = Math.max(x0 + 1, Math.floor(((x + 1) * width) / sw))
+      let peak = 0
+      for (let yy = y0; yy < y1; yy += 1) {
+        const row = yy * width
+        for (let xx = x0; xx < x1; xx += 1) {
+          const i = (row + xx) * 4
+          const luma = pixelLuma(data[i] ?? 0, data[i + 1] ?? 0, data[i + 2] ?? 0)
+          if (luma > peak) peak = luma
+        }
+      }
+      field[y * sw + x] = peak
+    }
+    if (y % 4 === 0) await yieldBusy(clock)
+  }
+  field = dilateGray3x3(dilateGray3x3(field, sw, sh), sw, sh)
+  const radius = Math.max(2, Math.min(BG_BLUR_RADIUS, Math.floor(Math.min(sw, sh) / 2) - 1))
+  for (let pass = 0; pass < BG_BLUR_PASSES; pass += 1) {
+    boxBlurGray(field, sw, sh, radius)
+    await yieldBusy(clock)
+  }
+  const span = PAPER_RATIO - INK_RATIO
   for (let y = 0; y < height; y += 1) {
     if (y % 48 === 0) await yieldBusy(clock)
     for (let x = 0; x < width; x += 1) {
@@ -597,31 +525,38 @@ async function whiteBalanceRgb(
       const red = data[i] ?? 0
       const green = data[i + 1] ?? 0
       const blue = data[i + 2] ?? 0
-      const bgR = Math.max(sampleGrid(fields.gridR, x, y, width, height), floorR)
-      const bgG = Math.max(sampleGrid(fields.gridG, x, y, width, height), floorG)
-      const bgB = Math.max(sampleGrid(fields.gridB, x, y, width, height), floorB)
-      const localBg = pixelLuma(bgR, bgG, bgB)
       const luma = pixelLuma(red, green, blue)
       const sat = pixelSat(red, green, blue)
-      const paperCut = Math.max(localBg * PAPER_BG, 180)
-      if (luma > localBg * PAPER_BG && sat < PAPER_SAT) {
-        data[i] = flattenChannel(red, bgR)
-        data[i + 1] = flattenChannel(green, bgG)
-        data[i + 2] = flattenChannel(blue, bgB)
-      } else if (luma < INK_LUMA) {
-        const factor = Math.pow(Math.max(luma, 1) / INK_LUMA, INK_GAMMA) * INK_GAIN
-        data[i] = clamp255(red * factor)
-        data[i + 1] = clamp255(green * factor)
-        data[i + 2] = clamp255(blue * factor)
+      const bg = sampleBlurred(field, sw, sh, x, y, width, height)
+      const ratio = luma / Math.max(bg, 1)
+      if (ratio > PAPER_RATIO && sat < PAPER_SAT) {
+        data[i] = 255
+        data[i + 1] = 255
+        data[i + 2] = 255
+      } else if (ratio > PAPER_RATIO) {
+        data[i] = red
+        data[i + 1] = green
+        data[i + 2] = blue
       } else {
-        const span = Math.max(8, paperCut - INK_LUMA)
-        const mix = smooth01((luma - INK_LUMA) / span)
-        const scale = FLAT_TARGET / Math.max(localBg, 180)
-        data[i] = clamp255(red * (1 - mix) + Math.min(255, red * scale) * mix)
-        data[i + 1] = clamp255(green * (1 - mix) + Math.min(255, green * scale) * mix)
-        data[i + 2] = clamp255(blue * (1 - mix) + Math.min(255, blue * scale) * mix)
+        const scale = Math.max(0, (ratio - INK_RATIO) / span) * 0.9 + 0.1
+        data[i] = clamp255(Math.floor(red * scale))
+        data[i + 1] = clamp255(Math.floor(green * scale))
+        data[i + 2] = clamp255(Math.floor(blue * scale))
       }
       data[i + 3] = 255
+    }
+  }
+}
+
+function clampPaperWhite(data: Uint8ClampedArray) {
+  for (let i = 0; i < data.length; i += 4) {
+    const red = data[i] ?? 0
+    const green = data[i + 1] ?? 0
+    const blue = data[i + 2] ?? 0
+    if (pixelLuma(red, green, blue) >= PAPER_LUMA && pixelSat(red, green, blue) < PAPER_SAT) {
+      data[i] = 255
+      data[i + 1] = 255
+      data[i + 2] = 255
     }
   }
 }
@@ -672,7 +607,7 @@ function sharpenLuma(image: ImageData) {
           (gray[p + width + 1] ?? 0)) /
         9
       const delta = center - blur
-      if (Math.abs(delta) < SHARPEN_NOISE) continue
+      if (center >= PAPER_LUMA || Math.abs(delta) < SHARPEN_NOISE) continue
       const sharp = clamp255(center + SHARPEN_AMOUNT * delta)
       const lift = center > 1 ? sharp / center : 1
       const i = p * 4
@@ -697,11 +632,11 @@ async function despeckle(
   }
   const seen = new Uint8Array(n)
   const stack = new Int32Array(n)
-  const cells = new Int32Array(8)
+  const cells = new Int32Array(4)
   const yieldEvery = Math.max(width * 20, 1)
   for (let start = 0; start < n; start += 1) {
     if (start % yieldEvery === 0) await yieldBusy(clock)
-    if (seen[start] || (gray[start] ?? 255) >= 108) continue
+    if (seen[start] || (gray[start] ?? 255) >= 128) continue
     let top = 0
     stack[0] = start
     top = 1
@@ -714,7 +649,7 @@ async function despeckle(
     while (top > 0) {
       top -= 1
       const index = stack[top] ?? 0
-      if (count < 8) cells[count] = index
+      if (count < 4) cells[count] = index
       count += 1
       const x = index % width
       const y = (index - x) / width
@@ -724,7 +659,7 @@ async function despeckle(
       if (y > maxY) maxY = y
       if (x > 0) {
         const next = index - 1
-        if (!seen[next] && (gray[next] ?? 255) < 108) {
+        if (!seen[next] && (gray[next] ?? 255) < 128) {
           seen[next] = 1
           stack[top] = next
           top += 1
@@ -732,7 +667,7 @@ async function despeckle(
       }
       if (x + 1 < width) {
         const next = index + 1
-        if (!seen[next] && (gray[next] ?? 255) < 108) {
+        if (!seen[next] && (gray[next] ?? 255) < 128) {
           seen[next] = 1
           stack[top] = next
           top += 1
@@ -740,7 +675,7 @@ async function despeckle(
       }
       if (y > 0) {
         const next = index - width
-        if (!seen[next] && (gray[next] ?? 255) < 108) {
+        if (!seen[next] && (gray[next] ?? 255) < 128) {
           seen[next] = 1
           stack[top] = next
           top += 1
@@ -748,41 +683,19 @@ async function despeckle(
       }
       if (y + 1 < height) {
         const next = index + width
-        if (!seen[next] && (gray[next] ?? 255) < 108) {
+        if (!seen[next] && (gray[next] ?? 255) < 128) {
           seen[next] = 1
           stack[top] = next
           top += 1
         }
       }
     }
-    if (count > 8 || maxX - minX > 3 || maxY - minY > 3) continue
+    if (count > 3 || maxX - minX > 1 || maxY - minY > 1) continue
     for (let c = 0; c < count; c += 1) {
-      const index = cells[c] ?? 0
-      const x = index % width
-      const y = (index - x) / width
-      let sr = 0
-      let sg = 0
-      let sb = 0
-      let paper = 0
-      for (let dy = -2; dy <= 2; dy += 1) {
-        const yy = y + dy
-        if (yy < 0 || yy >= height) continue
-        for (let dx = -2; dx <= 2; dx += 1) {
-          const xx = x + dx
-          if (xx < 0 || xx >= width) continue
-          const g = gray[yy * width + xx] ?? 0
-          if (g < 160) continue
-          const i = (yy * width + xx) * 4
-          sr += data[i] ?? 255
-          sg += data[i + 1] ?? 255
-          sb += data[i + 2] ?? 255
-          paper += 1
-        }
-      }
-      const i = index * 4
-      data[i] = paper ? (sr / paper) | 0 : 255
-      data[i + 1] = paper ? (sg / paper) | 0 : 255
-      data[i + 2] = paper ? (sb / paper) | 0 : 255
+      const i = (cells[c] ?? 0) * 4
+      data[i] = 255
+      data[i + 1] = 255
+      data[i + 2] = 255
     }
   }
 }
@@ -1088,18 +1001,22 @@ async function applyMagicColor(image: ImageData) {
   const { data, width, height } = image
   const clock = { last: performance.now() }
   await whiteBalanceRgb(data, width, height, clock)
+  clampPaperWhite(data)
   await applyScanTone(data, width, height, clock)
-  sharpenLuma(image)
   await despeckle(data, width, height, clock)
+  sharpenLuma(image)
+  clampPaperWhite(data)
 }
 
 async function applyFastBlackWhite(image: ImageData) {
   const { data, width, height } = image
   const clock = { last: performance.now() }
   await whiteBalanceRgb(data, width, height, clock)
+  clampPaperWhite(data)
   await applyScanTone(data, width, height, clock)
-  sharpenLuma(image)
   await despeckle(data, width, height, clock)
+  sharpenLuma(image)
+  clampPaperWhite(data)
   desaturatePixels(data)
   await yieldBusy(clock)
 }
