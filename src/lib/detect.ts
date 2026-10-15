@@ -1,9 +1,12 @@
 import type { Corners, Point } from '../types'
 
 const DETECT_WIDTH = 240
+const STILL_WIDTH = 720
 const MIN_AREA = 0.08
 const MAX_AREA = 0.88
 const MARGIN = 0.04
+const STILL_MARGIN = 0.02
+const PAPER_SAT = 46
 
 const sample = document.createElement('canvas')
 const sampleCtx = sample.getContext('2d', { willReadFrequently: true })
@@ -16,11 +19,14 @@ function sourceSize(source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElem
   return { width: source.width, height: source.height }
 }
 
-function grabFrame(source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElement): ImageData | null {
+function grabFrame(
+  source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElement,
+  maxWidth = DETECT_WIDTH,
+): ImageData | null {
   if (!sampleCtx) return null
   const { width: sw, height: sh } = sourceSize(source)
   if (sw < 8 || sh < 8) return null
-  const scale = Math.min(1, DETECT_WIDTH / sw)
+  const scale = Math.min(1, maxWidth / sw)
   const width = Math.max(1, Math.round(sw * scale))
   const height = Math.max(1, Math.round(sh * scale))
   if (sample.width !== width) sample.width = width
@@ -173,15 +179,209 @@ function largestBrightBlob(gray: Uint8Array, width: number, height: number, thre
   return best
 }
 
+function cornersFromMask(mask: Uint8Array, width: number, height: number): Corners | null {
+  const acc = extrema()
+  for (let i = 0; i < mask.length; i += 1) {
+    if (!mask[i]) continue
+    addPoint(acc, i % width, (i - (i % width)) / width)
+  }
+  if (acc.count < width * height * MIN_AREA) return null
+  const touch =
+    Number(acc.minX <= 1) + Number(acc.minY <= 1) + Number(acc.maxX >= width - 2) + Number(acc.maxY >= height - 2)
+  if (touch >= 4) return null
+  return { tl: acc.tl, tr: acc.tr, br: acc.br, bl: acc.bl }
+}
+
+function fitLine(independent: number[], dependent: number[]): { a: number; b: number } | null {
+  const n = independent.length
+  if (n < 12) return null
+  let sumI = 0
+  let sumD = 0
+  let sumII = 0
+  let sumID = 0
+  for (let i = 0; i < n; i += 1) {
+    const x = independent[i] ?? 0
+    const y = dependent[i] ?? 0
+    sumI += x
+    sumD += y
+    sumII += x * x
+    sumID += x * y
+  }
+  const den = n * sumII - sumI * sumI
+  if (Math.abs(den) < 1e-6) return null
+  const a = (n * sumID - sumI * sumD) / den
+  const b = (sumD - a * sumI) / n
+  return { a, b }
+}
+
+function sliceMiddle<T>(items: T[], trim = 0.14): T[] {
+  if (items.length < 16) return items
+  const start = Math.floor(items.length * trim)
+  const end = Math.max(start + 8, Math.ceil(items.length * (1 - trim)))
+  return items.slice(start, end)
+}
+
+function intersectEdge(xOfY: { a: number; b: number }, yOfX: { a: number; b: number }): Point | null {
+  const den = 1 - xOfY.a * yOfX.a
+  if (Math.abs(den) < 1e-6) return null
+  const x = (xOfY.a * yOfX.b + xOfY.b) / den
+  const y = yOfX.a * x + yOfX.b
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null
+  return { x, y }
+}
+
 /**
- * Largest bright page blob. No ray-cast, no ink snap — those made the live box thrash
- * and cropped the page after the user set pins.
+ * Least-squares lines on the page's four sides. A desk photo's far edge is shorter;
+ * stretching that trapezoid is what CamScanner's "lift" does.
+ */
+function fitTrapezoid(mask: Uint8Array, width: number, height: number): Corners | null {
+  const leftX: number[] = []
+  const leftY: number[] = []
+  const rightX: number[] = []
+  const rightY: number[] = []
+  const topX: number[] = []
+  const topY: number[] = []
+  const bottomX: number[] = []
+  const bottomY: number[] = []
+
+  for (let y = 0; y < height; y += 1) {
+    const row = y * width
+    let minX = -1
+    let maxX = -1
+    for (let x = 0; x < width; x += 1) {
+      if (!mask[row + x]) continue
+      if (minX < 0) minX = x
+      maxX = x
+    }
+    if (minX < 0) continue
+    leftX.push(minX)
+    leftY.push(y)
+    rightX.push(maxX)
+    rightY.push(y)
+  }
+  for (let x = 0; x < width; x += 1) {
+    let minY = -1
+    let maxY = -1
+    for (let y = 0; y < height; y += 1) {
+      if (!mask[y * width + x]) continue
+      if (minY < 0) minY = y
+      maxY = y
+    }
+    if (minY < 0) continue
+    topX.push(x)
+    topY.push(minY)
+    bottomX.push(x)
+    bottomY.push(maxY)
+  }
+
+  const left = fitLine(sliceMiddle(leftY), sliceMiddle(leftX))
+  const right = fitLine(sliceMiddle(rightY), sliceMiddle(rightX))
+  const top = fitLine(sliceMiddle(topX), sliceMiddle(topY))
+  const bottom = fitLine(sliceMiddle(bottomX), sliceMiddle(bottomY))
+  if (!left || !right || !top || !bottom) return null
+
+  const tl = intersectEdge(left, top)
+  const tr = intersectEdge(right, top)
+  const br = intersectEdge(right, bottom)
+  const bl = intersectEdge(left, bottom)
+  if (!tl || !tr || !br || !bl) return null
+
+  const pad = 8
+  const inside = [tl, tr, br, bl].every(
+    (point) => point.x >= -pad && point.y >= -pad && point.x <= width - 1 + pad && point.y <= height - 1 + pad,
+  )
+  if (!inside) return null
+  const clampPt = (point: Point): Point => ({
+    x: Math.min(width - 1, Math.max(0, point.x)),
+    y: Math.min(height - 1, Math.max(0, point.y)),
+  })
+  const corners = { tl: clampPt(tl), tr: clampPt(tr), br: clampPt(br), bl: clampPt(bl) }
+  const area =
+    Math.abs(
+      corners.tl.x * corners.tr.y -
+        corners.tr.x * corners.tl.y +
+        corners.tr.x * corners.br.y -
+        corners.br.x * corners.tr.y +
+        corners.br.x * corners.bl.y -
+        corners.bl.x * corners.br.y +
+        corners.bl.x * corners.tl.y -
+        corners.tl.x * corners.bl.y,
+    ) / 2
+  const frac = area / (width * height)
+  if (frac < MIN_AREA || frac > MAX_AREA) return null
+  return corners
+}
+
+function paperPageMask(
+  data: Uint8ClampedArray,
+  gray: Uint8Array,
+  width: number,
+  height: number,
+  lumaThresh: number,
+): Uint8Array | null {
+  const n = gray.length
+  const paper = new Uint8Array(n)
+  for (let p = 0, i = 0; p < n; p += 1, i += 4) {
+    const r = data[i] ?? 0
+    const g = data[i + 1] ?? 0
+    const b = data[i + 2] ?? 0
+    const sat = Math.max(r, g, b) - Math.min(r, g, b)
+    if ((gray[p] ?? 0) > lumaThresh && sat < PAPER_SAT) paper[p] = 1
+  }
+  const bg = new Uint8Array(n)
+  const stack = new Int32Array(n)
+  let top = 0
+  const push = (index: number) => {
+    if (index < 0 || index >= n || bg[index] || paper[index]) return
+    bg[index] = 1
+    stack[top] = index
+    top += 1
+  }
+  for (let x = 0; x < width; x += 1) {
+    push(x)
+    push((height - 1) * width + x)
+  }
+  for (let y = 0; y < height; y += 1) {
+    push(y * width)
+    push(y * width + width - 1)
+  }
+  while (top > 0) {
+    top -= 1
+    const index = stack[top] ?? 0
+    const x = index % width
+    if (x > 0) push(index - 1)
+    if (x + 1 < width) push(index + 1)
+    if (index >= width) push(index - width)
+    if (index + width < n) push(index + width)
+  }
+  const page = new Uint8Array(n)
+  let count = 0
+  for (let i = 0; i < n; i += 1) {
+    if (bg[i]) continue
+    page[i] = 1
+    count += 1
+  }
+  const frac = count / n
+  if (frac < MIN_AREA || frac > MAX_AREA) return null
+  return page
+}
+
+function stillPageCorners(data: Uint8ClampedArray, gray: Uint8Array, width: number, height: number, lumaThresh: number) {
+  const page = paperPageMask(data, gray, width, height, lumaThresh)
+  if (!page) return null
+  return fitTrapezoid(page, width, height) ?? cornersFromMask(page, width, height)
+}
+
+/**
+ * Live view: largest bright blob only (stable orange box).
+ * Still photo: paper vs beige desk, then a fitted trapezoid so the far edge lifts like CamScanner.
  */
 export function detectDocumentCorners(
   source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElement,
 ): Corners | null {
   try {
-    const image = grabFrame(source)
+    const still = !(source instanceof HTMLVideoElement)
+    const image = grabFrame(source, still ? STILL_WIDTH : DETECT_WIDTH)
     if (!image) return null
     const { width, height, data } = image
     const gray = new Uint8Array(width * height)
@@ -193,9 +393,13 @@ export function detectDocumentCorners(
     }
     if (sum / gray.length < 12) return null
     const threshold = Math.min(210, Math.max(130, otsu(gray)))
+    if (still) {
+      const fitted = stillPageCorners(data, gray, width, height, threshold)
+      if (fitted) return toUnit(expand(fitted, width, height, STILL_MARGIN), width, height)
+    }
     const blob = largestBrightBlob(gray, width, height, threshold)
     if (!blob) return null
-    return toUnit(expand(blob.corners, width, height, MARGIN), width, height)
+    return toUnit(expand(blob.corners, width, height, still ? STILL_MARGIN : MARGIN), width, height)
   } catch (err) {
     console.warn('Detection failed:', err)
     return null

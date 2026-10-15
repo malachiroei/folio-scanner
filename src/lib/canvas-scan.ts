@@ -194,7 +194,20 @@ function mapHomography(h: number[], x: number, y: number): Point {
   }
 }
 
-function sampleBilinear(
+function cubicCatmull(p0: number, p1: number, p2: number, p3: number, t: number) {
+  const t2 = t * t
+  const t3 = t2 * t
+  return 0.5 * (2 * p1 + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 + (-p0 + 3 * p1 - 3 * p2 + p3) * t3)
+}
+
+function sampleChannel(data: Uint8ClampedArray, width: number, height: number, x: number, y: number, channel: number) {
+  const xi = x < 0 ? 0 : x > width - 1 ? width - 1 : x
+  const yi = y < 0 ? 0 : y > height - 1 ? height - 1 : y
+  return data[(yi * width + xi) * 4 + channel] ?? 255
+}
+
+/** Catmull-Rom bicubic — keeps the stretched far edge sharp when the page is lifted. */
+function sampleBicubic(
   data: Uint8ClampedArray,
   width: number,
   height: number,
@@ -203,7 +216,7 @@ function sampleBilinear(
   out: Uint8ClampedArray,
   offset: number,
 ) {
-  if (x < 0 || y < 0 || x >= width - 1 || y >= height - 1) {
+  if (x < -1 || y < -1 || x > width || y > height) {
     out[offset] = 255
     out[offset + 1] = 255
     out[offset + 2] = 255
@@ -214,18 +227,19 @@ function sampleBilinear(
   const y0 = Math.floor(y)
   const fx = x - x0
   const fy = y - y0
-  const i00 = (y0 * width + x0) * 4
-  const i10 = i00 + 4
-  const i01 = i00 + width * 4
-  const i11 = i01 + 4
   for (let c = 0; c < 3; c += 1) {
-    const v00 = data[i00 + c] ?? 255
-    const v10 = data[i10 + c] ?? 255
-    const v01 = data[i01 + c] ?? 255
-    const v11 = data[i11 + c] ?? 255
-    const top = v00 + (v10 - v00) * fx
-    const bottom = v01 + (v11 - v01) * fx
-    out[offset + c] = top + (bottom - top) * fy
+    const rows = [0, 0, 0, 0]
+    for (let dy = -1; dy <= 2; dy += 1) {
+      const yy = y0 + dy
+      rows[dy + 1] = cubicCatmull(
+        sampleChannel(data, width, height, x0 - 1, yy, c),
+        sampleChannel(data, width, height, x0, yy, c),
+        sampleChannel(data, width, height, x0 + 1, yy, c),
+        sampleChannel(data, width, height, x0 + 2, yy, c),
+        fx,
+      )
+    }
+    out[offset + c] = clamp255(cubicCatmull(rows[0] ?? 0, rows[1] ?? 0, rows[2] ?? 0, rows[3] ?? 0, fy))
   }
   out[offset + 3] = 255
 }
@@ -275,7 +289,7 @@ function paintScaled(
 }
 
 /**
- * Map the paper trapezoid onto a flat A4. Inverse homography + bilinear sample.
+ * Map the paper trapezoid onto a flat A4. Inverse homography + bicubic sample.
  * Stretching the shorter far edge is what lifts the page to face the camera.
  * No OpenCV — loading WASM here froze the phone after shutter.
  */
@@ -320,10 +334,10 @@ async function warpCanvas(
   const out = dest.data
 
   for (let y = 0; y < height; y += 1) {
-    if (y % 20 === 0) await nextFrame()
+    if (y % 16 === 0) await nextFrame()
     for (let x = 0; x < width; x += 1) {
       const sample = mapHomography(map, x + 0.5, y + 0.5)
-      sampleBilinear(srcData, sw, sh, sample.x, sample.y, out, (y * width + x) * 4)
+      sampleBicubic(srcData, sw, sh, sample.x, sample.y, out, (y * width + x) * 4)
     }
   }
   context.putImageData(dest, 0, 0)
