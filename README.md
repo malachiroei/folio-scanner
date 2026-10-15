@@ -1,4 +1,4 @@
-# Folio
+# My Scanner
 
 A mobile-first document scanner that runs in the browser. Point the camera at a page, adjust the four corners, then export a straightened multi-page PDF.
 

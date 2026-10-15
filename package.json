@@ -1,6 +1,6 @@
 {
-  "name": "document-scanner",
-  "description": "Document Scanner",
+  "name": "my-scanner",
+  "description": "My Scanner",
   "private": true,
   "version": "1.0.0",
   "type": "module",

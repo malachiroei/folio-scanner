@@ -25,7 +25,7 @@ function readTheme(): 'light' | 'dark' {
 }
 
 function pageFileName(index: number) {
-  return `folio-page-${String(index + 1).padStart(2, '0')}.jpg`
+  return `my-scanner-page-${String(index + 1).padStart(2, '0')}.jpg`
 }
 
 function filterLabel(filter: FilterMode) {

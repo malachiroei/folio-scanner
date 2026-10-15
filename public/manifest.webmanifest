@@ -1,8 +1,8 @@
 {
   "id": "/",
-  "name": "סורק מסמכים",
-  "short_name": "סורק מסמכים",
-  "description": "סורק מסמכים חכם - יישור דפים, הלבנת רקע ויצוא ל-PDF",
+  "name": "My Scanner",
+  "short_name": "My Scanner",
+  "description": "My Scanner - document scanning, page straighten, and PDF export",
   "lang": "he",
   "dir": "rtl",
   "start_url": "/",

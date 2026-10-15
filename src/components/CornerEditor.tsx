@@ -348,7 +348,7 @@ export function CornerEditor() {
                 aria-hidden="true"
               >
                 <defs>
-                  <mask id="folio-crop-mask">
+                  <mask id="my-scanner-crop-mask">
                     <rect width={draft.width} height={draft.height} fill="white" />
                     <polygon points={polygon} fill="black" />
                   </mask>
@@ -357,7 +357,7 @@ export function CornerEditor() {
                   width={draft.width}
                   height={draft.height}
                   fill="rgba(8,14,12,0.55)"
-                  mask="url(#folio-crop-mask)"
+                  mask="url(#my-scanner-crop-mask)"
                 />
                 <polygon
                   points={polygon}

@@ -86,7 +86,7 @@ async function encodePage(url: string, maxEdge: number, quality: number): Promis
 }
 
 export function pdfFileName() {
-  return `folio-${pageStamp()}.pdf`
+  return `my-scanner-${pageStamp()}.pdf`
 }
 
 export async function buildPagesPdf(pages: ScanPage[], options: PdfOptions = {}): Promise<Blob> {
@@ -112,7 +112,7 @@ export async function buildPagesPdf(pages: ScanPage[], options: PdfOptions = {})
   }
 
   if (!doc) throw new Error('הוסף עמוד לפני הייצוא.')
-  doc.setProperties({ title: 'סורק מסמכים', creator: 'סורק מסמכים' })
+  doc.setProperties({ title: 'My Scanner', creator: 'My Scanner' })
   return doc.output('blob')
 }
 

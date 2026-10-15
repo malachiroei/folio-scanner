@@ -21,7 +21,7 @@ export function HomeScreen() {
                 alt=""
                 className="size-12 shrink-0 rounded-[14px] shadow-[0_8px_20px_rgba(8,18,40,0.35)] ring-1 ring-black/10"
               />
-              <h1 className="font-display text-[1.85rem] leading-tight font-bold">סורק מסמכים</h1>
+              <h1 className="font-display text-[1.85rem] leading-tight font-bold">My Scanner</h1>
             </div>
           </div>
           <button

@@ -51,7 +51,7 @@ function jscanifyCvProxy(): Plugin {
 
 function sendScanDevApi(): Plugin {
   return {
-    name: 'folio-send-scan',
+    name: 'my-scanner-send-scan',
     configureServer(server) {
       server.middlewares.use((req, res, next) => {
         const path = req.url?.split('?')[0]

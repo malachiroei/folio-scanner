@@ -57,7 +57,7 @@ export async function sendScan(input: unknown): Promise<SendScanResult> {
 
   const resend = new Resend(apiKey)
   const { error } = await resend.emails.send({
-    from: process.env.RESEND_FROM || 'סורק מסמכים <onboarding@resend.dev>',
+    from: process.env.RESEND_FROM || 'My Scanner <onboarding@resend.dev>',
     to,
     subject: `סריקת מסמך (${new Date().toLocaleDateString('he-IL')})`,
     text: 'מצורף קובץ PDF של המסמך שנסרק.',
