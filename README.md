@@ -2,6 +2,8 @@
 
 A mobile-first document scanner that runs in the browser. Point the camera at a page, adjust the four corners, then export a straightened multi-page PDF.
 
+Production: https://my-scanner-app.vercel.app
+
 ## Run
 
 ```bash
