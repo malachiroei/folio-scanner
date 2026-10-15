@@ -25,23 +25,17 @@ function isLandscape(corners: Corners): boolean {
 const LIGHT_GRID = 16
 const LIGHT_PERCENTILE = 0.95
 const LIGHT_BLUR_PASSES = 4
-const LIGHT_FLOOR = 0.74
+const LIGHT_FLOOR = 0.82
 const FLAT_TARGET = 255
-const SAT_BOOST = 1.22
+const SAT_BOOST = 1.1
 const SAT_MIN = 0.08
-const PAPER_LUMA = 215
-const PAPER_SAT = 0.06
-const COLOR_CONTRAST = 1.18
-const INK_SAT = 0.12
-const INK_HARD = 90
-const FAINT_INK = 150
-const MID_DARK = 175
-const SHADOW_TARGET = 20
-const MID_DARK_TARGET = 100
-const INK_FAINT_GAIN = 70
-const HIGHLIGHT_TARGET = 220
-const SHARPEN_AMOUNT = 1.35
-const SHARPEN_NOISE = 5
+const PAPER_BG = 0.88
+const PAPER_SAT = 0.18
+const INK_LUMA = 160
+const INK_GAMMA = 1.25
+const INK_GAIN = 0.95
+const SHARPEN_AMOUNT = 1.12
+const SHARPEN_NOISE = 8
 const YIELD_MS = 24
 
 function sourceSize(image: CanvasImageSource): { width: number; height: number } {
@@ -570,12 +564,6 @@ function flattenChannel(value: number, bg: number) {
   return flat < 0 ? 0 : flat > 255 ? 255 : flat
 }
 
-function scaleToLuma(r: number, g: number, b: number, fromL: number, toL: number): [number, number, number] {
-  if (fromL < 0.5) return [toL, toL, toL]
-  const scale = toL / fromL
-  return [r * scale, g * scale, b * scale]
-}
-
 function boostSat(r: number, g: number, b: number, sat: number): [number, number, number] {
   const [hue, , value] = rgbToHsv(r, g, b)
   return hsvToRgb(hue, Math.min(1, sat * SAT_BOOST), value)
@@ -586,7 +574,11 @@ function smooth01(t: number) {
   return x * x * (3 - 2 * x)
 }
 
-/** Every pixel: `normC = clamp((C / bgC) * 255)`. Never skips or clears a region. */
+/**
+ * Paper pixels (near local background, low sat) lift to white.
+ * Ink darker than 160 is gamma-weighted so fine print is not clipped.
+ * Photos/midtones get a partial flatten so gradients stay continuous.
+ */
 async function whiteBalanceRgb(
   data: Uint8ClampedArray,
   width: number,
@@ -602,48 +594,39 @@ async function whiteBalanceRgb(
     if (y % 48 === 0) await yieldBusy(clock)
     for (let x = 0; x < width; x += 1) {
       const i = (y * width + x) * 4
+      const red = data[i] ?? 0
+      const green = data[i + 1] ?? 0
+      const blue = data[i + 2] ?? 0
       const bgR = Math.max(sampleGrid(fields.gridR, x, y, width, height), floorR)
       const bgG = Math.max(sampleGrid(fields.gridG, x, y, width, height), floorG)
       const bgB = Math.max(sampleGrid(fields.gridB, x, y, width, height), floorB)
-      data[i] = flattenChannel(data[i] ?? 0, bgR)
-      data[i + 1] = flattenChannel(data[i + 1] ?? 0, bgG)
-      data[i + 2] = flattenChannel(data[i + 2] ?? 0, bgB)
+      const localBg = pixelLuma(bgR, bgG, bgB)
+      const luma = pixelLuma(red, green, blue)
+      const sat = pixelSat(red, green, blue)
+      const paperCut = Math.max(localBg * PAPER_BG, 180)
+      if (luma > localBg * PAPER_BG && sat < PAPER_SAT) {
+        data[i] = flattenChannel(red, bgR)
+        data[i + 1] = flattenChannel(green, bgG)
+        data[i + 2] = flattenChannel(blue, bgB)
+      } else if (luma < INK_LUMA) {
+        const factor = Math.pow(Math.max(luma, 1) / INK_LUMA, INK_GAMMA) * INK_GAIN
+        data[i] = clamp255(red * factor)
+        data[i + 1] = clamp255(green * factor)
+        data[i + 2] = clamp255(blue * factor)
+      } else {
+        const span = Math.max(8, paperCut - INK_LUMA)
+        const mix = smooth01((luma - INK_LUMA) / span)
+        const scale = FLAT_TARGET / Math.max(localBg, 180)
+        data[i] = clamp255(red * (1 - mix) + Math.min(255, red * scale) * mix)
+        data[i + 1] = clamp255(green * (1 - mix) + Math.min(255, green * scale) * mix)
+        data[i + 2] = clamp255(blue * (1 - mix) + Math.min(255, blue * scale) * mix)
+      }
       data[i + 3] = 255
     }
   }
 }
 
-/**
- * Contrast stretch: gray print (L < 150, S < 0.12) → toward #151515; colored
- * midtones stay continuous; paper snaps to white. Grain at 150–175 stays paper.
- */
-function scanLuma(normL: number, sat: number) {
-  if (sat >= SAT_MIN) {
-    const t = normL / 255
-    return clamp255(((t - 0.5) * COLOR_CONTRAST + 0.5) * 255)
-  }
-  let next: number
-  if (normL < FAINT_INK && sat < INK_SAT) {
-    next = Math.floor(Math.pow(Math.max(0, normL) / FAINT_INK, 1.5) * INK_FAINT_GAIN)
-  } else if (normL < INK_HARD) {
-    next = Math.floor((normL / INK_HARD) * SHADOW_TARGET)
-  } else if (normL < MID_DARK) {
-    const t = (normL - INK_HARD) / (MID_DARK - INK_HARD)
-    next = Math.floor(SHADOW_TARGET + t * (MID_DARK_TARGET - SHADOW_TARGET))
-  } else if (normL <= PAPER_LUMA) {
-    const t = (normL - MID_DARK) / (PAPER_LUMA - MID_DARK)
-    const start = sat < INK_SAT ? INK_FAINT_GAIN : MID_DARK_TARGET
-    next = start + t * (HIGHLIGHT_TARGET - start)
-  } else if (sat < PAPER_SAT) {
-    next = 255
-  } else {
-    const t = smooth01((normL - PAPER_LUMA) / (255 - PAPER_LUMA))
-    next = HIGHLIGHT_TARGET + t * (255 - HIGHLIGHT_TARGET)
-  }
-  return clamp255(next)
-}
-
-/** Paper/ink curve; colored stamps keep hue and get 1.22× saturation. */
+/** Mild 1.1× saturation on color only. No second luma curve — that posterized photos and ate fine print. */
 async function applyScanTone(
   data: Uint8ClampedArray,
   width: number,
@@ -657,10 +640,8 @@ async function applyScanTone(
     const red = data[i] ?? 0
     const green = data[i + 1] ?? 0
     const blue = data[i + 2] ?? 0
-    const normL = pixelLuma(red, green, blue)
     const sat = pixelSat(red, green, blue)
-    const rgb = scaleToLuma(red, green, blue, normL, scanLuma(normL, sat))
-    const out = sat > SAT_MIN ? boostSat(rgb[0], rgb[1], rgb[2], sat) : rgb
+    const out = sat > SAT_MIN ? boostSat(red, green, blue, sat) : [red, green, blue]
     data[i] = clamp255(out[0])
     data[i + 1] = clamp255(out[1])
     data[i + 2] = clamp255(out[2])
